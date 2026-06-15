@@ -18,7 +18,7 @@ Forge does not ship model weights in this repository.
 
 ## Requirements
 
-- macOS 14 or newer.
+- macOS 26 or newer.
 - Apple Silicon Mac.
 - Xcode command line tools or Xcode with Swift 6.
 - SwiftPM can resolve all dependencies directly from public git sources.
