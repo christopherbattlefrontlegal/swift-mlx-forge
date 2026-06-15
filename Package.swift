@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.1
 // Swift-native, headless MLX runtime.
 //
 // This package builds the existing mlx-swift-examples `llm-tool` sources as a
@@ -18,7 +18,7 @@ import PackageDescription
 let package = Package(
     name: "forge_swift_open_source",
     platforms: [
-        .macOS(.v26)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "mlx-runtime", targets: ["mlx-runtime"]),
