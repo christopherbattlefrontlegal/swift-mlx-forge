@@ -47,3 +47,7 @@ llama_cache/
 
 # Nested experiment builds
 research/experiments/**/.build/
+
+# Optional local/marketplace-specific and experimental folders kept out of open-source publish
+MacAppStore/
+research/
