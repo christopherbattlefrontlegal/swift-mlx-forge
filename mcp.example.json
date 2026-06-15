@@ -1,0 +1,76 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "memoryGraph": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ]
+    },
+    "court-listener": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "<replace-with-court-listener-repo-path>",
+        "run",
+        "python",
+        "-m",
+        "app.server"
+      ],
+      "env": {}
+    },
+    "cerebra-legal": {
+      "command": "node",
+      "args": [
+        "<replace-with-cerebra-legal-build/index.js>"
+      ],
+      "env": {}
+    },
+    "pdf-reader": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@shtse8/pdf-reader-mcp"
+      ]
+    },
+    "swift-lsp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@blackwell-systems/agent-lsp",
+        "swift:sourcekit-lsp"
+      ],
+      "env": {}
+    },
+    "sourcekit-lsp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@blackwell-systems/agent-lsp",
+        "swift:sourcekit-lsp"
+      ],
+      "env": {}
+    },
+    "swiftlens": {
+      "command": "uvx",
+      "args": [
+        "swiftlens"
+      ],
+      "env": {}
+    },
+    "desktop-commander": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@wonderwhy-er/desktop-commander@latest"
+      ]
+    }
+  }
+}

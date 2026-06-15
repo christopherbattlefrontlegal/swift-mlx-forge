@@ -1,0 +1,49 @@
+.DS_Store
+
+# SwiftPM / Xcode build output
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Local app bundles and signing output
+*.app/
+*.pkg
+*.dSYM/
+*.ipa
+*.xcarchive/
+
+# Local configuration, secrets, and machine state
+.claude/
+.env
+.env.*
+*.local
+*.local.json
+mcp-servers.json
+mcp.json
+
+# Model weights and tokenizer caches
+models/
+*.bin
+*.safetensors
+*.gguf
+*.mlx
+*.onnx
+*.pt
+*.pth
+*.safetensors.index.json
+*.model
+
+# Local model/tokenizer cache locations
+.cache/
+.cache/huggingface/
+hf_cache/
+hfcache/
+huggingface/
+llama.cpp/
+llama_cache/
+
+# Nested experiment builds
+research/experiments/**/.build/
