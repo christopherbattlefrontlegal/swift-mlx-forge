@@ -18,8 +18,7 @@ Forge does not ship model weights in this repository.
 
 ## Requirements
 
-- macOS 15 or newer for local SwiftPM builds (Swift 6.1).  
-  The manifest can be raised to macOS 26 when your toolchain is on Swift 6.2+.
+- macOS 26 or newer with Swift 6.2+.
 - Apple Silicon Mac.
 - Xcode command line tools or Xcode with Swift 6.
 - SwiftPM can resolve all dependencies directly from public git sources.
