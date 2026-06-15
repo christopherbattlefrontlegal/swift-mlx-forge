@@ -31,20 +31,11 @@ From the repository root:
 ```sh
 swift build
 ```
-
-Build the local app bundle:
-
-```sh
-./scripts/build-app.sh
-```
-
-The bundle is written to:
+Run the app locally:
 
 ```sh
-./Forge.app
+swift run mlx-forge
 ```
-
-The script also runs `scripts/security-check.sh`, bundles the Metal library and llama framework when available, and ad-hoc signs the local app for development use on the current Mac.
 
 ## Run
 
@@ -97,15 +88,15 @@ Forge can expose a local OpenAI-compatible API server on loopback. The server:
 - Rejects cross-origin browser requests.
 - Does not emit wildcard CORS.
 
-Run the regression check before publishing changes:
+Run a build before publishing changes:
 
 ```sh
-./scripts/security-check.sh
+swift build
 ```
 
 ## App Store Notes
 
-The `MacAppStore/` folder contains entitlements and submission notes. The local `build-app.sh` output is ad-hoc signed for development only. App Store or TestFlight distribution requires your Apple signing identity, provisioning profile, and App Store Connect workflow.
+This open-source snapshot excludes App Store submission assets. Local signing and App Store packaging workflows are maintained in a private/internal branch or repo.
 
 ## Repository Hygiene
 

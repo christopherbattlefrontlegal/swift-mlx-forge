@@ -17,7 +17,3 @@ jobs:
 
       - name: Build
         run: swift build
-
-      - name: Security regression check
-        run: ./scripts/security-check.sh
-

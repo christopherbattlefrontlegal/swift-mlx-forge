@@ -14,6 +14,8 @@ DerivedData/
 *.dSYM/
 *.ipa
 *.xcarchive/
+scripts/
+brand-spec.md
 
 # Local configuration, secrets, and machine state
 .claude/

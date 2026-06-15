@@ -8,16 +8,14 @@ Use the normal SwiftPM flow:
 
 ```sh
 swift build
-./scripts/security-check.sh
-./scripts/build-app.sh
+swift run mlx-forge
 ```
 
 Before opening a pull request:
 
 - Keep model weights, app bundles, `.build`, and local configuration out of git.
 - Run `swift build`.
-- Run `./scripts/security-check.sh`.
-- If you touch the app bundle or signing path, run `./scripts/build-app.sh`.
+- Optionally run `swift run mlx-forge` to verify the app entrypoint.
 - Keep App Store-safe behavior intact for `Sources/mlx-forge`.
 
 ## Security Boundaries
@@ -31,4 +29,3 @@ MCP support in the sandboxed app should use HTTP/SSE. Stdio MCP process launchin
 ## Models
 
 Do not commit model files, tokenizer caches, or generated Hugging Face cache directories. Put local models under ignored paths or add them through the app.
-
