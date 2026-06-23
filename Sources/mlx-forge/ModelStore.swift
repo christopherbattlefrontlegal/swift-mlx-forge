@@ -2,8 +2,8 @@
 //
 // Local models come from:
 //   1. Forge's managed download cache (~/Library/Application Support/Forge/Models, HubCache layout)
-//   2. Any extra directories the user adds (plain folders containing config.json + *.safetensors,
-//      or HubCache-layout roots)
+//   2. Any extra directories the user adds (MLX folders with config.json + *.safetensors,
+//      HubCache-layout roots, loose .gguf files, or Core AI bundles with CoreAI.manifest.json)
 //
 // Remote discovery hits the public Hugging Face REST API directly (no SDK needed),
 // downloads go through the same HubClient/Downloader stack the runtime loads with,
@@ -65,7 +65,7 @@ final class ModelStore {
     private(set) var downloads: [DownloadTask] = []
 
     /// The shared downloader writing into Forge's managed cache.
-    /// Uses the Keychain token when set; otherwise falls back to the
+    /// Uses the stored Hugging Face token when set; otherwise falls back to the
     /// environment/HF-CLI token auto-detection built into HubClient.
     nonisolated static func makeDownloader() -> any Downloader {
         let cache = HubCache(cacheDirectory: ForgePaths.modelsRoot)
@@ -78,7 +78,7 @@ final class ModelStore {
         return #hubDownloader(client)
     }
 
-    /// Whether a Hugging Face token is stored in the Keychain.
+    /// Whether a Hugging Face token is stored locally.
     private(set) var hasToken = SecretsStore.huggingFaceToken != nil
 
     func setToken(_ token: String?) {
@@ -144,6 +144,10 @@ final class ModelStore {
     private nonisolated static func scan(root: URL, managed: Bool) -> [LocalModel] {
         let fm = FileManager.default
 
+        if CoreAIBackend.isCoreAIModel(root) {
+            return [coreAIModel(directory: root)]
+        }
+
         // The root may itself be a model folder (the user picked the model dir
         // directly, not its parent). Register it as one model and stop.
         if fm.fileExists(atPath: root.appendingPathComponent("config.json").path),
@@ -173,6 +177,10 @@ final class ModelStore {
                 (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
 
             if !isDirectory {
+                if entry.pathExtension.lowercased() == "coreai" {
+                    models.append(coreAIModel(directory: entry))
+                    continue
+                }
                 // Loose GGUF file at the top level (llama.cpp backend).
                 if entry.pathExtension.lowercased() == "gguf" {
                     models.append(ggufModel(file: entry))
@@ -185,6 +193,8 @@ final class ModelStore {
                 if let model = scanHubCacheEntry(entry, managed: managed) {
                     models.append(model)
                 }
+            } else if CoreAIBackend.isCoreAIModel(entry) {
+                models.append(coreAIModel(directory: entry))
             } else if fm.fileExists(atPath: entry.appendingPathComponent("config.json").path) {
                 // Plain model folder.
                 if hasWeights(entry) {
@@ -226,6 +236,19 @@ final class ModelStore {
             }
         }
         return found
+    }
+
+
+    /// A Core AI compiled resource bundle.
+    private nonisolated static func coreAIModel(directory: URL) -> LocalModel {
+        LocalModel(
+            name: directory.deletingPathExtension().lastPathComponent,
+            directory: directory,
+            sizeBytes: directorySize(directory),
+            architecture: "core ai",
+            quantization: nil,
+            isManaged: false,
+            deletableRoot: nil)
     }
 
     /// A GGUF file as a model entry — runs on the llama.cpp backend.

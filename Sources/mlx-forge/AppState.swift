@@ -28,7 +28,62 @@ final class AppState {
 
     /// Named system-prompt presets shown in the inspector's dropdown.
     var promptPresets: [PromptPreset] = [] {
+        didSet {
+            reconcileActivePromptPreset()
+            scheduleSave()
+        }
+    }
+
+    /// Preset last chosen in the inspector; drives the visible preset name label.
+    var activePromptPresetID: UUID? {
         didSet { scheduleSave() }
+    }
+
+    /// Label for the system-prompt preset picker (e.g. "Prompter").
+    var systemPromptPresetLabel: String {
+        if settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "None"
+        }
+        if let preset = activePromptPreset {
+            return preset.name
+        }
+        return "Custom"
+    }
+
+    /// Resolved preset for `activePromptPresetID`, if it still exists in `promptPresets`.
+    var activePromptPreset: PromptPreset? {
+        guard let id = activePromptPresetID else { return nil }
+        return promptPresets.first(where: { $0.id == id })
+    }
+
+    /// Apply system prompt text and keep preset selection in sync.
+    func applySystemPrompt(_ text: String, presetID: UUID? = nil) {
+        settings.systemPrompt = text
+        if let presetID {
+            activePromptPresetID = presetID
+        } else if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activePromptPresetID = nil
+        } else {
+            activePromptPresetID = matchingPresetID(for: text)
+        }
+    }
+
+    func clearSystemPrompt() {
+        applySystemPrompt("", presetID: nil)
+    }
+
+    /// Keep `activePromptPresetID` valid after launch, deletes, or external prompt edits.
+    func reconcileActivePromptPreset() {
+        if settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if activePromptPresetID != nil { activePromptPresetID = nil }
+            return
+        }
+        if activePromptPreset != nil { return }
+        activePromptPresetID = matchingPresetID(for: settings.systemPrompt)
+    }
+
+    private func matchingPresetID(for text: String) -> UUID? {
+        promptPresets.first(where: { $0.text == text })?.id
     }
 
     /// User-managed prompt directories (e.g. awesome-prompts style collections).
@@ -77,7 +132,11 @@ final class AppState {
         return []
     }() {
         didSet {
-            openRouterModelIDs = Self.uniqueModelIDs(openRouterModelIDs)
+            let normalized = Self.uniqueModelIDs(openRouterModelIDs)
+            if normalized != openRouterModelIDs {
+                openRouterModelIDs = normalized
+                return
+            }
             if let first = openRouterModelIDs.first {
                 UserDefaults.standard.set(openRouterModelIDs, forKey: "openrouter.models")
                 UserDefaults.standard.set(first, forKey: "openrouter.model")
@@ -117,7 +176,7 @@ final class AppState {
     /// Anything currently producing tokens (local OR Claude).
     var isBusy: Bool {
         engine.isGenerating || isClaudeGenerating || isOpenRouterGenerating || !inFlightAgentLabels.isEmpty
-            || isMCPRunning
+            || isMCPRunning || isCodingOrchestratorRunning
     }
     /// Whether a chat target is selected.
     var canChat: Bool { engine.activeModel != nil || claudeSelected || openRouterSelected }
@@ -151,6 +210,119 @@ final class AppState {
 
     func clearOpenRouterModels() {
         openRouterModelIDs = []
+    }
+
+    /// Use a single OpenRouter model for chat (clears multi-select).
+    func setPrimaryOpenRouterModel(_ id: String) {
+        claudeModelID = nil
+        engine.activeModelID = nil
+        openRouterModelIDs = [id.trimmingCharacters(in: .whitespacesAndNewlines)]
+    }
+
+    var openRouterCatalog: [OpenRouterClient.ModelInfo] = []
+    private(set) var isOpenRouterCatalogLoading = false
+    var openRouterCatalogError: String?
+
+    func refreshOpenRouterCatalog() {
+        guard hasOpenRouterKey, let key = SecretsStore.openRouterAPIKey else {
+            openRouterCatalogError = "Add an OpenRouter API key in Settings first."
+            return
+        }
+        isOpenRouterCatalogLoading = true
+        openRouterCatalogError = nil
+        Task {
+            do {
+                let models = try await OpenRouterClient(apiKey: key).fetchModels()
+                self.openRouterCatalog = models
+                self.isOpenRouterCatalogLoading = false
+            } catch {
+                self.openRouterCatalogError = error.localizedDescription
+                self.isOpenRouterCatalogLoading = false
+            }
+        }
+    }
+
+    var codingOrchestratorConfig: CodingOrchestratorConfig = {
+        let modelID =
+            UserDefaults.standard.string(forKey: "codingOrchestrator.modelID")
+            ?? "qwen/qwen3-coder"
+        let rounds = UserDefaults.standard.integer(forKey: "codingOrchestrator.maxRounds")
+        return CodingOrchestratorConfig(
+            modelID: modelID,
+            maxRounds: rounds > 0 ? rounds : 3)
+    }() {
+        didSet {
+            UserDefaults.standard.set(codingOrchestratorConfig.modelID, forKey: "codingOrchestrator.modelID")
+            UserDefaults.standard.set(codingOrchestratorConfig.maxRounds, forKey: "codingOrchestrator.maxRounds")
+        }
+    }
+
+    private(set) var isCodingOrchestratorRunning = false
+    private(set) var codingOrchestratorPhase = ""
+    private var codingOrchestratorTask: Task<Void, Never>?
+
+    func runCodingOrchestrator(task: String) {
+        let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard hasOpenRouterKey, let key = SecretsStore.openRouterAPIKey else { return }
+        guard var conversation = selectedConversation else { return }
+
+        conversation.messages.append(ChatMessage(role: .user, content: trimmed))
+        var assistant = ChatMessage(role: .assistant, content: "# Code loop\n\nStarting…\n")
+        assistant.modelName = "Code loop · \(OpenRouterClient.label(for: codingOrchestratorConfig.modelID))"
+        conversation.messages.append(assistant)
+        conversation.refreshTitle()
+        conversation.updatedAt = Date()
+        selectedConversation = conversation
+
+        let convID = conversation.id
+        let messageID = assistant.id
+        let config = codingOrchestratorConfig
+        let client = OpenRouterClient(apiKey: key)
+
+        isCodingOrchestratorRunning = true
+        codingOrchestratorPhase = "Starting"
+        codingOrchestratorTask?.cancel()
+        codingOrchestratorTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    self.isCodingOrchestratorRunning = false
+                    self.codingOrchestratorPhase = ""
+                    self.codingOrchestratorTask = nil
+                    self.scheduleSave()
+                }
+            }
+            do {
+                _ = try await CodingOrchestrator.run(
+                    task: trimmed,
+                    config: config,
+                    client: client,
+                    onPhaseStart: { round, phase in
+                        self.codingOrchestratorPhase = "R\(round) · \(phase.title)"
+                    },
+                    onPhaseComplete: { _, _, _ in },
+                    onAppend: { chunk in
+                        self.appendToMessage(conversationID: convID, messageID: messageID) {
+                            $0.content += chunk
+                        }
+                    })
+            } catch is CancellationError {
+                self.appendToMessage(conversationID: convID, messageID: messageID) {
+                    $0.content += "\n\n⏹ Code loop stopped.\n"
+                }
+            } catch {
+                self.appendToMessage(conversationID: convID, messageID: messageID) {
+                    $0.content += "\n\n⚠️ Code loop error: \(error.localizedDescription)\n"
+                    $0.isError = true
+                }
+            }
+        }
+        scheduleSave()
+    }
+
+    func stopCodingOrchestrator() {
+        codingOrchestratorTask?.cancel()
     }
 
     private static func uniqueModelIDs(_ ids: [String]) -> [String] {
@@ -252,20 +424,23 @@ final class AppState {
     }
 
     private init() {
+        SecretsStore.migrateLegacyKeychainIfNeeded()
         let state = Persistence.loadState()
         let persistedSettings = Persistence.loadSettings()
         conversations = state.conversations
         settings = persistedSettings.generation
         promptPresets = persistedSettings.promptPresets
+        activePromptPresetID = persistedSettings.activePromptPresetID
+        reconcileActivePromptPreset()
         promptDirectories = resolvePromptDirectories(from: persistedSettings)
         commanderDirectories = resolveCommanderDirectories(from: persistedSettings)
         mcp.commanderRoots = commanderDirectories
         lastPromptContent = persistedSettings.lastPromptContent
-        mcp.start()
 
         server.engine = engine
         server.store = store
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
+        engine.weightLoadPolicy = { [weak self] in self?.settings.weightLoadPolicy ?? .eager }
 
         // Models are NOT restored across launches: quitting Forge means the
         // models are gone, and a fresh launch starts at zero memory. Loading
@@ -285,8 +460,18 @@ final class AppState {
 
         serverPort = persistedSettings.serverPort
         serverEnabled = persistedSettings.serverEnabled
-        if serverEnabled {
-            server.start(port: UInt16(clamping: serverPort))
+        scheduleDeferredLaunchTasks()
+    }
+
+    /// MCP connects and the API server bind after the first UI frame so launch
+    /// doesn't hitch between the static Dock icon and the animated flame.
+    private func scheduleDeferredLaunchTasks() {
+        Task { @MainActor in
+            await Task.yield()
+            mcp.start()
+            if serverEnabled {
+                server.start(port: UInt16(clamping: serverPort))
+            }
         }
     }
 
@@ -497,9 +682,18 @@ final class AppState {
     }
 
     private func systemPrompt(for conversation: Conversation, includeMCP: Bool) -> String {
-        let base = conversation.systemPrompt.isEmpty ? settings.systemPrompt : conversation.systemPrompt
+        let base = baseSystemPrompt(for: conversation)
         guard includeMCP else { return base }
         return systemPromptWithMCPInstructions(base: base)
+    }
+
+    /// The inspector's active system prompt is the source of truth. Older saved
+    /// conversations may still carry a prompt, so use that only as a fallback
+    /// when the visible global prompt is empty.
+    private func baseSystemPrompt(for conversation: Conversation) -> String {
+        let global = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !global.isEmpty { return settings.systemPrompt }
+        return conversation.systemPrompt
     }
 
     private func systemPromptWithMCPInstructions(base: String) -> String {
@@ -818,7 +1012,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = history.systemPrompt.isEmpty ? settings.systemPrompt : history.systemPrompt
+        let sys = systemPrompt(for: history, includeMCP: false)
         let client = AnthropicClient(apiKey: key)
         do {
             try await client.stream(model: model, system: sys, messages: msgs) { [weak self] delta in
@@ -865,7 +1059,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = history.systemPrompt.isEmpty ? settings.systemPrompt : history.systemPrompt
+        let sys = systemPrompt(for: history, includeMCP: false)
         let client = OpenRouterClient(apiKey: key)
         do {
             try await client.stream(
@@ -1322,12 +1516,34 @@ final class AppState {
         return String(trimmed.prefix(max))
     }
 
+    /// Stop any in-flight generation and eject one loaded model from GPU memory.
+    func unloadLocalModel(_ modelID: String) {
+        stopGenerating()
+        engine.unload(modelID)
+        scheduleSave()
+    }
+
+    /// Stop any in-flight generation and eject every loaded model.
+    func unloadAllLocalModels() {
+        stopGenerating()
+        engine.unloadAll()
+        scheduleSave()
+    }
+
+    /// Unload and reload with the fast standard MLX loader (use after bounded/deferred).
+    func reloadModelStandard(_ model: LocalModel) {
+        unloadLocalModel(model.id)
+        engine.loadAndActivate(model, policy: .eager)
+        scheduleSave()
+    }
+
     func stopGenerating() {
         flushAllStreamBuffers()
         engine.stop()
         claudeTask?.cancel()
         openRouterTasks.values.forEach { $0.cancel() }
         openRouterTasks.removeAll()
+        stopCodingOrchestrator()
         isClaudeGenerating = false
         isOpenRouterGenerating = false
         streamingMessageID = nil
@@ -1409,6 +1625,7 @@ final class AppState {
             settings: PersistedSettings(
                 generation: settings,
                 promptPresets: promptPresets,
+                activePromptPresetID: activePromptPresetID,
                 extraModelDirectories: store.extraDirectories.map(\.path),
                 extraModelDirectoryBookmarks: store.extraDirectories.compactMap {
                     directoryBookmarks[$0]

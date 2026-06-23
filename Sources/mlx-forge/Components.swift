@@ -29,15 +29,22 @@ struct ModelPickerControl: View {
                     Menu("Unload…") {
                         ForEach(app.engine.loadedModels) { entry in
                             Button(menuDisplay(for: entry.model)) {
-                                app.engine.unload(entry.id)
-                                app.scheduleSave()
+                                app.unloadLocalModel(entry.id)
                             }
                         }
                         Divider()
                         Button("Unload All") {
-                            app.engine.unloadAll()
-                            app.scheduleSave()
+                            app.unloadAllLocalModels()
                         }
+                    }
+                }
+            }
+            if !app.engine.isLoaded(LocalModel.appleFoundationModel.id) {
+                Section("Apple Intelligence") {
+                    Button("Load Apple Foundation Model") {
+                        app.claudeModelID = nil
+                        app.engine.loadAndActivate(LocalModel.appleFoundationModel)
+                        app.scheduleSave()
                     }
                 }
             }
@@ -45,12 +52,44 @@ struct ModelPickerControl: View {
             if !coldModels.isEmpty {
                 Section("Library — load into memory") {
                     ForEach(coldModels) { model in
-                        Button(menuDisplay(for: model)) {
+                        Button("Load \(shortDisplay(for: model))") {
                             app.claudeModelID = nil
-                            app.engine.loadAndActivate(model)
+                            app.engine.loadAndActivate(model, policy: .eager)
                             app.scheduleSave()
                         }
                     }
+                }
+            }
+            if !app.engine.loadedModels.isEmpty {
+                Section("Loaded in memory") {
+                    Text("Tuning panel → Loaded Models, or Model Library (⌘M) → Installed")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if app.hasOpenRouterKey {
+                Section("OpenRouter presets") {
+                    ForEach(OpenRouterClient.models, id: \.id) { model in
+                        Button {
+                            if app.isOpenRouterModelSelected(model.id) {
+                                app.setPrimaryOpenRouterModel(model.id)
+                            } else {
+                                app.setOpenRouterModel(model.id, selected: true)
+                            }
+                        } label: {
+                            if app.openRouterModelID == model.id {
+                                Label(model.label, systemImage: "checkmark.circle.fill")
+                            } else if app.isOpenRouterModelSelected(model.id) {
+                                Label(model.label, systemImage: "circle.fill")
+                            } else {
+                                Label(model.label, systemImage: "circle")
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Select all presets") { app.selectAllOpenRouterModels() }
+                    Button("Clear selection") { app.clearOpenRouterModels() }
+                    Button("Refresh live catalog") { app.refreshOpenRouterCatalog() }
                 }
             }
             Section("Claude (API key)") {
@@ -178,9 +217,7 @@ struct UnloadModelsToolbarButton: View {
 
     var body: some View {
         Button {
-            app.stopGenerating()
-            app.engine.unloadAll()
-            app.scheduleSave()
+            app.unloadAllLocalModels()
         } label: {
             Label("Unload", systemImage: "eject.fill")
                 .font(.caption.weight(.semibold))
@@ -201,8 +238,6 @@ struct UnloadModelsToolbarButton: View {
 struct MemoryBadge: View {
     @Environment(AppState.self) private var app
 
-    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-
     var body: some View {
         HStack(spacing: Theme.s1) {
             Image(systemName: "memorychip")
@@ -213,11 +248,18 @@ struct MemoryBadge: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, Theme.s2)
         .padding(.vertical, Theme.s1)
-        .glassCard(radius: Theme.radiusSmall)
-        .onReceive(timer) { _ in
+        .background(Theme.assistantBubble.opacity(0.85))
+        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+        .onAppear {
             app.engine.refreshMemory()
         }
-        .help("MLX GPU memory (active / peak) of unified memory")
+        .onChange(of: app.engine.loadedModels.count) { _, _ in
+            app.engine.refreshMemory()
+        }
+        .onChange(of: app.engine.isGenerating) { _, _ in
+            app.engine.refreshMemory()
+        }
+        .help("MLX GPU memory — updates on load, unload, and generation start/stop")
     }
 
     private var label: String {
@@ -239,9 +281,15 @@ struct MarkdownText: View {
             ForEach(Self.blocks(in: text)) { block in
                 switch block.kind {
                 case .prose:
-                    Text(Self.inline(block.text))
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: Theme.s1) {
+                        HStack {
+                            Spacer(minLength: 0)
+                            CopyButton(text: block.text, label: "Copy")
+                        }
+                        Text(Self.inline(block.text))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 case .code(let language):
                     CodeBlock(code: block.text, language: language)
                 }
@@ -342,8 +390,6 @@ struct MarkdownText: View {
 struct CodeBlock: View {
     let code: String
     let language: String?
-    @State private var copied = false
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
@@ -351,20 +397,7 @@ struct CodeBlock: View {
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(code, forType: .string)
-                    copied = true
-                    Task {
-                        try? await Task.sleep(for: .seconds(1.5))
-                        copied = false
-                    }
-                } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(copied ? Theme.okGreen : .secondary)
+                CopyButton(text: code)
             }
             .padding(.horizontal, Theme.s3)
             .padding(.vertical, Theme.s2)
@@ -383,6 +416,32 @@ struct CodeBlock: View {
             RoundedRectangle(cornerRadius: Theme.radiusSmall)
                 .strokeBorder(.white.opacity(0.07), lineWidth: 1)
         )
+    }
+}
+
+// MARK: - Copy helper
+
+struct CopyButton: View {
+    let text: String
+    var label: String = "Copy"
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task {
+                try? await Task.sleep(for: .seconds(1.5))
+                copied = false
+            }
+        } label: {
+            Label(copied ? "Copied" : label, systemImage: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(copied ? Theme.okGreen : .secondary)
+        .disabled(text.isEmpty)
     }
 }
 

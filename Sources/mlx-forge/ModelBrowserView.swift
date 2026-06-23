@@ -87,8 +87,8 @@ private struct HuggingFaceTokenPopover: View {
 
             Text(
                 app.store.hasToken
-                    ? "A token is stored securely in your Keychain. It is used for gated and private models, downloads, and search."
-                    : "Paste an access token (hf_…) to download gated or private models. Stored in the macOS Keychain — never written to disk in plain text."
+                    ? "A token is saved on this Mac and used for gated models, downloads, and search."
+                    : "Paste an access token (hf_…) to download gated or private models. Saved locally in Application Support."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -134,22 +134,17 @@ private struct InstalledList: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        Group {
-            if app.store.localModels.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: Theme.s2) {
-                        ForEach(app.store.localModels) { model in
-                            InstalledRow(model: model) {
-                                app.engine.loadAndActivate(model)
-                                app.scheduleSave()
-                            }
-                        }
-                    }
-                    .padding(Theme.s4)
+        ScrollView {
+            LazyVStack(spacing: Theme.s2) {
+                InstalledRow(model: LocalModel.appleFoundationModel)
+                ForEach(app.store.localModels) { model in
+                    InstalledRow(model: model)
+                }
+                if app.store.localModels.isEmpty {
+                    emptyHint
                 }
             }
+            .padding(Theme.s4)
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
@@ -174,6 +169,18 @@ private struct InstalledList: View {
             .padding(Theme.s3)
             .background(.ultraThinMaterial)
         }
+    }
+
+    private var emptyHint: some View {
+        VStack(spacing: Theme.s2) {
+            Text("No MLX or GGUF folders yet")
+                .font(.callout.weight(.medium))
+            Text("Use Discover to download, or Add Model Folder below.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, Theme.s4)
     }
 
     private var emptyState: some View {
@@ -210,7 +217,6 @@ private struct InstalledList: View {
 private struct InstalledRow: View {
     @Environment(AppState.self) private var app
     let model: LocalModel
-    let onLoad: () -> Void
 
     private var isLoaded: Bool { app.engine.isLoaded(model.id) }
     private var isActive: Bool { app.engine.activeModelID == model.id }
@@ -218,7 +224,29 @@ private struct InstalledRow: View {
     private var loadedEntry: InferenceEngine.Loaded? {
         app.engine.loadedModels.first { $0.id == model.id }
     }
-    private var isMemoryMapped: Bool { loadedEntry?.mmapReaders != nil }
+    private var loadHelp: String {
+        if model.isAppleFM {
+            return "Load Apple's on-device Foundation Model via LanguageModelSession."
+        }
+        if model.isCoreAI {
+            return "Compile and load a Core AI BYOM adapter."
+        }
+        if model.isGGUF {
+            return "Load this GGUF file on the llama.cpp backend."
+        }
+        return "Standard MLX load — fastest for MoE models like Qwen A3B. Use this."
+    }
+
+    private var loadStatusLabel: String {
+        guard let entry = loadedEntry else { return "Loaded" }
+        if entry.weightLoadPolicy == .deferred {
+            return isActive ? "Active · deferred" : "Deferred"
+        }
+        if entry.weightLoadPolicy == .boundedEager {
+            return isActive ? "Active · bounded" : "Bounded"
+        }
+        return isActive ? "Active" : "Loaded"
+    }
 
     var body: some View {
         HStack(spacing: Theme.s3) {
@@ -250,28 +278,56 @@ private struct InstalledRow: View {
                         .foregroundStyle(.secondary)
                 }
             } else if isLoaded {
-                Label(
-                    isActive ? (isMemoryMapped ? "Active · mmap" : "Active") : (isMemoryMapped ? "Mapped" : "Loaded"),
-                    systemImage: "checkmark.circle.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(isActive ? Theme.emberGlow : Theme.okGreen)
+                VStack(alignment: .trailing, spacing: Theme.s1) {
+                    Label(loadStatusLabel, systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(isActive ? Theme.emberGlow : Theme.okGreen)
+                    if loadedEntry?.weightLoadPolicy == .boundedEager
+                        || loadedEntry?.weightLoadPolicy == .deferred
+                    {
+                        Button("Reload Standard") {
+                            app.reloadModelStandard(model)
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Unload and reload with the fast standard MLX path")
+                    }
+                }
             } else {
                 HStack(spacing: Theme.s2) {
-                    Button("Load") { onLoad() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Theme.ember)
-                        .controlSize(.small)
-                        .help("Load normally")
-                    if model.supportsMemoryMapping {
-                        Button {
-                            app.engine.loadAndActivateMmap(model)
+                    Button("Load") {
+                        app.engine.loadAndActivate(model, policy: .eager)
+                        app.scheduleSave()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.ember)
+                    .controlSize(.small)
+                    .help(loadHelp)
+
+                    if !model.usesFoundationSession && !model.isGGUF {
+                    Menu {
+                        Button("Bounded eager") {
+                            app.engine.loadAndActivate(model, policy: .boundedEager)
                             app.scheduleSave()
-                        } label: {
-                            Label("Map", systemImage: "memorychip")
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Explicitly load with memory-mapped safetensors weights")
+                        .disabled(model.prefersStandardMLXLoad)
+                        Button("Deferred (lazy)") {
+                            app.engine.loadAndActivate(model, policy: .deferred)
+                            app.scheduleSave()
+                        }
+                        .disabled(model.prefersStandardMLXLoad)
+                        if model.prefersStandardMLXLoad {
+                            Text("MoE models use standard Load only")
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .controlSize(.small)
+                    .help(
+                        "Dense LLMs only — lowers peak RAM while loading. MoE/A3B models ignore this and use Load.")
                     }
                 }
             }
@@ -282,16 +338,17 @@ private struct InstalledRow: View {
                         app.engine.activeModelID = model.id
                     }
                     Button("Unload from Memory") {
-                        app.engine.unload(model.id)
-                        app.scheduleSave()
+                        app.unloadLocalModel(model.id)
                     }
                 }
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([model.directory])
+                if !model.isAppleFM {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([model.directory])
+                    }
                 }
                 if model.isManaged {
                     Button("Delete from Disk", role: .destructive) {
-                        if isLoaded { app.engine.unload(model.id) }
+                        if isLoaded { app.unloadLocalModel(model.id) }
                         app.store.delete(model)
                     }
                 }

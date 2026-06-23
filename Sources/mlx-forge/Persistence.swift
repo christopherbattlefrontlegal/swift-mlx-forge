@@ -25,6 +25,11 @@ enum ForgePaths {
     static var settingsFile: URL {
         appSupport.appendingPathComponent("settings.json")
     }
+
+    /// API tokens and keys — file-backed so ad-hoc rebuilds don't re-trigger Keychain prompts.
+    static var secretsFile: URL {
+        appSupport.appendingPathComponent("secrets.json")
+    }
 }
 
 struct PersistedState: Codable {
@@ -42,6 +47,8 @@ struct PromptPreset: Codable, Identifiable, Hashable {
 struct PersistedSettings: Codable {
     var generation = GenerationSettings()
     var promptPresets: [PromptPreset] = []
+    /// Last preset explicitly chosen in the inspector (nil when custom/edited).
+    var activePromptPresetID: UUID?
     var extraModelDirectories: [String] = []
     /// Security-scoped bookmarks for the user-added directories. Under the App
     /// Sandbox a plain path string grants no access after relaunch; the bookmark
@@ -65,6 +72,7 @@ struct PersistedSettings: Codable {
     init(
         generation: GenerationSettings = GenerationSettings(),
         promptPresets: [PromptPreset] = [],
+        activePromptPresetID: UUID? = nil,
         extraModelDirectories: [String] = [],
         extraModelDirectoryBookmarks: [Data] = [],
         promptDirectories: [String] = [],
@@ -79,6 +87,7 @@ struct PersistedSettings: Codable {
     ) {
         self.generation = generation
         self.promptPresets = promptPresets
+        self.activePromptPresetID = activePromptPresetID
         self.extraModelDirectories = extraModelDirectories
         self.extraModelDirectoryBookmarks = extraModelDirectoryBookmarks
         self.promptDirectories = promptDirectories
@@ -102,6 +111,7 @@ struct PersistedSettings: Codable {
         promptPresets =
             (try? c.decodeIfPresent([PromptPreset].self, forKey: .promptPresets))
             .flatMap { $0 } ?? []
+        activePromptPresetID = try? c.decodeIfPresent(UUID.self, forKey: .activePromptPresetID)
         extraModelDirectories =
             (try? c.decodeIfPresent([String].self, forKey: .extraModelDirectories))
             .flatMap { $0 } ?? []

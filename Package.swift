@@ -81,7 +81,10 @@ let package = Package(
                 .product(name: "Hub", package: "swift-transformers"),
                 .product(name: "LLM", package: "LLM.swift"),
             ],
-            path: "Sources/mlx-forge"
+            path: "Sources/mlx-forge",
+            linkerSettings: [
+                .linkedFramework("FoundationModels"),
+            ]
         )
     ]
 )

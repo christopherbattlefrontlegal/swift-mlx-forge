@@ -20,25 +20,31 @@ import os.log
 @Observable
 final class InferenceEngine {
 
-    /// A model resident in unified memory — MLX backend (container) or
-    /// llama.cpp backend (gguf). Exactly one of the two is non-nil.
+    /// A model resident in unified memory — MLX (`container`), GGUF (`gguf`),
+    /// or Foundation Models (`coreAI`: Apple FM / Core AI BYOM).
     struct Loaded: Identifiable {
         let model: LocalModel
         let container: ModelContainer?
         var loadedAt: Date
-        /// Retains the memory-mapped readers when using the mmap loading path.
-        let mmapReaders: [SafetensorsReader]?
+        /// Forge weight materialization policy when loaded via the policy path.
+        let weightLoadPolicy: WeightLoadPolicy?
         /// llama.cpp context when this is a GGUF model.
         let gguf: GGUFRuntime?
 
+        /// Core AI compiled resources when using the Core AI backend.
+        let coreAI: CoreAIRuntime?
+
         init(
             model: LocalModel, container: ModelContainer?, loadedAt: Date,
-            mmapReaders: [SafetensorsReader]?, gguf: GGUFRuntime? = nil
+            weightLoadPolicy: WeightLoadPolicy? = nil,
+            coreAI: CoreAIRuntime? = nil,
+            gguf: GGUFRuntime? = nil
         ) {
             self.model = model
             self.container = container
             self.loadedAt = loadedAt
-            self.mmapReaders = mmapReaders
+            self.weightLoadPolicy = weightLoadPolicy
+            self.coreAI = coreAI
             self.gguf = gguf
         }
 
@@ -60,9 +66,11 @@ final class InferenceEngine {
     private(set) var isGenerating = false
     private var activeGenerationCount = 0
 
-    /// Live stats for the in-flight UI generation.
+    /// Live stats for the in-flight UI generation (published at ~5 Hz, not per token).
     private(set) var liveTokenCount = 0
     private(set) var liveTokensPerSecond: Double = 0
+    private var rawLiveTokenCount = 0
+    private var lastLiveStatsPublish = Date.distantPast
 
     /// GPU memory snapshot, refreshed by `refreshMemory()`.
     private(set) var activeMemory: Int = 0
@@ -102,7 +110,8 @@ final class InferenceEngine {
     /// evaluated exactly once — and a waiter gets *that load's* error, not
     /// whatever `lastError` happens to hold by the time it wakes up.
     private var loadTasks: [String: Task<ModelContainer, Error>] = [:]
-
+    private var loadGenerations: [String: UInt64] = [:]
+    private var loadTaskPolicies: [String: WeightLoadPolicy] = [:]
     /// Models unloaded while their load was still in flight. Without this, the
     /// load completes AFTER the unload and re-appends the entry — resurrecting
     /// tens of GB the user just ejected.
@@ -110,24 +119,60 @@ final class InferenceEngine {
 
     private static let log = Logger(subsystem: "com.forge.mlx", category: "memory")
 
+    /// Resolves the MLX safetensors load policy for UI and API loads.
+    var weightLoadPolicy: () -> WeightLoadPolicy = { .eager }
+
     /// Loads a model into memory (idempotent) without changing the active model.
     @discardableResult
     func load(_ model: LocalModel) async throws -> Loaded {
+        try await load(model, policy: weightLoadPolicy())
+    }
+
+    @discardableResult
+    func load(_ model: LocalModel, policy: WeightLoadPolicy) async throws -> Loaded {
         if let existing = loadedModels.first(where: { $0.id == model.id }) {
             return existing
         }
         if model.isGGUF {
             return try await loadGGUF(model)
         }
+        if model.isAppleFM {
+            return try loadAppleFM(model)
+        }
+        if model.isCoreAI {
+            return try await loadCoreAI(model)
+        }
 
+        let useFactoryLoader = policy == .eager || model.prefersStandardMLXLoad
         let task: Task<ModelContainer, Error>
-        if let inFlight = loadTasks[model.id] {
+        let generation: UInt64
+        if let inFlight = loadTasks[model.id],
+            loadTaskPolicies[model.id] == policy
+        {
             task = inFlight
+            generation = loadGenerations[model.id] ?? 0
         } else {
+            if loadTasks[model.id] != nil {
+                loadTasks[model.id]?.cancel()
+                loadTasks.removeValue(forKey: model.id)
+                loadTaskPolicies.removeValue(forKey: model.id)
+            }
+            // A prior unload mid-flight stashes the ID here — clear it when the
+            // user explicitly starts a fresh load so we don't reject the result.
+            discardedLoads.remove(model.id)
             lastError = nil
             loadingModels.updateValue(nil, forKey: model.id)
             let modelID = model.id
             let directory = model.directory
+            let loadPolicy = policy
+            generation = (loadGenerations[model.id] ?? 0) + 1
+            loadGenerations[model.id] = generation
+            loadTaskPolicies[model.id] = policy
+            if loadPolicy != .eager, model.prefersStandardMLXLoad {
+                Self.log.info(
+                    "load(\(modelID, privacy: .public)): MoE/dense-mix — using standard MLX loader for full speed"
+                )
+            }
             task = Task {
                 let configuration = ModelConfiguration(directory: directory)
                 let downloader = ModelStore.makeDownloader()
@@ -135,19 +180,42 @@ final class InferenceEngine {
                 // Weight load/quantization evaluates on the GPU — take a turn
                 // so it never overlaps a running generation.
                 return try await self.gate.withTurn {
+                    try Task.checkCancellation()
+                    if useFactoryLoader {
+                        do {
+                            return try await LLMModelFactory.shared.loadContainer(
+                                from: downloader, using: tokenizerLoader,
+                                configuration: configuration
+                            ) { progress in
+                                Task { @MainActor [weak self] in
+                                    if self?.loadingModels.keys.contains(modelID) == true {
+                                        self?.loadingModels[modelID] = progress.fractionCompleted
+                                    }
+                                }
+                            }
+                        } catch let error as ModelFactoryError {
+                            // Not an LLM architecture — try the vision-language factory.
+                            guard case .unsupportedModelType = error else { throw error }
+                            return try await VLMModelFactory.shared.loadContainer(
+                                from: downloader, using: tokenizerLoader,
+                                configuration: configuration)
+                        }
+                    }
+
                     do {
-                        return try await LLMModelFactory.shared.loadContainer(
-                            from: downloader, using: tokenizerLoader,
-                            configuration: configuration
-                        ) { progress in
+                        let (container, _) = try await loadLLMContainerWithPolicy(
+                            modelDirectory: directory,
+                            policy: loadPolicy,
+                            tokenizerLoader: tokenizerLoader
+                        ) { fraction in
                             Task { @MainActor [weak self] in
                                 if self?.loadingModels.keys.contains(modelID) == true {
-                                    self?.loadingModels[modelID] = progress.fractionCompleted
+                                    self?.loadingModels[modelID] = fraction
                                 }
                             }
                         }
+                        return container
                     } catch let error as ModelFactoryError {
-                        // Not an LLM architecture — try the vision-language factory.
                         guard case .unsupportedModelType = error else { throw error }
                         return try await VLMModelFactory.shared.loadContainer(
                             from: downloader, using: tokenizerLoader,
@@ -158,9 +226,13 @@ final class InferenceEngine {
             loadTasks[model.id] = task
         }
         defer {
-            // Idempotent — every waiter clears, first one wins.
-            loadTasks.removeValue(forKey: model.id)
-            loadingModels.removeValue(forKey: model.id)
+            // Only the generation that registered this task may clear it — a
+            // stale waiter must not drop a newer in-flight load's slot.
+            if loadGenerations[model.id] == generation {
+                loadTasks.removeValue(forKey: model.id)
+                loadTaskPolicies.removeValue(forKey: model.id)
+                loadingModels.removeValue(forKey: model.id)
+            }
         }
 
         do {
@@ -169,6 +241,7 @@ final class InferenceEngine {
             // freshly loaded container instead of resurrecting it.
             if discardedLoads.remove(model.id) != nil {
                 Self.log.info("load(\(model.id, privacy: .public)) discarded — unloaded mid-flight")
+                recordLoadCancelled(for: model)
                 scheduleCachePurge()
                 throw CancellationError()
             }
@@ -177,7 +250,43 @@ final class InferenceEngine {
             if let existing = loadedModels.first(where: { $0.id == model.id }) {
                 return existing
             }
-            let entry = Loaded(model: model, container: container, loadedAt: Date(), mmapReaders: nil)
+            let recordedPolicy: WeightLoadPolicy? =
+                useFactoryLoader && policy != .eager ? .eager : policy
+            let entry = Loaded(
+                model: model, container: container, loadedAt: Date(),
+                weightLoadPolicy: recordedPolicy)
+            loadedModels.append(entry)
+            if activeModelID == nil { activeModelID = entry.id }
+            refreshMemory()
+            if let policy = entry.weightLoadPolicy {
+                Self.log.info(
+                    "load(\(model.id, privacy: .public)) complete — policy \(policy.shortLabel, privacy: .public)")
+            }
+            return entry
+        } catch is CancellationError {
+            if lastError == nil { recordLoadCancelled(for: model) }
+            refreshMemory()
+            throw CancellationError()
+        } catch {
+            lastError = error.localizedDescription
+            refreshMemory()
+            throw error
+        }
+    }
+
+    /// Loads a GGUF model on the llama.cpp backend.
+
+    @discardableResult
+
+    private func loadAppleFM(_ model: LocalModel) throws -> Loaded {
+        if let existing = loadedModels.first(where: { $0.id == model.id }) {
+            return existing
+        }
+        lastError = nil
+        do {
+            let runtime = try CoreAIBackend.loadAppleFM()
+            let entry = Loaded(
+                model: model, container: nil, loadedAt: Date(), coreAI: runtime)
             loadedModels.append(entry)
             if activeModelID == nil { activeModelID = entry.id }
             refreshMemory()
@@ -189,7 +298,26 @@ final class InferenceEngine {
         }
     }
 
-    /// Loads a GGUF model on the llama.cpp backend.
+    private func loadCoreAI(_ model: LocalModel) async throws -> Loaded {
+        if let existing = loadedModels.first(where: { $0.id == model.id }) {
+            return existing
+        }
+        lastError = nil
+        do {
+            let runtime = try await CoreAIBackend.loadResources(at: model.directory)
+            let entry = Loaded(
+                model: model, container: nil, loadedAt: Date(), coreAI: runtime)
+            loadedModels.append(entry)
+            if activeModelID == nil { activeModelID = entry.id }
+            refreshMemory()
+            return entry
+        } catch {
+            lastError = error.localizedDescription
+            refreshMemory()
+            throw error
+        }
+    }
+
     private func loadGGUF(_ model: LocalModel) async throws -> Loaded {
         lastError = nil
         loadingModels.updateValue(nil, forKey: model.id)
@@ -206,106 +334,50 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
         if discardedLoads.remove(model.id) != nil {
+            recordLoadCancelled(for: model)
             throw CancellationError()
         }
         let entry = Loaded(
-            model: model, container: nil, loadedAt: Date(), mmapReaders: nil, gguf: runtime)
+            model: model, container: nil, loadedAt: Date(),
+            weightLoadPolicy: nil, gguf: runtime)
         loadedModels.append(entry)
         if activeModelID == nil { activeModelID = entry.id }
         refreshMemory()
         return entry
     }
 
-    /// Loads a model with memory-mapped weights (LLM architectures only).
-    /// Tries to keep load behavior consistent with the normal path while preserving
-    /// compatibility with the selected mlx-swift-lm API.
-    func loadModelMmap(_ model: LocalModel) async throws -> Loaded {
-        if let existing = loadedModels.first(where: { $0.id == model.id }),
-            existing.mmapReaders != nil
-        {
-            return existing
-        }
-        if let existing = loadedModels.first(where: { $0.id == model.id }),
-            existing.mmapReaders == nil
-        {
-            throw ForgeError.loadFailed(
-                "\(model.shortName) is already loaded normally — unload it before mapping.")
-        }
-        guard model.supportsMemoryMapping else {
-            throw ForgeError.loadFailed(
-                "\(model.shortName) is not eligible for MLX safetensors memory mapping.")
-        }
-        // A conventional load for this model is already in flight — starting a
-        // second factory load here would hold two full copies of the weights.
-        guard loadTasks[model.id] == nil, loadingModels[model.id] == nil else {
-            throw ForgeError.loadFailed("\(model.shortName) is already loading — wait or unload first.")
-        }
+    /// User-initiated or superseded load — don't surface as a load failure.
+    private func recordLoadCancelled(for model: LocalModel) {
+        Self.log.info("load(\(model.id, privacy: .public)) cancelled")
         lastError = nil
-        loadingModels.updateValue(nil, forKey: model.id)
-        defer { loadingModels.removeValue(forKey: model.id) }
-
-        do {
-            // Current mlx-swift-lm API exposes a stable load path without a
-            // custom weight loader hook. Fall back to the standard load flow for
-            // now while keeping the UI control surface and model state intact.
-            let entry = try await load(model)
-            let mappedEntry = Loaded(
-                model: entry.model, container: entry.container, loadedAt: entry.loadedAt,
-                mmapReaders: entry.mmapReaders)
-            if let index = loadedModels.firstIndex(where: { $0.id == model.id }) {
-                loadedModels[index] = mappedEntry
-            } else {
-                loadedModels.append(mappedEntry)
-            }
-            if discardedLoads.remove(model.id) != nil {
-                Self.log.info("mmap load(\(model.id, privacy: .public)) discarded — unloaded mid-flight")
-                scheduleCachePurge()
-                throw CancellationError()
-            }
-            if activeModelID == nil { activeModelID = entry.id }
-            refreshMemory()
-            return mappedEntry
-        } catch {
-            lastError = error.localizedDescription
-            refreshMemory()
-            throw error
-        }
     }
 
     /// UI path: load in the background and make active when ready.
-    func loadAndActivate(_ model: LocalModel) {
+    func loadAndActivate(_ model: LocalModel, policy: WeightLoadPolicy = .eager) {
         Task {
             do {
-                let entry = try await load(model)
+                let entry = try await load(model, policy: policy)
                 activeModelID = entry.id
+            } catch is CancellationError {
+                // Unload mid-flight or superseded — not an error surface.
             } catch {
                 // lastError already set by load()
             }
         }
     }
 
-    /// UI path: memory-mapped load in the background, activate when ready.
-    func loadAndActivateMmap(_ model: LocalModel) {
-        Task {
-            do {
-                let entry = try await loadModelMmap(model)
-                activeModelID = entry.id
-            } catch {
-                // lastError already set by loadModelMmap()
-            }
-        }
-    }
 
     func unload(_ modelID: String) {
-        if isGenerating, activeModelID == modelID { stop() }
-        if loadTasks[modelID] != nil || loadingModels.keys.contains(modelID) {
-            discardedLoads.insert(modelID)
+        if activeModelID == modelID, isGenerating {
+            stop()
         }
+        cancelInFlightLoad(for: modelID)
         sessions = sessions.filter { $0.value.modelID != modelID }
         loadedModels.removeAll { $0.id == modelID }
         if activeModelID == modelID {
             activeModelID = loadedModels.first?.id
         }
+        lastError = nil
         Self.log.info(
             "unload(\(modelID, privacy: .public)): remaining=\(self.loadedModels.count) sessions=\(self.sessions.count)"
         )
@@ -314,12 +386,28 @@ final class InferenceEngine {
 
     func unloadAll() {
         stop()
-        discardedLoads.formUnion(loadTasks.keys)
-        discardedLoads.formUnion(loadingModels.keys)
+        let inFlight = Set(loadTasks.keys).union(loadingModels.keys)
+        discardedLoads.formUnion(inFlight)
+        loadTasks.values.forEach { $0.cancel() }
+        loadTasks.removeAll()
+        loadTaskPolicies.removeAll()
+        loadingModels.removeAll()
         sessions.removeAll()
         loadedModels.removeAll()
         activeModelID = nil
+        lastError = nil
         scheduleCachePurge()
+    }
+
+    /// Abort a background load and drop its progress indicator immediately.
+    private func cancelInFlightLoad(for modelID: String) {
+        guard loadTasks[modelID] != nil
+            || loadingModels[modelID] != nil
+        else { return }
+        discardedLoads.insert(modelID)
+        loadTasks[modelID]?.cancel()
+        loadTasks.removeValue(forKey: modelID)
+        loadingModels.removeValue(forKey: modelID)
     }
 
     /// Purging the MLX buffer cache while a generation is mid-stream frees
@@ -389,6 +477,13 @@ final class InferenceEngine {
             return
         }
 
+        if let coreAI = entry.coreAI {
+            generateFoundationSession(
+                coreAI, conversation: conversation, prompt: prompt, settings: settings,
+                onChunk: onChunk, onComplete: onComplete)
+            return
+        }
+
         let session = preparedSession(
             for: conversation, entry: entry, settings: settings)
         session.generateParameters = Self.parameters(from: settings)
@@ -415,11 +510,8 @@ final class InferenceEngine {
                         if Task.isCancelled { break }
                         switch item {
                         case .chunk(let text):
-                            self.liveTokenCount += 1
-                            let elapsed = Date().timeIntervalSince(start)
-                            if elapsed > 0.2 {
-                                self.liveTokensPerSecond = Double(self.liveTokenCount) / elapsed
-                            }
+                            self.rawLiveTokenCount += 1
+                            self.publishLiveStatsIfNeeded(since: start)
                             onChunk(text)
                         case .info(let info):
                             completionInfo = info
@@ -434,6 +526,45 @@ final class InferenceEngine {
                     // KV cache may be mid-turn; drop the session so the next
                     // generation re-hydrates cleanly from stored history.
                     self.sessions.removeValue(forKey: conversation.id)
+                    self.finishGeneration()
+                    onComplete(nil, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Streams via LanguageModelSession — Apple FM and Core AI BYOM.
+    private func generateFoundationSession(
+        _ coreAI: CoreAIRuntime,
+        conversation: Conversation,
+        prompt: String,
+        settings: GenerationSettings,
+        onChunk: @escaping @MainActor (String) -> Void,
+        onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
+    ) {
+        let systemPrompt = effectiveSystemPrompt(conversation: conversation, settings: settings)
+        let generationID = beginGeneration()
+
+        generationTasks[generationID] = Task { [generationID] in
+            await self.gate.withTurn {
+                defer { self.generationTasks.removeValue(forKey: generationID) }
+                let start = Date()
+                do {
+                    _ = try await coreAI.stream(
+                        conversation: conversation,
+                        prompt: prompt,
+                        settings: settings,
+                        systemPrompt: systemPrompt
+                    ) { delta in
+                        await MainActor.run {
+                            self.rawLiveTokenCount += 1
+                            self.publishLiveStatsIfNeeded(since: start)
+                            onChunk(delta)
+                        }
+                    }
+                    self.finishGeneration()
+                    onComplete(nil, nil)
+                } catch {
                     self.finishGeneration()
                     onComplete(nil, error.localizedDescription)
                 }
@@ -474,11 +605,8 @@ final class InferenceEngine {
                 let start = Date()
                 _ = await gguf.respond(to: prompt) { delta in
                     await MainActor.run {
-                        self.liveTokenCount += 1
-                        let elapsed = Date().timeIntervalSince(start)
-                        if elapsed > 0.2 {
-                            self.liveTokensPerSecond = Double(self.liveTokenCount) / elapsed
-                        }
+                        self.rawLiveTokenCount += 1
+                        self.publishLiveStatsIfNeeded(since: start)
                         onChunk(delta)
                     }
                 }
@@ -506,12 +634,25 @@ final class InferenceEngine {
     private func beginGeneration() -> UUID {
         let generationID = UUID()
         if activeGenerationCount == 0 {
+            rawLiveTokenCount = 0
             liveTokenCount = 0
             liveTokensPerSecond = 0
+            lastLiveStatsPublish = Date.distantPast
         }
         activeGenerationCount += 1
         isGenerating = true
         return generationID
+    }
+
+    private func publishLiveStatsIfNeeded(since start: Date) {
+        let now = Date()
+        guard now.timeIntervalSince(lastLiveStatsPublish) >= 0.2 else { return }
+        lastLiveStatsPublish = now
+        liveTokenCount = rawLiveTokenCount
+        let elapsed = Date().timeIntervalSince(start)
+        if elapsed > 0.2 {
+            liveTokensPerSecond = Double(rawLiveTokenCount) / elapsed
+        }
     }
 
     private func finishGeneration() {
@@ -519,6 +660,9 @@ final class InferenceEngine {
             activeGenerationCount -= 1
         }
         isGenerating = activeGenerationCount > 0
+        if !isGenerating {
+            liveTokenCount = rawLiveTokenCount
+        }
         refreshMemory()
     }
 
@@ -560,7 +704,9 @@ final class InferenceEngine {
     private func effectiveSystemPrompt(
         conversation: Conversation, settings: GenerationSettings
     ) -> String {
-        conversation.systemPrompt.isEmpty ? settings.systemPrompt : conversation.systemPrompt
+        let global = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !global.isEmpty { return settings.systemPrompt }
+        return conversation.systemPrompt
     }
 
     static func parameters(from settings: GenerationSettings) -> GenerateParameters {

@@ -1,4 +1,4 @@
-// Forge — app settings window (⌘,): Claude API key (Keychain) + MCP servers.
+// Forge — app settings window (⌘,): cloud API keys + MCP servers.
 // Both lived in the right sidebar before; they're configuration, not tuning.
 
 import AppKit
@@ -36,8 +36,8 @@ private struct ClaudeKeySettings: View {
                 title: "OpenRouter",
                 icon: "point.3.connected.trianglepath.dotted",
                 description: app.hasOpenRouterKey
-                    ? "A key is stored in your Keychain. Pick any OpenRouter models below to route chat through OpenRouter."
-                    : "Stored in the macOS Keychain. Used for OpenRouter's OpenAI-compatible chat endpoint."
+                    ? "A key is saved on this Mac. Pick any OpenRouter models below to route chat through OpenRouter."
+                    : "Saved locally in Application Support (not in your project). Used for OpenRouter's OpenAI-compatible chat endpoint."
             ) {
                 VStack(alignment: .leading, spacing: Theme.s2) {
                     HStack {
@@ -119,14 +119,49 @@ private struct ClaudeKeySettings: View {
                         .help("Remove the stored OpenRouter key")
                     }
                 }
+
+                Divider()
+                VStack(alignment: .leading, spacing: Theme.s2) {
+                    Text("Code loop (OpenRouter)")
+                        .font(.caption.weight(.semibold))
+                    Text("Planner → coder → auditor → fixer → tester. Chat toolbar loop button.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Picker("Model", selection: Binding(
+                        get: { app.codingOrchestratorConfig.modelID },
+                        set: { app.codingOrchestratorConfig.modelID = $0 })) {
+                        ForEach(OpenRouterClient.models, id: \.id) { model in
+                            Text(model.label).tag(model.id)
+                        }
+                        if !OpenRouterClient.models.contains(where: {
+                            $0.id == app.codingOrchestratorConfig.modelID
+                        }) {
+                            Text(app.codingOrchestratorConfig.modelID).tag(app.codingOrchestratorConfig.modelID)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    TextField("Or custom slug", text: Binding(
+                        get: { app.codingOrchestratorConfig.modelID },
+                        set: { app.codingOrchestratorConfig.modelID = $0 }))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                    Stepper(
+                        "Max rounds: \(app.codingOrchestratorConfig.maxRounds)",
+                        value: Binding(
+                            get: { app.codingOrchestratorConfig.maxRounds },
+                            set: { app.codingOrchestratorConfig.maxRounds = max(1, min(10, $0)) }),
+                        in: 1...10)
+                    Button("Refresh model catalog") { app.refreshOpenRouterCatalog() }
+                        .controlSize(.small)
+                }
             }
 
             providerCard(
                 title: "Anthropic Claude",
                 icon: "cloud",
                 description: app.hasAnthropicKey
-                    ? "A key is stored in your Keychain. Pick a Claude model below to route chat through Anthropic."
-                    : "Stored in the macOS Keychain. Billed to your Anthropic API account."
+                    ? "A key is saved on this Mac. Pick a Claude model below to route chat through Anthropic."
+                    : "Saved locally in Application Support. Billed to your Anthropic API account."
             ) {
                 Picker("Model", selection: Binding(
                     get: { app.claudeModelID ?? AnthropicClient.models[0].id },
@@ -197,7 +232,7 @@ private struct ClaudeKeySettings: View {
     private func saveOpenRouter() {
         let key = openRouterDraft.trimmingCharacters(in: .whitespaces)
         guard !key.isEmpty else { return }
-        app.setOpenRouterKey(key)
+app.setOpenRouterKey(key)
         app.openRouterModelID = app.openRouterModelID ?? OpenRouterClient.defaultModelID
         openRouterDraft = ""
     }

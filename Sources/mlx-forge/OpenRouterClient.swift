@@ -28,6 +28,20 @@ struct OpenRouterClient {
         let text: String
     }
 
+    struct ModelInfo: Identifiable, Codable, Equatable, Hashable {
+        var id: String
+        var name: String
+        var contextLength: Int?
+
+        var label: String {
+            if let contextLength, contextLength > 0 {
+                let k = contextLength >= 1000 ? contextLength / 1000 : contextLength
+                return "\(name) · \(k)k ctx"
+            }
+            return name
+        }
+    }
+
     static let defaultModelID = "openrouter/auto"
 
     static let models: [(id: String, label: String)] = [
@@ -36,18 +50,115 @@ struct OpenRouterClient {
         ("~openai/gpt-latest", "OpenAI Latest"),
         ("~anthropic/claude-sonnet-latest", "Claude Sonnet Latest"),
         ("~google/gemini-pro-latest", "Gemini Pro Latest"),
+        ("openai/gpt-5.2-codex", "GPT-5.2 Codex"),
+        ("openai/gpt-5.5", "GPT-5.5"),
+        ("z-ai/glm-5.2", "GLM 5.2"),
         ("moonshotai/kimi-k2.7-code", "Kimi K2.7 Code"),
+        ("arcee-ai/coder-large", "Arcee Coder Large"),
+        ("kwaipilot/kat-coder-pro-v2", "Kat Coder Pro v2"),
+        ("cohere/north-mini-code:free", "Cohere North Mini Code (free)"),
+        ("qwen/qwen3-coder", "Qwen3 Coder"),
         ("qwen/qwen3.7-plus", "Qwen3.7 Plus"),
+        ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
         ("minimax/minimax-m3", "MiniMax M3"),
         ("nvidia/nemotron-3-ultra-550b-a55b:free", "Nemotron 3 Ultra Free"),
     ]
 
+    nonisolated(unsafe) private static var catalogLabels: [String: String] = [:]
+
     static func label(for id: String) -> String {
-        models.first { $0.id == id }?.label ?? id
+        if let preset = models.first(where: { $0.id == id }) {
+            return preset.label
+        }
+        if let cached = catalogLabels[id] {
+            return cached
+        }
+        return id
+    }
+
+    static func registerCatalog(_ entries: [ModelInfo]) {
+        for entry in entries {
+            catalogLabels[entry.id] = entry.label
+        }
     }
 
     var apiKey: String
     var maxTokens: Int = 8192
+
+    func fetchModels() async throws -> [ModelInfo] {
+        guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
+        var request = URLRequest(url: URL(string: "https://openrouter.ai/api/v1/models")!)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw OpenRouterError.http(status, Self.extractError(from: data) ?? "model list failed")
+        }
+        guard
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rows = root["data"] as? [[String: Any]]
+        else { return [] }
+
+        let mapped = rows.compactMap { row -> ModelInfo? in
+            guard let id = row["id"] as? String else { return nil }
+            let name = (row["name"] as? String) ?? id
+            let context = row["context_length"] as? Int
+            return ModelInfo(id: id, name: name, contextLength: context)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        Self.registerCatalog(mapped)
+        return mapped
+    }
+
+    func complete(
+        model: String,
+        system: String?,
+        messages: [Message],
+        maxTokens: Int? = nil
+    ) async throws -> String {
+        guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
+
+        var payloadMessages = [[String: String]]()
+        if let system, !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payloadMessages.append(["role": "system", "content": system])
+        }
+        payloadMessages.append(contentsOf: messages.map { ["role": $0.role, "content": $0.text] })
+
+        var request = URLRequest(
+            url: URL(string: "https://openrouter.ai/api/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
+
+        var body: [String: Any] = [
+            "model": model,
+            "stream": false,
+            "messages": payloadMessages,
+        ]
+        if model != "openrouter/fusion" {
+            body["max_tokens"] = maxTokens ?? self.maxTokens
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw OpenRouterError.http(status, Self.extractError(from: data) ?? "request failed")
+        }
+        guard
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let choices = obj["choices"] as? [[String: Any]],
+            let first = choices.first,
+            let message = first["message"] as? [String: Any],
+            let content = message["content"] as? String
+        else {
+            throw OpenRouterError.stream("empty completion response")
+        }
+        return content
+    }
 
     func stream(
         model: String,

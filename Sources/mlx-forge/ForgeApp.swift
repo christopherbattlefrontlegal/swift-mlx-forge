@@ -66,6 +66,11 @@ struct ForgeApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dockFlame = DockFlame()
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Before the first window paints, replace the static .icns in the Dock.
+        dockFlame.prime()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockFlame.start()
     }
@@ -80,6 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct RootView: View {
     @Environment(AppState.self) private var app
+    /// Inspector attaches one frame after the window appears so launch doesn't
+    /// resize twice (window open → inspector column → window jump).
+    @State private var inspectorAttached = false
 
     var body: some View {
         @Bindable var app = app
@@ -89,7 +97,16 @@ struct RootView: View {
         } detail: {
             ChatView()
         }
+        .inspector(isPresented: inspectorPresented) {
+            TuningInspector()
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
+        }
         .background(Theme.backgroundGradient)
+        .onAppear {
+            DispatchQueue.main.async {
+                inspectorAttached = true
+            }
+        }
         .sheet(isPresented: $app.showModelBrowser) {
             ModelBrowserView()
                 .environment(app)
@@ -114,7 +131,11 @@ struct RootView: View {
                 }
                 MemoryBadge()
                 Button {
-                    app.showInspector.toggle()
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        app.showInspector.toggle()
+                    }
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
@@ -134,5 +155,15 @@ struct RootView: View {
             app.engine.unloadAll()
             app.saveNow()
         }
+    }
+
+    private var inspectorPresented: Binding<Bool> {
+        Binding(
+            get: { inspectorAttached && app.showInspector },
+            set: { newValue in
+                inspectorAttached = true
+                app.showInspector = newValue
+            }
+        )
     }
 }

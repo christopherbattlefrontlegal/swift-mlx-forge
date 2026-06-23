@@ -130,6 +130,21 @@ struct LocalModel: Identifiable, Equatable, Hashable {
     /// Root folder to remove when deleting (cache `models--…` dir, not the snapshot).
     var deletableRoot: URL?
 
+
+    /// Synthetic entry for Apple's on-device Foundation Model (not on disk).
+    static let appleFMDirectory = URL(fileURLWithPath: "/@forge/apple-foundation-model")
+
+    static var appleFoundationModel: LocalModel {
+        LocalModel(
+            name: "Apple Foundation Model",
+            directory: appleFMDirectory,
+            sizeBytes: 0,
+            architecture: "apple intelligence",
+            quantization: nil,
+            isManaged: false,
+            deletableRoot: nil)
+    }
+
     var shortName: String {
         name.split(separator: "/").last.map(String.init) ?? name
     }
@@ -140,23 +155,37 @@ struct LocalModel: Identifiable, Equatable, Hashable {
         directory.pathExtension.lowercased() == "gguf"
     }
 
-    /// True when the model is an MLX safetensors folder suitable for the mmap loader.
-    /// GGUF files already use llama.cpp's own file-backed loading path.
-    var supportsMemoryMapping: Bool {
-        guard !isGGUF else { return false }
-        guard
-            let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path),
-            names.contains(where: { $0.hasSuffix(".safetensors") })
-        else { return false }
-        let unsupported = [
-            "clip", "florence", "idefics", "llava", "paligemma", "siglip", "vit",
+    /// Compiled Core AI resource bundle (WWDC 2026 BYOM path).
+    var isAppleFM: Bool {
+        directory.path == Self.appleFMDirectory.path
+    }
+
+    /// Routes chat through LanguageModelSession (Apple FM or Core AI BYOM).
+    var usesFoundationSession: Bool { isAppleFM || isCoreAI }
+
+    var isCoreAI: Bool {
+        CoreAIBackend.isCoreAIModel(directory)
+    }
+
+    /// MoE / expert models must use mlx-swift-lm's standard factory loader.
+    /// Forge's bounded/deferred weight path is for dense LLMs only and runs
+    /// dramatically slower on architectures like Qwen3.5/3.6 A3B.
+    var prefersStandardMLXLoad: Bool {
+        if isGGUF || isCoreAI || isAppleFM { return true }
+        let haystack =
+            "\(architecture ?? "") \(name) \(shortName) \(directory.lastPathComponent)"
+            .lowercased()
+        let markers = [
+            "moe", "mixtral", "a3b", "a22b", "a2b", "deepseek_v3", "kimi-k2",
         ]
-        let type = architecture?.lowercased() ?? ""
-        return !unsupported.contains { type.contains($0) }
+        return markers.contains { haystack.contains($0) }
     }
 
     var backendLabel: String {
-        isGGUF ? "GGUF" : "MLX"
+        if isGGUF { return "GGUF" }
+        if isAppleFM { return "Apple FM" }
+        if isCoreAI { return "Core AI" }
+        return "MLX"
     }
 
     var precisionLabel: String? {
@@ -230,9 +259,52 @@ struct RemoteModel: Identifiable, Codable, Equatable {
     }
 }
 
+// MARK: - Weight loading
+
+/// How MLX safetensors weights are materialized during load.
+enum WeightLoadPolicy: String, Codable, CaseIterable, Identifiable, Equatable {
+    /// Upstream path: one whole-model `eval` after all shards merge.
+    case eager
+    /// Per-shard `eval` while loading — lowers transient peak RAM (recommended).
+    case boundedEager
+    /// Skip final `eval`; weights materialize on first forward pass.
+    case deferred
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .eager: "Standard (eager)"
+        case .boundedEager: "Bounded eager"
+        case .deferred: "Deferred (lazy)"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .eager: "eager"
+        case .boundedEager: "bounded"
+        case .deferred: "deferred"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .eager:
+            "Default MLX behavior — all weights evaluated in one step at the end of load."
+        case .boundedEager:
+            "Evaluates each safetensors shard before loading the next — lowers peak RAM during load while staying ready after load completes."
+        case .deferred:
+            "Load returns quickly with lazy weights; the first token pays the materialization cost. Not labeled as fully ready for latency-sensitive use."
+        }
+    }
+}
+
 // MARK: - Generation settings
 
 struct GenerationSettings: Codable, Equatable {
+    /// MLX safetensors materialization policy for API auto-load (UI Load picks per click).
+    var weightLoadPolicy: WeightLoadPolicy = .eager
     var temperature: Double = 0.7
     var topP: Double = 0.95
     var topK: Int = 0
@@ -247,6 +319,9 @@ struct GenerationSettings: Codable, Equatable {
     // Tolerant decoding so new fields never invalidate an older settings file.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        weightLoadPolicy =
+            (try? c.decodeIfPresent(WeightLoadPolicy.self, forKey: .weightLoadPolicy))
+            .flatMap { $0 } ?? .eager
         temperature =
             (try? c.decodeIfPresent(Double.self, forKey: .temperature)).flatMap { $0 } ?? 0.7
         topP = (try? c.decodeIfPresent(Double.self, forKey: .topP)).flatMap { $0 } ?? 0.95

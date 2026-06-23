@@ -16,7 +16,7 @@ struct TuningInspector: View {
 
     var body: some View {
         @Bindable var app = app
-        ScrollView {
+        ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: Theme.s3) {
                 collapsibleSection(
                     "Sampling & Limits", icon: "dice", expanded: $samplingExpanded,
@@ -46,20 +46,36 @@ struct TuningInspector: View {
                     ParameterSlider(
                         label: "Repetition penalty", value: $app.settings.repetitionPenalty,
                         range: 1.0...1.5, hardLimit: 1.0...3.0, fractionDigits: 2)
+                    Picker("API auto-load policy", selection: $app.settings.weightLoadPolicy) {
+                        ForEach(WeightLoadPolicy.allCases) { policy in
+                            Text(policy.label).tag(policy)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .help(
+                        "Only affects models the API server loads automatically — not chat speed for an already-loaded model. Use Model Library → Load for chat; MoE models (A3B, etc.) always use standard load."
+                    )
                 }
 
                 collapsibleSection(
                     "System Prompt", icon: "text.quote", expanded: $promptExpanded,
-                    detail: app.settings.systemPrompt.isEmpty ? "empty" : promptSummary
+                    detail: systemPromptSectionDetail
                 ) {
-                    HStack {
+                    VStack(alignment: .leading, spacing: Theme.s2) {
+                        HStack(spacing: Theme.s2) {
                         Menu {
                             if app.promptPresets.isEmpty {
                                 Text("No presets saved yet")
                             }
                             ForEach(app.promptPresets) { preset in
-                                Button(preset.name) {
-                                    app.settings.systemPrompt = preset.text
+                                Button {
+                                    app.applySystemPrompt(preset.text, presetID: preset.id)
+                                } label: {
+                                    if app.activePromptPresetID == preset.id {
+                                        Label(preset.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(preset.name)
+                                    }
                                 }
                             }
                             Divider()
@@ -75,22 +91,28 @@ struct TuningInspector: View {
                                     ForEach(app.promptPresets) { preset in
                                         Button(preset.name, role: .destructive) {
                                             app.promptPresets.removeAll { $0.id == preset.id }
+                                            if app.activePromptPresetID == preset.id {
+                                                app.activePromptPresetID = nil
+                                            }
                                         }
                                     }
                                 }
                             }
                         } label: {
-                            Label("Presets", systemImage: "bookmark")
-                                .font(.caption)
+                            HStack(spacing: Theme.s1) {
+                                Image(systemName: "bookmark.fill")
+                                Text(app.systemPromptPresetLabel)
+                                    .font(.caption.weight(.semibold))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Image(systemName: "chevron.down")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .menuStyle(.borderlessButton)
-                        .fixedSize()
-
-                        Spacer()
-
-                        Text(promptSummary)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                        .layoutPriority(1)
 
                         Button {
                             showPromptEditor = true
@@ -101,6 +123,12 @@ struct TuningInspector: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Open the system prompt in a large resizable editor")
+                        }
+
+                        Text(promptSummary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
                     }
 
                     TextEditor(text: $app.settings.systemPrompt)
@@ -110,6 +138,9 @@ struct TuningInspector: View {
                         .padding(Theme.s2)
                         .background(.black.opacity(0.25))
                         .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                        .onChange(of: app.settings.systemPrompt) { _, _ in
+                            app.reconcileActivePromptPreset()
+                        }
                 }
 
                 if !app.engine.loadedModels.isEmpty {
@@ -191,9 +222,12 @@ struct TuningInspector: View {
                 }
             }
             .padding(Theme.s3)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollContentBackground(.hidden)
         .background(.black.opacity(0.15))
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .clipped()
         .sheet(isPresented: $showPromptEditor) {
             SystemPromptEditor()
                 .environment(app)
@@ -237,11 +271,22 @@ struct TuningInspector: View {
         // Same name = overwrite, so presets stay editable in place.
         if let index = app.promptPresets.firstIndex(where: { $0.name == name }) {
             app.promptPresets[index].text = app.settings.systemPrompt
+            app.activePromptPresetID = app.promptPresets[index].id
         } else {
-            app.promptPresets.append(
-                PromptPreset(name: name, text: app.settings.systemPrompt))
+            let preset = PromptPreset(name: name, text: app.settings.systemPrompt)
+            app.promptPresets.append(preset)
+            app.activePromptPresetID = preset.id
         }
         presetNameDraft = ""
+    }
+
+    private var systemPromptSectionDetail: String {
+        if app.settings.systemPrompt.isEmpty { return "empty" }
+        let label = app.systemPromptPresetLabel
+        if label == "Custom" || label == "None" {
+            return promptSummary
+        }
+        return "\(label) · \(promptSummary)"
     }
 
     private var promptSummary: String {
@@ -264,7 +309,7 @@ struct TuningInspector: View {
         }
         .padding(Theme.s3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
+        .inspectorPanelCard()
     }
 
     @ViewBuilder
@@ -275,9 +320,7 @@ struct TuningInspector: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: Theme.s2) {
             Button {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    expanded.wrappedValue.toggle()
-                }
+                expanded.wrappedValue.toggle()
             } label: {
                 HStack {
                     Label(title, systemImage: icon)
@@ -309,7 +352,7 @@ struct TuningInspector: View {
         }
         .padding(Theme.s3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
+        .inspectorPanelCard()
     }
 
     private func labeledValue(_ label: String, _ value: String) -> some View {
@@ -329,12 +372,12 @@ private struct MCPInspectorPanel: View {
     @Environment(AppState.self) private var app
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s2) {
-            if app.mcp.entries.isEmpty {
-                Text("No MCP servers configured.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            } else {
+        if app.mcp.entries.isEmpty {
+            Text("No MCP servers configured.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: Theme.s1) {
                 ForEach(app.mcp.entries) { entry in
                     MCPInspectorRow(entry: entry)
                 }
@@ -345,6 +388,7 @@ private struct MCPInspectorPanel: View {
 
 private struct MCPInspectorRow: View {
     @Environment(AppState.self) private var app
+    @State private var showToolsPopover = false
     let entry: MCPManager.Entry
 
     private var enabled: Bool { app.mcp.isServerEnabled(entry.id) }
@@ -356,35 +400,28 @@ private struct MCPInspectorRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s2) {
+        VStack(alignment: .leading, spacing: Theme.s1) {
             HStack(alignment: .center, spacing: Theme.s2) {
                 refreshStatusButton
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 0) {
                     Text(entry.id)
-                        .font(.caption.weight(.bold))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(statusSummary)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(statusForeground)
+                        .font(.callout.weight(.semibold))
                         .lineLimit(1)
-                        .help(statusDetail)
+                        .truncationMode(.tail)
+                    Text(rowSubtitle)
+                        .font(.caption2)
+                        .foregroundStyle(subtitleColor)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .help(rowSubtitleHelp)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
-                if !tools.isEmpty {
-                    Text("\(selectedTools.count)/\(tools.count)")
-                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .frame(minWidth: 34, alignment: .center)
-                        .background(.white.opacity(0.055))
-                        .clipShape(.capsule)
-                        .minimumScaleFactor(0.85)
-                        .help("Enabled tools")
-                }
+            HStack(spacing: Theme.s3) {
+                Spacer(minLength: 0)
+                toolMenuButton
 
                 Toggle("Enabled", isOn: Binding(
                     get: { enabled },
@@ -400,38 +437,14 @@ private struct MCPInspectorRow: View {
                 } label: {
                     Image(systemName: entry.isBuiltIn ? "folder" : "doc.text.magnifyingglass")
                         .font(.callout)
+                        .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.borderless)
                 .help(entry.isBuiltIn ? "Reveal built-in MCP workspace folder" : "Reveal MCP config file")
             }
-
-            VStack(alignment: .leading, spacing: Theme.s1) {
-                HStack(spacing: Theme.s2) {
-                    Text("Tools")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    toolMenu
-                }
-
-                Text(detailText)
-                    .font(.caption)
-                    .foregroundStyle(detailColor)
-                    .lineLimit(1)
-                    .help(detailText)
-            }
-
-            HStack(spacing: Theme.s2) {
-                Text(transportSummary)
-                    .font(.caption2.monospaced().weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .help(entry.transport)
-                Spacer(minLength: 0)
-            }
         }
-        .padding(Theme.s2)
-        .background(.white.opacity(0.04))
-        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
     }
 
     private var refreshStatusButton: some View {
@@ -440,89 +453,76 @@ private struct MCPInspectorRow: View {
         } label: {
             Circle()
                 .fill(statusColor)
-                .frame(width: 11, height: 11)
-                .padding(6)
-                .contentShape(.circle)
-            .background(statusColor.opacity(0.16))
-            .clipShape(.capsule)
+                .frame(width: 8, height: 8)
+                .padding(4)
+                .contentShape(.rect)
         }
         .buttonStyle(.plain)
         .help("Refresh MCP status: \(statusLabel)")
     }
 
-    private var toolMenu: some View {
-        Menu {
-            if tools.isEmpty {
-                Text("No tools reported")
-            } else {
-                Button("Enable all tools") {
-                    app.mcp.setAllTools(true, for: entry.id)
-                }
-                Button("Disable all tools") {
-                    app.mcp.setAllTools(false, for: entry.id)
-                }
-                Divider()
-                ForEach(tools) { tool in
-                    Button {
-                        app.mcp.setTool(
-                            tool.name,
-                            enabled: !app.mcp.isToolSelected(tool.name, for: entry.id),
-                            for: entry.id)
-                    } label: {
-                        Label(
-                            tool.name,
-                            systemImage: app.mcp.isToolSelected(tool.name, for: entry.id)
-                                ? "checkmark.square.fill" : "square")
-                    }
-                }
-            }
+    private var toolMenuButton: some View {
+        Button {
+            showToolsPopover.toggle()
         } label: {
-            HStack(spacing: Theme.s1) {
-                Text(selectedToolTitle)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                Spacer(minLength: Theme.s1)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, Theme.s2)
-            .frame(height: 28)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.white.opacity(0.055))
-            .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+            Image(systemName: "slider.horizontal.3")
+                .font(.callout)
+                .foregroundStyle(enabled && !tools.isEmpty ? .secondary : .tertiary)
+                .frame(width: 28, height: 28)
+                .contentShape(.rect)
         }
-        .menuStyle(.borderlessButton)
+        .buttonStyle(.borderless)
         .disabled(!enabled || tools.isEmpty)
-        .help(toolSelectionHelp)
-    }
-
-    private var selectedToolTitle: String {
-        guard !tools.isEmpty else { return "No tools" }
-        guard !selectedTools.isEmpty else { return "None enabled" }
-        if selectedTools.count == tools.count { return "All enabled" }
-        if selectedTools.count == 1 {
-            return Self.shortToolTitle(selectedTools[0].name)
+        .help(toolMenuHelp)
+        .popover(isPresented: $showToolsPopover, arrowEdge: .bottom) {
+            MCPToolChecklistPopover(entryID: entry.id, tools: tools)
+                .environment(app)
         }
-        return "\(selectedTools.count) enabled"
     }
 
-    private var detailText: String {
-        guard enabled else { return "Off" }
-        guard !tools.isEmpty else { return shortStatusDetail }
-        guard !selectedTools.isEmpty else { return "No tools enabled" }
-        if selectedTools.count == 1 {
-            return Self.shortToolSummary(selectedTools[0])
+    private var rowSubtitle: String {
+        let transport = transportSummary
+        guard enabled else { return "off · \(transport)" }
+        switch entry.status {
+        case .disabled:
+            return "off · \(transport)"
+        case .connecting:
+            return "starting · \(transport)"
+        case .connected:
+            if tools.isEmpty {
+                return "online · \(transport)"
+            }
+            return "online · \(selectedTools.count)/\(tools.count) tools · \(transport)"
+        case .failed:
+            return "failed · \(transport)"
         }
-        return "\(selectedTools.count) tools enabled"
     }
 
-    private var detailColor: Color {
-        selectedTools.isEmpty ? statusForeground : .secondary
+    private var rowSubtitleHelp: String {
+        var parts = [statusDetail]
+        if !tools.isEmpty {
+            parts.append("Tools: \(toolMenuHelp)")
+        }
+        return parts.joined(separator: "\n")
     }
 
-    private var toolSelectionHelp: String {
-        guard !selectedTools.isEmpty else { return "No MCP tools enabled for this server." }
+    private var subtitleColor: Color {
+        guard enabled else { return Color.secondary.opacity(0.75) }
+        switch entry.status {
+        case .failed:
+            return .red
+        case .connecting:
+            return .yellow
+        case .connected:
+            return tools.isEmpty || selectedTools.isEmpty ? .yellow : .secondary
+        case .disabled:
+            return Color.secondary.opacity(0.75)
+        }
+    }
+
+    private var toolMenuHelp: String {
+        guard !tools.isEmpty else { return "No tools reported." }
+        if selectedTools.isEmpty { return "No tools enabled." }
         return selectedTools.map(\.name).joined(separator: ", ")
     }
 
@@ -544,90 +544,6 @@ private struct MCPInspectorRow: View {
         }
     }
 
-    private var shortStatusDetail: String {
-        guard enabled else { return "Off" }
-        switch entry.status {
-        case .disabled:
-            return "Off"
-        case .connecting:
-            return "Starting"
-        case .connected(let tools):
-            return tools.isEmpty ? "No tools" : "Ready"
-        case .failed:
-            return "Failed"
-        }
-    }
-
-    private static func shortToolTitle(_ name: String) -> String {
-        switch name.lowercased() {
-        case "sequentialthinking":
-            return "thinking"
-        case "get_config":
-            return "config"
-        case "read_pdf":
-            return "read pdf"
-        case "read_pdf_page":
-            return "pdf page"
-        case "get_pdf_metadata":
-            return "pdf meta"
-        case "legal_think":
-            return "legal think"
-        case "create_entities":
-            return "create"
-        default:
-            let words = name
-                .replacingOccurrences(of: "_", with: " ")
-                .replacingOccurrences(of: "-", with: " ")
-                .split(separator: " ")
-                .map(String.init)
-            if words.isEmpty { return clipped(name, max: 16) }
-            return clipped(words.prefix(2).joined(separator: " "), max: 16)
-        }
-    }
-
-    private static func shortToolSummary(_ tool: MCPTool) -> String {
-        switch tool.name.lowercased() {
-        case "legal_think":
-            return "Legal reasoning"
-        case "status":
-            return "Status"
-        case "get_config":
-            return "Config"
-        case "list_roots":
-            return "Roots"
-        case "read_file":
-            return "Read file"
-        case "write_file":
-            return "Write file"
-        case "list_directory":
-            return "List files"
-        case "search_files":
-            return "Search files"
-        case "create_entities":
-            return "Create entities"
-        case "create_relations":
-            return "Create links"
-        case "read_graph":
-            return "Read graph"
-        case "search_nodes":
-            return "Search graph"
-        case "open_nodes":
-            return "Open nodes"
-        case "read_pdf":
-            return "PDF text"
-        case "read_pdf_page":
-            return "PDF page"
-        case "get_pdf_metadata":
-            return "PDF metadata"
-        case "search_pdf":
-            return "PDF search"
-        case "sequentialthinking":
-            return "Step reasoning"
-        default:
-            return shortToolTitle(tool.name)
-        }
-    }
-
     private static func clipped(_ text: String, max: Int) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > max else { return trimmed }
@@ -645,21 +561,6 @@ private struct MCPInspectorRow: View {
             return tools.isEmpty ? "empty" : "online"
         case .failed:
             return "failed"
-        }
-    }
-
-    private var statusSummary: String {
-        guard enabled else { return "off" }
-        switch entry.status {
-        case .disabled:
-            return "off"
-        case .connecting:
-            return entry.config.command == nil ? "checking tools" : "starting stdio"
-        case .connected(let tools):
-            if tools.isEmpty { return "online · no tools" }
-            return "online · \(tools.count) tools"
-        case .failed:
-            return entry.config.command == nil ? "connection failed" : "launch failed"
         }
     }
 
@@ -693,19 +594,6 @@ private struct MCPInspectorRow: View {
         }
     }
 
-    private var statusForeground: Color {
-        switch entry.status {
-        case .failed:
-            return .red
-        case .connecting:
-            return .yellow
-        case .connected(let tools):
-            return tools.isEmpty ? .yellow : .secondary
-        case .disabled:
-            return .secondary
-        }
-    }
-
     private func revealCurrentTarget() {
         if entry.isBuiltIn {
             NSWorkspace.shared.activateFileViewerSelecting([ForgePaths.appSupport])
@@ -715,14 +603,71 @@ private struct MCPInspectorRow: View {
     }
 }
 
+private struct MCPToolChecklistPopover: View {
+    @Environment(AppState.self) private var app
+    @Environment(\.dismiss) private var dismiss
+
+    let entryID: String
+    let tools: [MCPTool]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            HStack(spacing: Theme.s2) {
+                Button("Enable all tools") {
+                    app.mcp.setAllTools(true, for: entryID)
+                }
+                Button("Disable all tools") {
+                    app.mcp.setAllTools(false, for: entryID)
+                }
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .help("Close")
+            }
+
+            Divider()
+
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: Theme.s2) {
+                    ForEach(tools) { tool in
+                        Toggle(tool.name, isOn: Binding(
+                            get: { app.mcp.isToolSelected(tool.name, for: entryID) },
+                            set: { app.mcp.setTool(tool.name, enabled: $0, for: entryID) }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                        .help(tool.name)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 520)
+        }
+        .padding(Theme.s3)
+        .frame(width: 330)
+    }
+}
+
 /// One resident model in the inspector: activate, inspect, eject.
 private struct LoadedModelRow: View {
     @Environment(AppState.self) private var app
     let entry: InferenceEngine.Loaded
 
     private var isActive: Bool { app.engine.activeModelID == entry.id }
+    private var needsStandardReload: Bool {
+        entry.weightLoadPolicy == .boundedEager
+            || entry.weightLoadPolicy == .deferred
+    }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s1) {
         HStack(spacing: Theme.s2) {
             Button {
                 app.engine.activeModelID = entry.id
@@ -742,7 +687,7 @@ private struct LoadedModelRow: View {
                         Format.bytes(entry.model.sizeBytes),
                         entry.model.quantization,
                         entry.model.architecture,
-                        entry.mmapReaders != nil ? "mmap" : nil,
+entry.weightLoadPolicy?.shortLabel,
                     ]
                     .compactMap { $0 }.joined(separator: " · ")
                 )
@@ -751,8 +696,7 @@ private struct LoadedModelRow: View {
             }
             Spacer()
             Button {
-                app.engine.unload(entry.id)
-                app.scheduleSave()
+                app.unloadLocalModel(entry.id)
             } label: {
                 Image(systemName: "eject")
                     .font(.caption)
@@ -760,6 +704,16 @@ private struct LoadedModelRow: View {
             }
             .buttonStyle(.plain)
             .help("Unload from memory")
+        }
+        if needsStandardReload {
+            Button("Reload with Standard Load (faster)") {
+                app.reloadModelStandard(entry.model)
+            }
+            .font(.caption2.weight(.medium))
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .tint(Theme.ember)
+        }
         }
     }
 }
@@ -799,7 +753,7 @@ struct SystemPromptEditor: View {
 
             HStack {
                 Button("Clear", role: .destructive) {
-                    app.settings.systemPrompt = ""
+                    app.clearSystemPrompt()
                 }
                 .disabled(app.settings.systemPrompt.isEmpty)
                 Text("Changes apply live to the next message.")
@@ -836,6 +790,13 @@ struct ParameterSlider: View {
     let hardLimit: ClosedRange<Double>
     let fractionDigits: Int
 
+    @State private var draft: Double?
+    @State private var isDragging = false
+
+    private var displayValue: Double {
+        draft ?? value
+    }
+
     var body: some View {
         VStack(spacing: Theme.s1) {
             HStack {
@@ -844,8 +805,8 @@ struct ParameterSlider: View {
                 Spacer()
                 TextField(
                     "", value: Binding(
-                        get: { value },
-                        set: { value = min(max($0, hardLimit.lowerBound), hardLimit.upperBound) }),
+                        get: { displayValue },
+                        set: { commit($0) }),
                     format: .number.precision(.fractionLength(0...fractionDigits)))
                     .textFieldStyle(.plain)
                     .multilineTextAlignment(.trailing)
@@ -858,12 +819,26 @@ struct ParameterSlider: View {
             }
             Slider(
                 value: Binding(
-                    get: { min(max(value, range.lowerBound), range.upperBound) },
-                    set: { value = $0 }),
-                in: range)
+                    get: { min(max(displayValue, range.lowerBound), range.upperBound) },
+                    set: { draft = $0 }),
+                in: range,
+                onEditingChanged: { editing in
+                    isDragging = editing
+                    if !editing, let draft {
+                        commit(draft)
+                        self.draft = nil
+                    }
+                })
                 .tint(Theme.ember)
                 .controlSize(.small)
         }
+        .onChange(of: value) { _, _ in
+            if !isDragging { draft = nil }
+        }
+    }
+
+    private func commit(_ raw: Double) {
+        value = min(max(raw, hardLimit.lowerBound), hardLimit.upperBound)
     }
 }
 
@@ -929,5 +904,17 @@ struct IntField: View {
             return "\(preset / 1_024)K"
         }
         return "\(preset)"
+    }
+}
+
+/// Solid panel chrome for the inspector — avoids expensive material blur while scrolling.
+private extension View {
+    func inspectorPanelCard() -> some View {
+        background(Theme.assistantBubble.opacity(0.92))
+            .clipShape(.rect(cornerRadius: Theme.radiusMedium))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusMedium)
+                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            )
     }
 }

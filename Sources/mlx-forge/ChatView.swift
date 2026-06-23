@@ -30,10 +30,6 @@ struct ChatView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerView()
         }
-        .inspector(isPresented: $app.showInspector) {
-            TuningInspector()
-                .inspectorColumnWidth(min: 240, ideal: 280, max: 340)
-        }
         .background(Theme.backgroundGradient)
         .sheet(isPresented: $showLargeTextPopup) {
             LargeTextView(text: largeTextPopupContent) {
@@ -116,7 +112,13 @@ struct TranscriptView: View {
     let conversation: Conversation
     var onShowLargeText: (String) -> Void = { _ in }
 
+    /// When true, new tokens keep the transcript pinned to the bottom.
+    /// Set false as soon as the user scrolls up; only re-enables near the bottom.
     @State private var followsOutput = true
+    @State private var distanceFromBottom: CGFloat = 0
+
+    private let detachThreshold: CGFloat = 48
+    private let attachThreshold: CGFloat = 16
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -135,106 +137,42 @@ struct TranscriptView: View {
                 .frame(maxWidth: 860)
                 .frame(maxWidth: .infinity)
             }
-            .background(
-                TranscriptScrollMonitor { isNearBottom in
-                    followsOutput = isNearBottom
-                }
-            )
-            .onChange(of: conversation.messages.last?.content) {
-                if followsOutput {
-                    scrollToBottom(proxy)
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                max(0, geometry.contentSize.height - geometry.visibleRect.maxY)
+            } action: { _, gap in
+                distanceFromBottom = gap
+                if gap > detachThreshold {
+                    followsOutput = false
+                } else if gap <= attachThreshold {
+                    followsOutput = true
                 }
             }
+            .onChange(of: conversation.messages.last?.content) {
+                scrollToBottomIfFollowing(proxy)
+            }
             .onChange(of: conversation.messages.count) {
-                if followsOutput {
-                    scrollToBottom(proxy)
-                }
+                scrollToBottomIfFollowing(proxy)
             }
             .onChange(of: conversation.id) {
                 followsOutput = true
-                scrollToBottom(proxy)
+                distanceFromBottom = 0
+                scrollToBottomIfFollowing(proxy, force: true)
             }
             .onAppear {
-                scrollToBottom(proxy)
+                scrollToBottomIfFollowing(proxy, force: true)
             }
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+    private func scrollToBottomIfFollowing(_ proxy: ScrollViewProxy, force: Bool = false) {
+        guard force || (followsOutput && distanceFromBottom <= detachThreshold) else { return }
         DispatchQueue.main.async {
+            guard force || (followsOutput && distanceFromBottom <= detachThreshold) else { return }
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) {
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
-        }
-    }
-}
-
-private struct TranscriptScrollMonitor: NSViewRepresentable {
-    var onNearBottomChange: (Bool) -> Void
-
-    func makeNSView(context: Context) -> MonitorView {
-        let view = MonitorView()
-        view.onNearBottomChange = onNearBottomChange
-        return view
-    }
-
-    func updateNSView(_ nsView: MonitorView, context: Context) {
-        nsView.onNearBottomChange = onNearBottomChange
-        nsView.attachIfNeeded()
-    }
-
-    final class MonitorView: NSView {
-        var onNearBottomChange: ((Bool) -> Void)?
-        private weak var scrollView: NSScrollView?
-        private var lastNearBottom: Bool?
-        private let threshold: CGFloat = 80
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            attachIfNeeded()
-        }
-
-        func attachIfNeeded() {
-            guard scrollView == nil else {
-                updatePosition()
-                return
-            }
-            guard let found = enclosingScrollView() else { return }
-            scrollView = found
-            found.contentView.postsBoundsChangedNotifications = true
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(boundsDidChange(_:)),
-                name: NSView.boundsDidChangeNotification,
-                object: found.contentView)
-            updatePosition()
-        }
-
-        @objc private func boundsDidChange(_ notification: Notification) {
-            updatePosition()
-        }
-
-        private func enclosingScrollView() -> NSScrollView? {
-            var view: NSView? = superview
-            while let current = view {
-                if let scrollView = current as? NSScrollView { return scrollView }
-                view = current.superview
-            }
-            return nil
-        }
-
-        private func updatePosition() {
-            guard let scrollView,
-                  let documentView = scrollView.documentView else { return }
-            let visible = scrollView.contentView.bounds
-            let documentHeight = documentView.bounds.height
-            let bottomGap = documentHeight - (visible.origin.y + visible.height)
-            let isNearBottom = bottomGap <= threshold
-            guard isNearBottom != lastNearBottom else { return }
-            lastNearBottom = isNearBottom
-            onNearBottomChange?(isNearBottom)
         }
     }
 }
@@ -302,13 +240,17 @@ struct MessageView: View {
 
     private var header: some View {
         HStack(spacing: Theme.s2) {
-            ForgeMark(size: 12)
+            ForgeMark(size: 12, animated: false)
             Text(message.modelName ?? "Assistant")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             if isStreaming {
                 ProgressView()
                     .controlSize(.mini)
+            }
+            Spacer(minLength: 0)
+            if !isStreaming, !message.content.isEmpty {
+                CopyButton(text: message.content, label: "Copy all")
             }
         }
     }
@@ -439,6 +381,10 @@ struct ThinkingBlock: View {
                 Text(done ? "Reasoning" : "Reasoning…")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if !text.isEmpty {
+                    CopyButton(text: text, label: "Copy")
+                }
                 if !done && isStreaming {
                     ProgressView()
                         .controlSize(.mini)
@@ -603,11 +549,10 @@ struct ComposerView: View {
                                             Button(name) {
                                                 if let content = app.loadPromptContent(from: url) {
                                                     app.lastPromptContent = content
+                                                    app.applySystemPrompt(content)
                                                     if var conv = app.selectedConversation {
                                                         conv.systemPrompt = content
                                                         app.selectedConversation = conv
-                                                    } else {
-                                                        app.settings.systemPrompt = content
                                                     }
                                                 }
                                             }
@@ -641,6 +586,19 @@ struct ComposerView: View {
                     Spacer(minLength: Theme.s6)
 
                     HStack(spacing: Theme.s3) {
+                        Button {
+                            if app.isCodingOrchestratorRunning {
+                                app.stopCodingOrchestrator()
+                            } else if !app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                app.runCodingOrchestrator(task: app.composerText)
+                            }
+                        } label: {
+                            ToolbarIcon(app.isCodingOrchestratorRunning ? "stop.fill" : "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!app.hasOpenRouterKey)
+                        .help(app.isCodingOrchestratorRunning ? "Stop code loop (\(app.codingOrchestratorPhase))" : "Code loop: planner→coder→auditor→fixer→tester via OpenRouter")
+
                         Button {
                             showAgentDispatch = true
                         } label: {
@@ -691,7 +649,7 @@ struct ComposerView: View {
                         Toggle("OpenRouter", isOn: Binding(
                             get: { !app.openRouterModelIDs.isEmpty },
                             set: { enabled in
-                                if enabled {
+if enabled {
                                     if app.openRouterModelIDs.isEmpty {
                                         app.setOpenRouterModel(OpenRouterClient.defaultModelID, selected: true)
                                     }
@@ -755,9 +713,7 @@ struct ComposerView: View {
 
                         if !app.engine.loadedModels.isEmpty || app.engine.isLoadingAnything {
                             Button {
-                                app.stopGenerating()
-                                app.engine.unloadAll()
-                                app.scheduleSave()
+                                app.unloadAllLocalModels()
                             } label: {
                                 Image(systemName: "eject.fill")
                                     .font(.callout.weight(.semibold))
@@ -1072,11 +1028,14 @@ struct ComposerView: View {
             }
             let count = app.engine.liveTokenCount
             let tps = app.engine.liveTokensPerSecond
+            if count == 0, app.engine.isGenerating {
+                return "Agents: \(labels) · Generating…"
+            }
             if tps > 0 {
                 return
                     "Agents: \(labels) · \(count) tokens · \(tps.formatted(.number.precision(.fractionLength(1)))) tok/s"
             }
-            return "Agents: \(labels) · \(count) tokens"
+            return count > 0 ? "Agents: \(labels) · \(count) tokens" : "Agents: \(labels) · Working…"
         }
         if app.isClaudeGenerating {
             return "Claude is responding…"
@@ -1086,10 +1045,13 @@ struct ComposerView: View {
         }
         let count = app.engine.liveTokenCount
         let tps = app.engine.liveTokensPerSecond
+        if count == 0, app.engine.isGenerating {
+            return "Generating…"
+        }
         if tps > 0 {
             return "\(count) tokens · \(tps.formatted(.number.precision(.fractionLength(1)))) tok/s"
         }
-        return "\(count) tokens"
+        return count > 0 ? "\(count) tokens" : "Working…"
     }
 
     // Compact popover triggered from the agents icon in the bottom composer bar.
@@ -1261,6 +1223,23 @@ private struct CloudModelPicker: View {
 private struct OpenRouterModelPicker: View {
     @Environment(AppState.self) private var app
     @Binding var customModel: String
+    @State private var search = ""
+
+    private var filteredPresets: [(id: String, label: String)] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return OpenRouterClient.models }
+        return OpenRouterClient.models.filter {
+            $0.id.lowercased().contains(q) || $0.label.lowercased().contains(q)
+        }
+    }
+
+    private var filteredCatalog: [OpenRouterClient.ModelInfo] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return app.openRouterCatalog }
+        return app.openRouterCatalog.filter {
+            $0.id.lowercased().contains(q) || $0.name.lowercased().contains(q)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.s2) {
@@ -1274,48 +1253,106 @@ private struct OpenRouterModelPicker: View {
             }
 
             HStack(spacing: Theme.s2) {
-                Button("All") {
-                    app.selectAllOpenRouterModels()
+                Button("Refresh catalog") {
+                    app.refreshOpenRouterCatalog()
                 }
                 .buttonStyle(.bordered)
-                Button("None") {
-                    app.clearOpenRouterModels()
+                .disabled(app.isOpenRouterCatalogLoading || !app.hasOpenRouterKey)
+                if app.isOpenRouterCatalogLoading {
+                    ProgressView().controlSize(.small)
                 }
-                .buttonStyle(.bordered)
+            }
+            if let err = app.openRouterCatalogError {
+                Text(err).font(.caption).foregroundStyle(.red)
+            }
+
+            TextField("Search models…", text: $search)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: Theme.s2) {
+                Button("All presets") { app.selectAllOpenRouterModels() }
+                    .buttonStyle(.bordered)
+                Button("None") { app.clearOpenRouterModels() }
+                    .buttonStyle(.bordered)
             }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.s1) {
-                    ForEach(OpenRouterClient.models, id: \.id) { model in
-                        Toggle(isOn: Binding(
-                            get: { app.isOpenRouterModelSelected(model.id) },
-                            set: { app.setOpenRouterModel(model.id, selected: $0) }
-                        )) {
-                            Text(model.label)
-                                .lineLimit(1)
+                    Text("Presets").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    if filteredPresets.isEmpty {
+                        Text("No presets match search")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(filteredPresets, id: \.id) { model in
+                            openRouterRow(id: model.id, label: model.label)
                         }
-                        .toggleStyle(.checkbox)
+                    }
+
+                    if !filteredCatalog.isEmpty {
+                        Text("Catalog").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.top, Theme.s1)
+                        ForEach(filteredCatalog.prefix(80)) { model in
+                            openRouterRow(id: model.id, label: model.label)
+                        }
+                    }
+
+                    let customIDs = app.openRouterModelIDs.filter { selected in
+                        !OpenRouterClient.models.contains { $0.id == selected }
+                        && !app.openRouterCatalog.contains { $0.id == selected }
+                    }
+                    if !customIDs.isEmpty {
+                        Text("Custom").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .padding(.top, Theme.s1)
+                        ForEach(customIDs, id: \.self) { modelID in
+                            openRouterRow(id: modelID, label: OpenRouterClient.label(for: modelID))
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 260)
+            .frame(maxHeight: 280)
 
             Divider()
             HStack(spacing: Theme.s2) {
-                TextField("custom model slug", text: $customModel)
+                TextField("any OpenRouter slug", text: $customModel)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption.monospaced())
                     .onSubmit { applyCustomModel() }
-                Button("Add") {
-                    applyCustomModel()
-                }
-                .disabled(customModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Add") { applyCustomModel() }
+                    .disabled(customModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(Theme.s3)
-        .frame(width: 330)
+        .frame(width: 380)
         .background(Theme.backgroundGradient)
+        .onAppear {
+            if app.openRouterCatalog.isEmpty, app.hasOpenRouterKey {
+                app.refreshOpenRouterCatalog()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func openRouterRow(id: String, label: String) -> some View {
+        HStack(spacing: Theme.s2) {
+            Toggle(isOn: Binding(
+                get: { app.isOpenRouterModelSelected(id) },
+                set: { app.setOpenRouterModel(id, selected: $0) }
+            )) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(label).lineLimit(1)
+                    Text(id).font(.caption2.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            .toggleStyle(.checkbox)
+            Button("Use") {
+                app.setPrimaryOpenRouterModel(id)
+            }
+            .font(.caption2)
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+        }
     }
 
     private func applyCustomModel() {
