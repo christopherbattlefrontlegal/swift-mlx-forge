@@ -716,16 +716,16 @@ final class AppState {
         }.joined(separator: "\n")
         let overflow =
             tools.count > 80 ? "\n- ... \(tools.count - 80) more enabled MCP tools hidden." : ""
+        let configPath = MCPManager.projectConfigFile.path
         let instruction = """
 
-        Forge MCP tool access:
-        The following MCP tools are enabled and callable by Forge:
+        Forge MCP tool access (direct stdio/HTTP from \(configPath)):
         \(toolLines)\(overflow)
 
-        When you need one of those tools, respond with only this exact marker followed by one JSON object:
-        FORGE_MCP_CALL {"server":"server-id","tool":"tool-name","arguments":{}}
+        When you need a tool, respond with only this exact marker followed by one JSON object:
+        FORGE_MCP_CALL {"server":"desktop-commander","tool":"tool-name","arguments":{}}
 
-        Use only enabled tools from the list. Do not wrap the marker in Markdown. After Forge returns the MCP result, answer the user's request using that result.
+        Forge launches the real MCP server from mcp.json and calls it directly. Use the exact server id from the list above (e.g. desktop-commander). Do not wrap the marker in Markdown. After Forge returns the MCP result, answer using that result.
         """
         guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return instruction.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1341,10 +1341,22 @@ final class AppState {
         messageID: UUID
     ) async -> Bool {
         guard let content = messageContent(conversationID: conversationID, messageID: messageID),
-              let request = Self.parseMCPCallRequest(from: content)
+              var request = Self.parseMCPCallRequest(from: content)
         else { return false }
 
+        request.serverID = mcp.resolveEntryID(request.serverID)
         let requestLabel = "\(request.serverID).\(request.toolName)"
+
+        do {
+            try await mcp.ensureConnected(entryID: request.serverID)
+        } catch {
+            appendSystemMessage(
+                conversationID: conversationID,
+                content: "MCP failed: \(requestLabel)\n\n\(error.localizedDescription)"
+            )
+            return true
+        }
+
         guard isMCPToolEnabled(request) else {
             let enabled = mcp.selectedTools(for: request.serverID)
                 .sorted()
@@ -1494,12 +1506,15 @@ final class AppState {
     }
 
     private func isMCPToolEnabled(_ request: MCPCallRequest) -> Bool {
-        mcp.selectedConnectedTools().contains {
-            $0.serverID == request.serverID && (
+        let serverID = mcp.resolveEntryID(request.serverID)
+        if mcp.selectedConnectedTools().contains(where: {
+            $0.serverID == serverID && (
                 $0.tool.name == request.toolName ||
-                "\(request.serverID).\($0.tool.name)" == request.toolName
-            )
+                "\(serverID).\($0.tool.name)" == request.toolName)
+        }) {
+            return true
         }
+        return mcp.tools(for: serverID).contains { $0.name == request.toolName }
     }
 
     private func messageContent(conversationID: UUID, messageID: UUID) -> String? {
@@ -1520,11 +1535,19 @@ final class AppState {
     }
 
     private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
-        guard let marker = content.range(of: "FORGE_MCP_CALL"),
-              let jsonText = firstJSONObject(in: String(content[marker.upperBound...])) else {
-            return nil
+        if let marker = content.range(of: "FORGE_MCP_CALL"),
+           let request = parseMCPCallJSONObject(from: String(content[marker.upperBound...]))
+        {
+            return request
         }
-        guard let object = try? JSONSerialization.jsonObject(with: Data(jsonText.utf8))
+        if let request = parseMCPInvokeXML(from: content) { return request }
+        if let request = parseMCPCallJSONObject(from: content) { return request }
+        return nil
+    }
+
+    private static func parseMCPCallJSONObject(from text: String) -> MCPCallRequest? {
+        guard let jsonText = firstJSONObject(in: text),
+              let object = try? JSONSerialization.jsonObject(with: Data(jsonText.utf8))
                 as? [String: Any]
         else { return nil }
 
@@ -1538,11 +1561,62 @@ final class AppState {
             ?? (object["name"] as? String)
             ?? (object["toolName"] as? String)
             ?? ""
-        let arguments = object["arguments"] as? [String: Any] ?? [:]
+        let arguments =
+            (object["arguments"] as? [String: Any])
+            ?? object.filter { !["server", "serverID", "entry", "tool", "name", "toolName"].contains($0.key) }
         let serverID = server.trimmingCharacters(in: .whitespacesAndNewlines)
         let toolName = canonicalizeMCPToolName(
             tool.trimmingCharacters(in: .whitespacesAndNewlines),
             serverID: serverID)
+        guard !serverID.isEmpty, !toolName.isEmpty else { return nil }
+        return MCPCallRequest(serverID: serverID, toolName: toolName, arguments: arguments)
+    }
+
+    /// Parses `<invoke name="desktop-commander.read_file">` and `<parameter name="path">` blocks.
+    private static func parseMCPInvokeXML(from content: String) -> MCPCallRequest? {
+        guard let invokeStart = content.range(of: "<invoke"),
+              let nameRange = content[invokeStart.lowerBound...].range(
+                of: #"name="([^"]+)""#, options: .regularExpression)
+        else { return nil }
+
+        let nameMatch = String(content[nameRange])
+        guard let quoted = nameMatch.split(separator: "\"").dropFirst().first else { return nil }
+        let rawName = String(quoted)
+        let serverID: String
+        let toolName: String
+        if let dot = rawName.firstIndex(of: ".") {
+            serverID = String(rawName[..<dot])
+            toolName = String(rawName[rawName.index(after: dot)...])
+        } else {
+            serverID = "desktop-commander"
+            toolName = rawName
+        }
+
+        var arguments: [String: Any] = [:]
+        var searchStart = invokeStart.upperBound
+        while let paramStart = content[searchStart...].range(of: "<parameter"),
+              let close = content[paramStart.lowerBound...].range(of: "</parameter>")
+        {
+            let block = String(content[paramStart.lowerBound..<close.upperBound])
+            if let keyRange = block.range(of: #"name="([^"]+)""#, options: .regularExpression),
+               let valueStart = block.range(of: ">"),
+               let valueEnd = block.range(of: "</parameter>")
+            {
+                let keyMatch = String(block[keyRange])
+                if let key = keyMatch.split(separator: "\"").dropFirst().first {
+                    let value = String(block[valueStart.upperBound..<valueEnd.lowerBound])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    arguments[String(key)] = value
+                }
+            }
+            searchStart = close.upperBound
+            if let invokeEnd = content[invokeStart.lowerBound...].range(of: "</invoke>"),
+               searchStart >= invokeEnd.lowerBound
+            {
+                break
+            }
+        }
+
         guard !serverID.isEmpty, !toolName.isEmpty else { return nil }
         return MCPCallRequest(serverID: serverID, toolName: toolName, arguments: arguments)
     }

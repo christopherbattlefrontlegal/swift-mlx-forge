@@ -105,6 +105,8 @@ final class MCPManager {
 
     private var watcher: DispatchSourceFileSystemObject?
     private var hasStarted = false
+    /// Live stdio MCP processes keyed by mcp.json server id (e.g. desktop-commander).
+    private var stdioSessions: [String: MCPStdioSession] = [:]
     private var disabledServerIDs = Set(
         UserDefaults.standard.stringArray(forKey: "mcp.disabledServers") ?? []
     ) {
@@ -125,13 +127,19 @@ final class MCPManager {
     }
 
     func reload() {
+        stopAllStdioSessions()
         loadConfig(connectExternalServers: true)
     }
 
     func connectAvailableServers() {
         for entry in entries {
             guard !entry.isBuiltIn, isServerEnabled(entry.id) else { continue }
-            guard case .available = entry.status else { continue }
+            switch entry.status {
+            case .available, .failed:
+                break
+            default:
+                continue
+            }
             setStatus(entry.id, .connecting)
             if let urlString = entry.config.url {
                 connect(entryID: entry.id, urlString: urlString, headers: entry.config.headers ?? [:])
@@ -145,6 +153,70 @@ final class MCPManager {
                 setStatus(entry.id, .failed("entry needs a \"url\" or \"command\" field"))
             }
         }
+    }
+
+    /// Maps user/model aliases to the mcp.json server id. External servers always win
+    /// over the built-in forge-commander fallback.
+    func resolveEntryID(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        if entries.contains(where: { $0.id == trimmed }) { return trimmed }
+        let normalized = trimmed.lowercased()
+        let aliases: [String: String] = [
+            "desktop commander": "desktop-commander",
+            "desktop_commander": "desktop-commander",
+            "desktopcommander": "desktop-commander",
+            "io.github.wonderwhy-er/desktop-commander": "desktop-commander",
+        ]
+        if let alias = aliases[normalized], entries.contains(where: { $0.id == alias }) {
+            return alias
+        }
+        if normalized == "forge-commander",
+           entries.contains(where: { $0.id == "desktop-commander" })
+        {
+            return "desktop-commander"
+        }
+        return trimmed
+    }
+
+    /// Ensures an mcp.json server is connected before a tool call (re-launches stdio if needed).
+    func ensureConnected(entryID: String) async throws {
+        let resolved = resolveEntryID(entryID)
+        guard let entry = entries.first(where: { $0.id == resolved }) else {
+            throw MCPError.server(
+                "MCP server '\(entryID)' is not declared in \(Self.projectConfigFile.path)")
+        }
+        guard !entry.isBuiltIn else { return }
+        guard isServerEnabled(resolved) else {
+            throw MCPError.server("MCP server '\(resolved)' is disabled in Forge.")
+        }
+        if case .connected = entry.status {
+            if entry.config.url != nil { return }
+            if stdioSessions[resolved] != nil { return }
+        }
+        if let urlString = entry.config.url {
+            setStatus(resolved, .connecting)
+            connect(entryID: resolved, urlString: urlString, headers: entry.config.headers ?? [:])
+        } else if let command = entry.config.command {
+            setStatus(resolved, .connecting)
+            connectStdio(
+                entryID: resolved,
+                command: command,
+                args: entry.config.args ?? [],
+                env: entry.config.env ?? [:])
+        } else {
+            throw MCPError.server("MCP server '\(resolved)' needs a \"url\" or \"command\" field")
+        }
+        for _ in 0..<90 {
+            try await Task.sleep(for: .milliseconds(500))
+            if let current = entries.first(where: { $0.id == resolved }) {
+                if case .connected = current.status { return }
+                if case .failed(let message) = current.status {
+                    throw MCPError.server(message)
+                }
+            }
+        }
+        throw MCPError.server("Timed out connecting MCP server '\(resolved)'")
     }
 
     /// Choose the single Forge MCP config location.
@@ -197,7 +269,10 @@ final class MCPManager {
         }
         lastLoaded = Date()
         var nextEntries: [Entry] = []
-        if allServers[Self.commanderID] == nil {
+        // When desktop-commander (or any declared replacement) is in mcp.json, use it
+        // directly — do not register the restricted built-in forge-commander fallback.
+        let usesExternalCommander = allServers.keys.contains("desktop-commander")
+        if allServers[Self.commanderID] == nil, !usesExternalCommander {
             configureDefaultTool(for: Self.commanderID, tools: BuiltinCommander.tools)
             nextEntries.append(
                 Entry(
@@ -342,14 +417,9 @@ final class MCPManager {
     }
 
     func selectedConnectedTools() -> [MCPToolBinding] {
-        let hasConfiguredDesktopCommander = entries.contains {
-            !$0.isBuiltIn && $0.id == "desktop-commander" && isServerEnabled($0.id)
-        }
-        return entries.flatMap { entry -> [MCPToolBinding] in
-            if entry.id == Self.commanderID && hasConfiguredDesktopCommander {
-                return []
-            }
-            guard isServerEnabled(entry.id),
+        entries.flatMap { entry -> [MCPToolBinding] in
+            guard !entry.isBuiltIn,
+                  isServerEnabled(entry.id),
                   case .connected(let tools) = entry.status
             else { return [] }
             let selected = Set(selectedToolsByServer[entry.id] ?? [])
@@ -387,14 +457,58 @@ final class MCPManager {
     ) {
         Task {
             do {
-                let tools = try await MCPStdioClient(command: command, args: args, env: env)
-                    .listTools()
+                self.stopStdioSession(entryID: entryID)
+                let tools = try await self.openStdioSession(
+                    entryID: entryID, command: command, args: args, env: env)
                 self.configureDefaultTool(for: entryID, tools: tools)
                 self.setStatus(entryID, .connected(tools: tools))
             } catch {
+                self.stopStdioSession(entryID: entryID)
                 self.setStatus(entryID, .failed(error.localizedDescription))
             }
         }
+    }
+
+    private func stopStdioSession(entryID: String) {
+        stdioSessions[entryID]?.stop()
+        stdioSessions[entryID] = nil
+    }
+
+    private func stopAllStdioSessions() {
+        for id in stdioSessions.keys {
+            stopStdioSession(entryID: id)
+        }
+    }
+
+    private func openStdioSession(
+        entryID: String, command: String, args: [String], env: [String: String]
+    ) async throws -> [MCPTool] {
+        let commandCopy = command
+        let argsCopy = args
+        let envCopy = env
+        let launched = try await Task.detached {
+            let session = try MCPStdioSession(command: commandCopy, args: argsCopy, env: envCopy)
+            _ = try session.request(
+                id: 1,
+                method: "initialize",
+                params: [
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": [String: String](),
+                    "clientInfo": ["name": "Forge", "version": "1.0"],
+                ])
+            try session.notify(method: "notifications/initialized")
+            let result = try session.request(
+                id: 2, method: "tools/list", params: [String: String]())
+            let tools = (result["tools"] as? [[String: Any]] ?? []).compactMap { tool -> MCPTool? in
+                guard let name = tool["name"] as? String else { return nil }
+                return MCPTool(
+                    name: name,
+                    description: (tool["description"] as? String) ?? "")
+            }
+            return (session, tools)
+        }.value
+        stdioSessions[entryID] = launched.0
+        return launched.1
     }
 
     private func configureDefaultTool(for entryID: String, tools: [MCPTool]) {
@@ -405,7 +519,7 @@ final class MCPManager {
         }
         if let selected = selectedToolsByServer[entryID] {
             let valid = selected.filter { toolNames.contains($0) }
-            if !valid.isEmpty {
+            if valid.count == selected.count, !valid.isEmpty {
                 selectedToolsByServer[entryID] = valid
                 return
             }
@@ -436,8 +550,11 @@ final class MCPManager {
     /// Returns the raw JSON result as Data (decode with JSONSerialization on the caller side).
     /// This keeps everything Sendable across actor boundaries.
     func callTool(entryID: String, name: String, arguments: [String: Any]) async throws -> Data {
-        guard let entry = entries.first(where: { $0.id == entryID }) else {
-            throw MCPError.server("MCP entry '\(entryID)' not found")
+        let resolvedID = resolveEntryID(entryID)
+        try await ensureConnected(entryID: resolvedID)
+        guard let entry = entries.first(where: { $0.id == resolvedID }) else {
+            throw MCPError.server(
+                "MCP server '\(entryID)' not found in \(Self.projectConfigFile.path)")
         }
         if entry.isBuiltIn {
             return try BuiltinCommander.call(
@@ -450,7 +567,6 @@ final class MCPManager {
             let headers = entry.config.headers ?? [:]
             let endpoint = url
             let nameCopy = name
-            // Serialize args on the actor, pass only Sendable Data into the detached task.
             return try await Task.detached {
                 let args = (try? JSONSerialization.jsonObject(with: argsPayload) as? [String: Any]) ?? [:]
                 let client = MCPHTTPClient(endpoint: endpoint, extraHeaders: headers)
@@ -458,15 +574,19 @@ final class MCPManager {
             }.value
         }
 
-        if let command = entry.config.command {
-            return try await MCPStdioClient(
-                command: command,
-                args: entry.config.args ?? [],
-                env: entry.config.env ?? [:]
-            ).callToolReturningData(name: name, argumentsData: argsPayload)
+        if entry.config.command != nil {
+            guard let session = stdioSessions[resolvedID] else {
+                throw MCPError.server(
+                    "MCP stdio session for '\(resolvedID)' is not running — check MCP status in Settings.")
+            }
+            return try await Task.detached {
+                let args =
+                    (try? JSONSerialization.jsonObject(with: argsPayload) as? [String: Any]) ?? [:]
+                return try session.callTool(name: name, arguments: args)
+            }.value
         }
 
-        throw MCPError.server("MCP entry '\(entryID)' needs a \"url\" or \"command\" field")
+        throw MCPError.server("MCP server '\(resolvedID)' needs a \"url\" or \"command\" field")
     }
 
     /// Loopback may be plaintext; anything leaving the machine must be TLS.
@@ -797,218 +917,175 @@ private enum BuiltinCommander {
     }
 }
 
-// MARK: - Stdio client
+// MARK: - Stdio session (persistent per mcp.json entry)
 
-struct MCPStdioClient: Sendable {
-    let command: String
-    let args: [String]
-    let env: [String: String]
+/// Long-lived stdio MCP process. Forge keeps one session per mcp.json command server
+/// (desktop-commander, sequential-thinking, etc.) and reuses it for tool calls.
+final class MCPStdioSession: @unchecked Sendable {
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private let error = Pipe()
+    private let lock = NSLock()
+    private var outputBuffer = Data()
+    private var errorBuffer = Data()
+    private var nextRequestID = 10
 
-    func listTools() async throws -> [MCPTool] {
-        try await Task.detached {
-            let session = try StdioSession(command: command, args: args, env: env)
-            defer { session.stop() }
+    init(command: String, args: [String], env: [String: String]) throws {
+        process.executableURL = URL(filePath: "/usr/bin/env")
+        process.arguments = [command] + args
+        process.environment = Self.processEnvironment(extra: env)
+        process.currentDirectoryURL = URL(filePath: NSHomeDirectory())
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = error
 
-            _ = try session.request(
-                id: 1,
-                method: "initialize",
-                params: [
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": [String: String](),
-                    "clientInfo": ["name": "Forge", "version": "1.0"],
-                ])
-            try session.notify(method: "notifications/initialized")
-            let result = try session.request(
-                id: 2, method: "tools/list", params: [String: String]())
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.appendOutput(data)
+        }
+        error.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.appendError(data)
+        }
 
-            guard let tools = result["tools"] as? [[String: Any]] else { return [] }
-            return tools.compactMap { tool in
-                guard let name = tool["name"] as? String else { return nil }
-                return MCPTool(
-                    name: name,
-                    description: (tool["description"] as? String) ?? "")
-            }
-        }.value
+        do {
+            try process.run()
+        } catch {
+            throw MCPError.server(
+                "Unable to launch stdio MCP command '\(command)': \(error.localizedDescription)")
+        }
     }
 
-    func callToolReturningData(name: String, argumentsData: Data) async throws -> Data {
-        let command = command
-        let args = args
-        let env = env
-        return try await Task.detached {
-            let callArguments =
-                (try? JSONSerialization.jsonObject(with: argumentsData) as? [String: Any]) ?? [:]
-            let session = try StdioSession(command: command, args: args, env: env)
-            defer { session.stop() }
-
-            _ = try session.request(
-                id: 1,
-                method: "initialize",
-                params: [
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": [String: String](),
-                    "clientInfo": ["name": "Forge", "version": "1.0"],
-                ])
-            try session.notify(method: "notifications/initialized")
-            let result = try session.request(
-                id: 10,
-                method: "tools/call",
-                params: ["name": name, "arguments": callArguments])
-            return try JSONSerialization.data(withJSONObject: result)
-        }.value
+    func callTool(name: String, arguments: [String: Any]) throws -> Data {
+        lock.lock()
+        let id = nextRequestID
+        nextRequestID += 1
+        lock.unlock()
+        let result = try request(
+            id: id,
+            method: "tools/call",
+            params: ["name": name, "arguments": arguments])
+        return try JSONSerialization.data(withJSONObject: result)
     }
 
-    private final class StdioSession: @unchecked Sendable {
-        private let process = Process()
-        private let input = Pipe()
-        private let output = Pipe()
-        private let error = Pipe()
-        private let lock = NSLock()
-        private var outputBuffer = Data()
-        private var errorBuffer = Data()
-
-        init(command: String, args: [String], env: [String: String]) throws {
-            process.executableURL = URL(filePath: "/usr/bin/env")
-            process.arguments = [command] + args
-            process.environment = Self.processEnvironment(extra: env)
-            process.currentDirectoryURL = URL(filePath: NSHomeDirectory())
-            process.standardInput = input
-            process.standardOutput = output
-            process.standardError = error
-
-            output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                self?.appendOutput(data)
-            }
-            error.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                self?.appendError(data)
-            }
-
-            do {
-                try process.run()
-            } catch {
-                throw MCPError.server("Unable to launch stdio MCP command '\(command)': \(error.localizedDescription)")
-            }
+    func stop() {
+        output.fileHandleForReading.readabilityHandler = nil
+        error.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
         }
+        try? input.fileHandleForWriting.close()
+    }
 
-        private static func processEnvironment(extra: [String: String]) -> [String: String] {
-            var base = ProcessInfo.processInfo.environment
-            let home = NSHomeDirectory()
-            let mcpPath = [
-                "/opt/homebrew/bin",
-                "/opt/homebrew/sbin",
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-                "/usr/sbin",
-                "/sbin",
-                "\(home)/.local/bin",
-                "\(home)/.volta/bin",
-                "\(home)/.bun/bin",
-                "\(home)/.cargo/bin",
-                "\(home)/.swiftly/bin",
-                "\(home)/.lmstudio/bin",
-            ]
-            let existing = [base["PATH"], extra["PATH"]].compactMap { $0 }
-            base["PATH"] = (mcpPath + existing).joined(separator: ":")
-            base["HOME"] = base["HOME"] ?? home
-            base["SHELL"] = base["SHELL"] ?? "/bin/zsh"
-            return base.merging(extra) { _, new in new }
-        }
-
-        func stop() {
-            output.fileHandleForReading.readabilityHandler = nil
-            error.fileHandleForReading.readabilityHandler = nil
-            if process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
-            }
-            try? input.fileHandleForWriting.close()
-        }
-
-        func request(id: Int, method: String, params: Any) throws -> [String: Any] {
-            try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
-            while true {
-                let payload = try readMessage(timeout: 20)
-                if let number = payload["id"] as? NSNumber, number.intValue == id {
-                    if let error = payload["error"] as? [String: Any] {
-                        throw MCPError.server((error["message"] as? String) ?? "MCP server error")
-                    }
-                    return (payload["result"] as? [String: Any]) ?? [:]
+    func request(id: Int, method: String, params: Any) throws -> [String: Any] {
+        try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+        while true {
+            let payload = try readMessage(timeout: 45)
+            if let number = payload["id"] as? NSNumber, number.intValue == id {
+                if let error = payload["error"] as? [String: Any] {
+                    throw MCPError.server((error["message"] as? String) ?? "MCP server error")
                 }
+                return (payload["result"] as? [String: Any]) ?? [:]
             }
         }
+    }
 
-        func notify(method: String) throws {
-            try send(["jsonrpc": "2.0", "method": method])
-        }
+    func notify(method: String) throws {
+        try send(["jsonrpc": "2.0", "method": method])
+    }
 
-        private func send(_ payload: [String: Any]) throws {
-            let body = try JSONSerialization.data(withJSONObject: payload)
-            input.fileHandleForWriting.write(body)
-            input.fileHandleForWriting.write(Data("\n".utf8))
-        }
+    private func send(_ payload: [String: Any]) throws {
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        input.fileHandleForWriting.write(body)
+        input.fileHandleForWriting.write(Data("\n".utf8))
+    }
 
-        private func readMessage(timeout: TimeInterval) throws -> [String: Any] {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                if let body = popMessageBody() {
-                    guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-                    else { continue }
-                    return json
-                }
-                if !process.isRunning {
-                    throw MCPError.server("MCP stdio process exited. \(stderrSummary)")
-                }
-                Thread.sleep(forTimeInterval: 0.02)
+    private func readMessage(timeout: TimeInterval) throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let body = popMessageBody() {
+                guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+                else { continue }
+                return json
             }
-            throw MCPError.server("Timed out waiting for MCP stdio response. \(stderrSummary)")
-        }
-
-        private func appendOutput(_ data: Data) {
-            lock.lock()
-            outputBuffer.append(data)
-            lock.unlock()
-        }
-
-        private func appendError(_ data: Data) {
-            lock.lock()
-            errorBuffer.append(data)
-            if errorBuffer.count > 32_768 {
-                errorBuffer.removeFirst(errorBuffer.count - 32_768)
+            if !process.isRunning {
+                throw MCPError.server("MCP stdio process exited. \(stderrSummary)")
             }
-            lock.unlock()
+            Thread.sleep(forTimeInterval: 0.02)
         }
+        throw MCPError.server("Timed out waiting for MCP stdio response. \(stderrSummary)")
+    }
 
-        private func popMessageBody() -> Data? {
-            lock.lock()
-            defer { lock.unlock() }
-            return Self.extractLine(from: &outputBuffer)
-        }
+    private func appendOutput(_ data: Data) {
+        lock.lock()
+        outputBuffer.append(data)
+        lock.unlock()
+    }
 
-        private var stderrSummary: String {
-            lock.lock()
-            let data = errorBuffer
-            lock.unlock()
-            let text = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return text.isEmpty ? "" : String(text.prefix(500))
+    private func appendError(_ data: Data) {
+        lock.lock()
+        errorBuffer.append(data)
+        if errorBuffer.count > 32_768 {
+            errorBuffer.removeFirst(errorBuffer.count - 32_768)
         }
+        lock.unlock()
+    }
 
-        private static func extractLine(from buffer: inout Data) -> Data? {
-            guard let newline = buffer.firstIndex(of: 0x0A) else { return nil }
-            var line = Data(buffer[buffer.startIndex..<newline])
-            if line.last == 0x0D {
-                line.removeLast()
-            }
-            buffer.removeSubrange(buffer.startIndex...newline)
-            return line.isEmpty ? nil : line
+    private func popMessageBody() -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return Self.extractLine(from: &outputBuffer)
+    }
+
+    private var stderrSummary: String {
+        lock.lock()
+        let data = errorBuffer
+        lock.unlock()
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? "" : String(text.prefix(500))
+    }
+
+    private static func processEnvironment(extra: [String: String]) -> [String: String] {
+        var base = ProcessInfo.processInfo.environment
+        let home = NSHomeDirectory()
+        let mcpPath = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            "\(home)/.local/bin",
+            "\(home)/.volta/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.swiftly/bin",
+            "\(home)/.lmstudio/bin",
+        ]
+        let existing = [base["PATH"], extra["PATH"]].compactMap { $0 }
+        base["PATH"] = (mcpPath + existing).joined(separator: ":")
+        base["HOME"] = base["HOME"] ?? home
+        base["SHELL"] = base["SHELL"] ?? "/bin/zsh"
+        return base.merging(extra) { _, new in new }
+    }
+
+    private static func extractLine(from buffer: inout Data) -> Data? {
+        guard let newline = buffer.firstIndex(of: 0x0A) else { return nil }
+        var line = Data(buffer[buffer.startIndex..<newline])
+        if line.last == 0x0D {
+            line.removeLast()
         }
+        buffer.removeSubrange(buffer.startIndex...newline)
+        return line.isEmpty ? nil : line
     }
 }
+
 
 // MARK: - HTTP client (streamable-HTTP JSON-RPC)
 

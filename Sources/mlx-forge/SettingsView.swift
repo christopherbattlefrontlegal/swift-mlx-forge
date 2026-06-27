@@ -159,7 +159,7 @@ private struct ClaudeKeySettings: View {
                 title: "Brave Search Answers",
                 icon: "magnifyingglass.circle",
                 description: app.hasBraveSearchKey
-                    ? "Brave Answers key saved. Toggle Brave in chat or use the globe button to send web-grounded queries."
+                    ? "Brave Answers key saved. Use the globe button in chat to enable web-grounded queries."
                     : "Web-grounded answers via Brave Search Answers API."
             ) {
                 Toggle("Research mode (multi-search)", isOn: $app.braveSearchConfig.enableResearch)

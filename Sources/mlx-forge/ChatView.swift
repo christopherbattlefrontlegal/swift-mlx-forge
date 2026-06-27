@@ -674,16 +674,6 @@ struct ComposerView: View {
                                 allowsCustom: false)
                         }
 
-                        Toggle("Brave", isOn: $app.braveSearchEnabled)
-                            .font(.callout.weight(.semibold))
-                            .controlSize(.regular)
-                            .toggleStyle(.switch)
-                            .disabled(!app.hasBraveSearchKey)
-                            .help(
-                                app.hasBraveSearchKey
-                                    ? "Brave Search Answers — web-grounded research chat"
-                                    : "Add Brave Search API key in Settings (⌘,)")
-
                         if !app.engine.loadedModels.isEmpty || app.engine.isLoadingAnything {
                             Button {
                                 app.stopGenerating()
