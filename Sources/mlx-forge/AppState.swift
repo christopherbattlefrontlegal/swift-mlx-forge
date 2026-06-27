@@ -684,10 +684,18 @@ final class AppState {
         settings = next
     }
 
-    private func historyWithMCPInstructions(_ conversation: Conversation) -> Conversation {
+    private func historyWithMCPInstructions(
+        _ conversation: Conversation, mcpSystemPrompt: String
+    ) -> Conversation {
         var copy = conversation
-        copy.systemPrompt = systemPrompt(for: conversation, includeMCP: true)
+        copy.systemPrompt = mcpSystemPrompt
         return copy
+    }
+
+    private func mcpEnrichedSystemPrompt(for conversation: Conversation) async -> String {
+        let base = baseSystemPrompt(for: conversation)
+        let tools = await mcp.prepareToolCatalogForPrompt()
+        return systemPromptWithMCPInstructions(base: base, tools: tools)
     }
 
     /// Inspector `settings.systemPrompt` wins over per-conversation copies saved at creation.
@@ -700,32 +708,36 @@ final class AppState {
     private func systemPrompt(for conversation: Conversation, includeMCP: Bool) -> String {
         let base = baseSystemPrompt(for: conversation)
         guard includeMCP else { return base }
-        return systemPromptWithMCPInstructions(base: base)
+        return systemPromptWithMCPInstructions(base: base, tools: mcp.selectedPromptTools())
     }
 
-    private func systemPromptWithMCPInstructions(base: String) -> String {
-        mcp.connectAvailableServers()
-        let tools = mcp.selectedConnectedTools()
+    private func systemPromptWithMCPInstructions(
+        base: String, tools: [MCPToolBinding]
+    ) -> String {
         guard !tools.isEmpty else { return base }
         let toolLines = tools.prefix(80).map { binding in
             let description = Self.clippedForPrompt(binding.tool.description, max: 160)
             if description.isEmpty {
-                return "- \(binding.serverID).\(binding.tool.name)"
+                return "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\""
             }
-            return "- \(binding.serverID).\(binding.tool.name): \(description)"
+            return "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\": \(description)"
         }.joined(separator: "\n")
         let overflow =
             tools.count > 80 ? "\n- ... \(tools.count - 80) more enabled MCP tools hidden." : ""
         let configPath = MCPManager.projectConfigFile.path
         let instruction = """
 
-        Forge MCP tool access (direct stdio/HTTP from \(configPath)):
+        Forge MCP tools (from \(configPath)). To call one, output ONLY this line (no Markdown):
+        FORGE_MCP_CALL {"server":"<server-id>","tool":"<tool-name>","arguments":{...}}
+
+        Enabled tools:
         \(toolLines)\(overflow)
 
-        When you need a tool, respond with only this exact marker followed by one JSON object:
-        FORGE_MCP_CALL {"server":"desktop-commander","tool":"tool-name","arguments":{}}
-
-        Forge launches the real MCP server from mcp.json and calls it directly. Use the exact server id from the list above (e.g. desktop-commander). Do not wrap the marker in Markdown. After Forge returns the MCP result, answer using that result.
+        Rules:
+        - Use the exact server id and tool name from the list (e.g. server "sequential-thinking", tool "sequentialthinking").
+        - Put tool arguments inside "arguments" as a JSON object matching the tool schema.
+        - Example: FORGE_MCP_CALL {"server":"desktop-commander","tool":"read_file","arguments":{"path":"/path/to/file"}}
+        - After Forge returns the MCP result in the chat, answer the user using that result.
         """
         guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return instruction.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -840,54 +852,58 @@ final class AppState {
             return
         }
 
-        let systemInstructions = systemPrompt(for: historySnapshot, includeMCP: true)
-        let generationHistory = historyWithMCPInstructions(historySnapshot)
         let activeModelID = engine.activeModel?.id
         let activeModelLabel = engine.activeModel.map { localModelLabel($0.model) } ?? "Local"
-        engine.generate(
-            conversation: generationHistory,
-            prompt: prompt,
-            images: images,
-            settings: settings,
-            systemInstructions: systemInstructions,
-            onChunk: { [weak self] delta in
-                self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
-            },
-            onComplete: { [weak self] info, errorMessage in
-                guard let self else { return }
-                self.finishStreamBuffer(messageID)
-                self.appendToMessage(conversationID: conversationID, messageID: messageID) {
-                    if let info {
-                        $0.tokensPerSecond = info.tokensPerSecond
-                        $0.generationTokenCount = info.generationTokenCount
-                        $0.promptTokenCount = info.promptTokenCount
-                        $0.promptTime = info.promptTime
-                    }
-                    if let errorMessage {
-                        if $0.content.isEmpty {
-                            $0.content = "⚠️ \(errorMessage)"
-                            $0.isError = true
-                        } else {
-                            // Partial answer already streamed — keep it, but make the
-                            // interruption visible instead of silently truncating.
-                            $0.content += "\n\n⚠️ stream interrupted: \(errorMessage)"
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let systemInstructions = await self.mcpEnrichedSystemPrompt(for: historySnapshot)
+            let generationHistory = self.historyWithMCPInstructions(
+                historySnapshot, mcpSystemPrompt: systemInstructions)
+            self.engine.generate(
+                conversation: generationHistory,
+                prompt: prompt,
+                images: images,
+                settings: self.settings,
+                systemInstructions: systemInstructions,
+                onChunk: { [weak self] delta in
+                    self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
+                },
+                onComplete: { [weak self] info, errorMessage in
+                    guard let self else { return }
+                    self.finishStreamBuffer(messageID)
+                    self.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                        if let info {
+                            $0.tokensPerSecond = info.tokensPerSecond
+                            $0.generationTokenCount = info.generationTokenCount
+                            $0.promptTokenCount = info.promptTokenCount
+                            $0.promptTime = info.promptTime
+                        }
+                        if let errorMessage {
+                            if $0.content.isEmpty {
+                                $0.content = "⚠️ \(errorMessage)"
+                                $0.isError = true
+                            } else {
+                                // Partial answer already streamed — keep it, but make the
+                                // interruption visible instead of silently truncating.
+                                $0.content += "\n\n⚠️ stream interrupted: \(errorMessage)"
+                            }
                         }
                     }
-                }
-                self.streamingMessageID = nil
-                self.scheduleSave()
-                if let activeModelID {
-                    Task { @MainActor in
-                        await self.handleMCPToolRequestIfNeeded(
-                            backend: .local(modelID: activeModelID, label: activeModelLabel),
-                            history: historySnapshot,
-                            originalPrompt: prompt,
-                            images: images,
-                            conversationID: conversationID,
-                            messageID: messageID)
+                    self.streamingMessageID = nil
+                    self.scheduleSave()
+                    if let activeModelID {
+                        Task { @MainActor in
+                            await self.handleMCPToolRequestIfNeeded(
+                                backend: .local(modelID: activeModelID, label: activeModelLabel),
+                                history: historySnapshot,
+                                originalPrompt: prompt,
+                                images: images,
+                                conversationID: conversationID,
+                                messageID: messageID)
+                        }
                     }
-                }
-            })
+                })
+        }
         scheduleSave()
     }
 
@@ -978,11 +994,14 @@ final class AppState {
                     messageID: messageID
                 )
             } else if let mid = localID {
+                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: preSnapshot)
                 self.engine.generate(
-                    conversation: self.historyWithMCPInstructions(preSnapshot),
+                    conversation: self.historyWithMCPInstructions(
+                        preSnapshot, mcpSystemPrompt: systemInstructions),
                     prompt: p,
                     images: images,
                     settings: self.settings,
+                    systemInstructions: systemInstructions,
                     targetModelID: mid,
                     onChunk: { [weak self] delta in
                         self?.enqueueStreamDelta(delta, conversationID: convID, messageID: messageID)
@@ -1037,7 +1056,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = systemPrompt(for: history, includeMCP: false)
+        let sys = await mcpEnrichedSystemPrompt(for: history)
         let client = AnthropicClient(apiKey: key)
         do {
             try await client.stream(model: model, system: sys, messages: msgs) { [weak self] delta in
@@ -1084,7 +1103,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = systemPrompt(for: history, includeMCP: false)
+        let sys = await mcpEnrichedSystemPrompt(for: history)
         let client = OpenRouterClient(apiKey: key)
         do {
             try await client.stream(
@@ -1138,11 +1157,17 @@ final class AppState {
             }
         }
         messages.append(.init(role: "user", text: prompt))
-        let system = systemPrompt(for: history, includeMCP: allowMCPFollowup)
         let client = AnthropicClient(apiKey: key)
 
         isClaudeGenerating = true
         claudeTask = Task { [weak self] in
+            let system: String
+            if allowMCPFollowup {
+                system = await self?.mcpEnrichedSystemPrompt(for: history)
+                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            } else {
+                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            }
             do {
                 try await client.stream(model: model, system: system, messages: messages) { delta in
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
@@ -1206,11 +1231,17 @@ final class AppState {
             }
         }
         messages.append(.init(role: "user", text: prompt))
-        let system = systemPrompt(for: history, includeMCP: allowMCPFollowup)
         let client = OpenRouterClient(apiKey: key)
 
         isOpenRouterGenerating = true
         openRouterTasks[messageID] = Task { [weak self] in
+            let system: String
+            if allowMCPFollowup {
+                system = await self?.mcpEnrichedSystemPrompt(for: history)
+                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            } else {
+                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            }
             do {
                 try await client.stream(
                     model: model,
@@ -1454,12 +1485,17 @@ final class AppState {
 
         switch backend {
         case .local(let modelID, _):
-            engine.generate(
-                conversation: historyWithMCPInstructions(history),
-                prompt: prompt,
-                images: images,
-                settings: settings,
-                targetModelID: modelID,
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: history)
+                self.engine.generate(
+                    conversation: self.historyWithMCPInstructions(
+                        history, mcpSystemPrompt: systemInstructions),
+                    prompt: prompt,
+                    images: images,
+                    settings: self.settings,
+                    systemInstructions: systemInstructions,
+                    targetModelID: modelID,
                 onChunk: { [weak self] delta in
                     self?.enqueueStreamDelta(
                         delta, conversationID: conversationID, messageID: messageID)
@@ -1486,6 +1522,7 @@ final class AppState {
                     self.streamingMessageID = nil
                     self.scheduleSave()
                 })
+            }
         case .claude(let modelID):
             streamClaude(
                 model: modelID,
@@ -1507,14 +1544,13 @@ final class AppState {
 
     private func isMCPToolEnabled(_ request: MCPCallRequest) -> Bool {
         let serverID = mcp.resolveEntryID(request.serverID)
-        if mcp.selectedConnectedTools().contains(where: {
-            $0.serverID == serverID && (
-                $0.tool.name == request.toolName ||
-                "\(serverID).\($0.tool.name)" == request.toolName)
+        let canonicalTool = Self.canonicalizeMCPToolName(request.toolName, serverID: serverID)
+        if mcp.selectedPromptTools().contains(where: {
+            $0.serverID == serverID && $0.tool.name == canonicalTool
         }) {
             return true
         }
-        return mcp.tools(for: serverID).contains { $0.name == request.toolName }
+        return mcp.tools(for: serverID).contains { $0.name == canonicalTool }
     }
 
     private func messageContent(conversationID: UUID, messageID: UUID) -> String? {

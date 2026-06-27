@@ -429,6 +429,46 @@ final class MCPManager {
         }
     }
 
+    /// Tools to embed in the LLM system prompt. Uses persisted selections immediately
+    /// (so the model sees the catalog even while stdio servers are still starting) and
+    /// enriches with live descriptions once a server reports connected.
+    func selectedPromptTools() -> [MCPToolBinding] {
+        entries.flatMap { entry -> [MCPToolBinding] in
+            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return [] }
+            let selected = selectedToolsByServer[entry.id] ?? []
+            guard !selected.isEmpty else { return [] }
+            let catalog: [String: MCPTool]
+            if case .connected(let tools) = entry.status {
+                catalog = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+            } else {
+                catalog = [:]
+            }
+            return selected.map { name in
+                let tool = catalog[name] ?? MCPTool(name: name, description: "")
+                return MCPToolBinding(serverID: entry.id, tool: tool)
+            }
+        }
+    }
+
+    /// Connect enabled MCP servers and wait briefly so prompt tool descriptions are live.
+    func prepareToolCatalogForPrompt() async -> [MCPToolBinding] {
+        connectAvailableServers()
+        for _ in 0..<80 {
+            let pending = entries.contains { entry in
+                guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return false }
+                switch entry.status {
+                case .connecting, .available:
+                    return true
+                default:
+                    return false
+                }
+            }
+            if !pending { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return selectedPromptTools()
+    }
+
     private func setStatus(_ id: String, _ status: Status) {
         if let index = entries.firstIndex(where: { $0.id == id }) {
             entries[index].status = status

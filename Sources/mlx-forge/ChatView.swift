@@ -517,25 +517,20 @@ struct ComposerView: View {
                         .help("Prompt library — add your prompting folders and select a prompt for the chat (categorized scroll menu)")
 
                         Button {
-                            if app.hasBraveSearchKey {
-                                app.braveSearchEnabled.toggle()
-                            } else {
-                                app.composerText +=
-                                    (app.composerText.isEmpty ? "" : " ")
-                                    + "[use web search / MCP tool if available]"
-                            }
+                            app.braveSearchEnabled.toggle()
                         } label: {
                             ToolbarIcon("globe")
                                 .foregroundStyle(
                                     app.braveSearchEnabled ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
                         }
                         .buttonStyle(.plain)
+                        .disabled(!app.hasBraveSearchKey)
                         .help(
                             app.hasBraveSearchKey
                                 ? (app.braveSearchEnabled
                                     ? "Brave Search on — send for web-grounded answers"
                                     : "Brave Search off — click to enable web-grounded answers")
-                                : "Web search — add Brave API key in Settings (⌘,) or use MCP tools")
+                                : "Brave Search — add API key in Settings (⌘,)")
 
                         Button {
                             app.composerText += (app.composerText.isEmpty ? "" : " ") + "[enhance / council review]"
