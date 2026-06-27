@@ -1,9 +1,7 @@
 // Forge — MCP (Model Context Protocol) server configuration + HTTP client.
 //
-// MCP servers are loaded from the local `mcp.json` if present, then
-// fallen back to `~/Library/Application Support/Forge/mcp-servers.json`.
-// using the same shape as Claude Desktop's config file. Saving the file applies
-// immediately (the manager watches it). HTTP(S) transports connect in-process;
+// MCP servers are loaded from the local `mcp.json`.
+// Saving the file applies immediately (the manager watches it). HTTP(S) transports connect in-process;
 // "command" entries launch stdio MCP servers in the developer build.
 
 import Foundation
@@ -60,6 +58,7 @@ final class MCPManager {
 
     enum Status: Equatable {
         case disabled
+        case available
         case connecting
         case connected(tools: [MCPTool])
         case failed(String)
@@ -91,28 +90,21 @@ final class MCPManager {
         didSet { UserDefaults.standard.set(selectedToolsByServer, forKey: "mcp.selectedTools") }
     }
     var commanderRoots: [URL] = [] {
-        didSet { reload() }
+        didSet {
+            guard hasStarted else { return }
+            loadConfig(connectExternalServers: false)
+        }
     }
 
-    /// `mcp.json` is useful during local development while `mcp-servers.json` keeps
-    /// portable settings for installed runs.
+    /// Local MCP server config for this project.
     static var projectConfigFile: URL {
         resolveProjectConfigFile()
     }
 
-    /// Kept for migration/recovery if this file is unavailable.
-    static var configFile: URL {
-        ForgePaths.appSupport.appendingPathComponent("mcp-servers.json")
-    }
-
-    static var legacySandboxConfigFile: URL {
-        URL(filePath: NSHomeDirectory())
-            .appendingPathComponent("Library/Containers/com.forge.mlx/Data/Library/Application Support/Forge/mcp-servers.json")
-    }
-
-    nonisolated fileprivate static let commanderID = "desktop-commander"
+    nonisolated fileprivate static let commanderID = "forge-commander"
 
     private var watcher: DispatchSourceFileSystemObject?
+    private var hasStarted = false
     private var disabledServerIDs = Set(
         UserDefaults.standard.stringArray(forKey: "mcp.disabledServers") ?? []
     ) {
@@ -127,22 +119,50 @@ final class MCPManager {
 
     func start() {
         ensureTemplate()
-        reload()
+        hasStarted = true
+        loadConfig(connectExternalServers: false)
         watch()
     }
 
-    /// Choose a writable and portable config location.
+    func reload() {
+        loadConfig(connectExternalServers: true)
+    }
+
+    func connectAvailableServers() {
+        for entry in entries {
+            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { continue }
+            guard case .available = entry.status else { continue }
+            setStatus(entry.id, .connecting)
+            if let urlString = entry.config.url {
+                connect(entryID: entry.id, urlString: urlString, headers: entry.config.headers ?? [:])
+            } else if let command = entry.config.command {
+                connectStdio(
+                    entryID: entry.id,
+                    command: command,
+                    args: entry.config.args ?? [],
+                    env: entry.config.env ?? [:])
+            } else {
+                setStatus(entry.id, .failed("entry needs a \"url\" or \"command\" field"))
+            }
+        }
+    }
+
+    /// Choose the single Forge MCP config location.
     private static func resolveProjectConfigFile() -> URL {
+        if let configuredPath = Bundle.main.object(forInfoDictionaryKey: "ForgeMCPConfigPath") as? String {
+            let trimmed = configuredPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return URL(filePath: trimmed)
+            }
+        }
+
         let candidates = discoverCandidateProjectConfigPaths()
         if let existing = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
             return existing
         }
 
         let localDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        if FileManager.default.isWritableFile(atPath: localDir.path) {
-            return localDir.appendingPathComponent("mcp.json")
-        }
-        return configFile
+        return localDir.appendingPathComponent("mcp.json")
     }
 
     private static func discoverCandidateProjectConfigPaths() -> [URL] {
@@ -165,16 +185,11 @@ final class MCPManager {
     private func ensureTemplate() {
         let url = Self.projectConfigFile
         if loadConfig(at: url) != nil { return }
-        if let legacy = try? Data(contentsOf: Self.legacySandboxConfigFile),
-           (try? JSONDecoder().decode(MCPConfigFile.self, from: legacy)) != nil {
-            try? legacy.write(to: url, options: .atomic)
-            return
-        }
         let template = "{\n  \"mcpServers\": {\n  }\n}\n"
         try? template.data(using: .utf8)?.write(to: url)
     }
 
-    func reload() {
+    private func loadConfig(connectExternalServers: Bool) {
         var allServers: [String: MCPServerConfig] = [:]
 
         if let file = loadConfig(at: Self.projectConfigFile) {
@@ -195,10 +210,13 @@ final class MCPManager {
             Entry(
                 id: $0,
                 config: allServers[$0]!,
-                status: isServerEnabled($0) ? .connecting : .disabled,
+                status: isServerEnabled($0)
+                    ? (connectExternalServers ? .connecting : .available)
+                    : .disabled,
                 builtIn: false)
         }
         entries = nextEntries
+        guard connectExternalServers else { return }
         for entry in entries {
             guard !entry.isBuiltIn else { continue }
             guard isServerEnabled(entry.id) else { continue }
@@ -324,7 +342,13 @@ final class MCPManager {
     }
 
     func selectedConnectedTools() -> [MCPToolBinding] {
-        entries.flatMap { entry -> [MCPToolBinding] in
+        let hasConfiguredDesktopCommander = entries.contains {
+            !$0.isBuiltIn && $0.id == "desktop-commander" && isServerEnabled($0.id)
+        }
+        return entries.flatMap { entry -> [MCPToolBinding] in
+            if entry.id == Self.commanderID && hasConfiguredDesktopCommander {
+                return []
+            }
             guard isServerEnabled(entry.id),
                   case .connected(let tools) = entry.status
             else { return [] }
@@ -494,7 +518,14 @@ final class MCPManager {
     }
 
     private var effectiveCommanderRoots: [URL] {
-        var roots = [ForgePaths.appSupport]
+        var roots = [
+            FileManager.default.homeDirectoryForCurrentUser,
+            URL(filePath: "/Volumes"),
+            URL(filePath: "/Applications"),
+            URL(filePath: "/tmp"),
+            URL(filePath: "/private/tmp"),
+            ForgePaths.appSupport
+        ]
         for root in commanderRoots where !roots.contains(root) {
             roots.append(root)
         }
@@ -538,13 +569,13 @@ final class MCPManager {
     }
 }
 
-// MARK: - Built-in desktop-commander tools
+// MARK: - Built-in Forge commander tools
 
 private enum BuiltinCommander {
     static let tools: [MCPTool] = [
         MCPTool(
             name: "list_roots",
-            description: "List folders available to the built-in Desktop Commander tools."),
+            description: "List folders available to the built-in Forge commander tools."),
         MCPTool(
             name: "list_directory",
             description: "List files in an allowed workspace folder. Arguments: path, limit."),
@@ -766,7 +797,7 @@ private enum BuiltinCommander {
     }
 }
 
-// MARK: - Stdio client (Claude Desktop-style command entries)
+// MARK: - Stdio client
 
 struct MCPStdioClient: Sendable {
     let command: String
@@ -1017,7 +1048,7 @@ struct MCPHTTPClient {
     /// For photo review or image tools, serialize the image into `arguments` however the target
     /// MCP server expects it (e.g. "image_base64": "<base64 data>", "query": "detailed review").
     ///
-    /// Sample mcp-servers.json for a photo review MCP server:
+    /// Sample mcp.json entry for a photo review MCP server:
     /// {
     ///   "mcpServers": {
     ///     "local-photo-review": { "url": "http://127.0.0.1:8765" }

@@ -1,6 +1,5 @@
 // Forge — chat surface: transcript, streaming bubbles, composer, tuning inspector.
 
-import AppKit
 import SwiftUI
 
 struct ChatView: View {
@@ -116,125 +115,20 @@ struct TranscriptView: View {
     let conversation: Conversation
     var onShowLargeText: (String) -> Void = { _ in }
 
-    @State private var followsOutput = true
-
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.s4) {
-                    ForEach(conversation.messages) { message in
-                        MessageView(
-                            message: message,
-                            isStreaming: app.streamingMessageID == message.id,
-                            onShowLargeText: onShowLargeText)
-                            .id(message.id)
-                    }
-                    Color.clear.frame(height: 1).id("bottom")
-                }
-                .padding(Theme.s5)
-                .frame(maxWidth: 860)
-                .frame(maxWidth: .infinity)
-            }
-            .background(
-                TranscriptScrollMonitor { isNearBottom in
-                    followsOutput = isNearBottom
-                }
-            )
-            .onChange(of: conversation.messages.last?.content) {
-                if followsOutput {
-                    scrollToBottom(proxy)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: Theme.s4) {
+                ForEach(conversation.messages) { message in
+                    MessageView(
+                        message: message,
+                        isStreaming: app.streamingMessageID == message.id,
+                        onShowLargeText: onShowLargeText)
+                        .id(message.id)
                 }
             }
-            .onChange(of: conversation.messages.count) {
-                if followsOutput {
-                    scrollToBottom(proxy)
-                }
-            }
-            .onChange(of: conversation.id) {
-                followsOutput = true
-                scrollToBottom(proxy)
-            }
-            .onAppear {
-                scrollToBottom(proxy)
-            }
-        }
-    }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
-        }
-    }
-}
-
-private struct TranscriptScrollMonitor: NSViewRepresentable {
-    var onNearBottomChange: (Bool) -> Void
-
-    func makeNSView(context: Context) -> MonitorView {
-        let view = MonitorView()
-        view.onNearBottomChange = onNearBottomChange
-        return view
-    }
-
-    func updateNSView(_ nsView: MonitorView, context: Context) {
-        nsView.onNearBottomChange = onNearBottomChange
-        nsView.attachIfNeeded()
-    }
-
-    final class MonitorView: NSView {
-        var onNearBottomChange: ((Bool) -> Void)?
-        private weak var scrollView: NSScrollView?
-        private var lastNearBottom: Bool?
-        private let threshold: CGFloat = 80
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            attachIfNeeded()
-        }
-
-        func attachIfNeeded() {
-            guard scrollView == nil else {
-                updatePosition()
-                return
-            }
-            guard let found = enclosingScrollView() else { return }
-            scrollView = found
-            found.contentView.postsBoundsChangedNotifications = true
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(boundsDidChange(_:)),
-                name: NSView.boundsDidChangeNotification,
-                object: found.contentView)
-            updatePosition()
-        }
-
-        @objc private func boundsDidChange(_ notification: Notification) {
-            updatePosition()
-        }
-
-        private func enclosingScrollView() -> NSScrollView? {
-            var view: NSView? = superview
-            while let current = view {
-                if let scrollView = current as? NSScrollView { return scrollView }
-                view = current.superview
-            }
-            return nil
-        }
-
-        private func updatePosition() {
-            guard let scrollView,
-                  let documentView = scrollView.documentView else { return }
-            let visible = scrollView.contentView.bounds
-            let documentHeight = documentView.bounds.height
-            let bottomGap = documentHeight - (visible.origin.y + visible.height)
-            let isNearBottom = bottomGap <= threshold
-            guard isNearBottom != lastNearBottom else { return }
-            lastNearBottom = isNearBottom
-            onNearBottomChange?(isNearBottom)
+            .padding(Theme.s5)
+            .frame(maxWidth: 860)
+            .frame(maxWidth: .infinity)
         }
     }
 }
@@ -323,6 +217,8 @@ struct MessageView: View {
                 Text(message.content)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+            } else if message.segments.isEmpty {
+                MarkdownText(text: message.content)
             } else {
                 ForEach(message.segments) { segment in
                     switch segment.kind {
@@ -603,11 +499,10 @@ struct ComposerView: View {
                                             Button(name) {
                                                 if let content = app.loadPromptContent(from: url) {
                                                     app.lastPromptContent = content
+                                                    app.applySystemPrompt(content)
                                                     if var conv = app.selectedConversation {
                                                         conv.systemPrompt = content
                                                         app.selectedConversation = conv
-                                                    } else {
-                                                        app.settings.systemPrompt = content
                                                     }
                                                 }
                                             }
@@ -622,12 +517,25 @@ struct ComposerView: View {
                         .help("Prompt library — add your prompting folders and select a prompt for the chat (categorized scroll menu)")
 
                         Button {
-                            app.composerText += (app.composerText.isEmpty ? "" : " ") + "[use web search / MCP tool if available]"
+                            if app.hasBraveSearchKey {
+                                app.braveSearchEnabled.toggle()
+                            } else {
+                                app.composerText +=
+                                    (app.composerText.isEmpty ? "" : " ")
+                                    + "[use web search / MCP tool if available]"
+                            }
                         } label: {
                             ToolbarIcon("globe")
+                                .foregroundStyle(
+                                    app.braveSearchEnabled ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
                         }
                         .buttonStyle(.plain)
-                        .help("Web / external MCP tool (e.g. search)")
+                        .help(
+                            app.hasBraveSearchKey
+                                ? (app.braveSearchEnabled
+                                    ? "Brave Search on — send for web-grounded answers"
+                                    : "Brave Search off — click to enable web-grounded answers")
+                                : "Web search — add Brave API key in Settings (⌘,) or use MCP tools")
 
                         Button {
                             app.composerText += (app.composerText.isEmpty ? "" : " ") + "[enhance / council review]"
@@ -641,6 +549,19 @@ struct ComposerView: View {
                     Spacer(minLength: Theme.s6)
 
                     HStack(spacing: Theme.s3) {
+                        Button {
+                            if app.isCodingOrchestratorRunning {
+                                app.stopCodingOrchestrator()
+                            } else if !app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                app.runCodingOrchestrator(task: app.composerText)
+                            }
+                        } label: {
+                            ToolbarIcon(app.isCodingOrchestratorRunning ? "stop.fill" : "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!app.hasOpenRouterKey)
+                        .help(app.isCodingOrchestratorRunning ? "Stop code loop (\(app.codingOrchestratorPhase))" : "Code loop: planner→coder→auditor→fixer→tester via OpenRouter")
+
                         Button {
                             showAgentDispatch = true
                         } label: {
@@ -752,6 +673,16 @@ struct ComposerView: View {
                                 customModel: .constant(""),
                                 allowsCustom: false)
                         }
+
+                        Toggle("Brave", isOn: $app.braveSearchEnabled)
+                            .font(.callout.weight(.semibold))
+                            .controlSize(.regular)
+                            .toggleStyle(.switch)
+                            .disabled(!app.hasBraveSearchKey)
+                            .help(
+                                app.hasBraveSearchKey
+                                    ? "Brave Search Answers — web-grounded research chat"
+                                    : "Add Brave Search API key in Settings (⌘,)")
 
                         if !app.engine.loadedModels.isEmpty || app.engine.isLoadingAnything {
                             Button {
@@ -1035,6 +966,9 @@ struct ComposerView: View {
     }
 
     private var placeholder: String {
+        if app.braveSearchEnabled {
+            return "Ask Brave \(app.braveSearchConfig.enableResearch ? "Research" : "Answers")…"
+        }
         if let openRouterID = app.openRouterModelID, !openRouterID.isEmpty {
             return "Message \(OpenRouterClient.label(for: openRouterID))…"
         }
@@ -1045,7 +979,7 @@ struct ComposerView: View {
             return "Message \(active.model.shortName)…"
         }
         if app.engine.isLoadingAnything { return "Model loading…" }
-        return "Load a model to start"
+        return "Load a model or enable Brave / cloud APIs to start"
     }
 
     private var liveBar: some View {
@@ -1062,8 +996,30 @@ struct ComposerView: View {
     }
 
     private var liveLabel: String {
+        if let advisory = app.engine.loadAdvisory, !app.engine.isLoadingAnything {
+            return advisory
+        }
+        if let materializingID = app.engine.materializingModelID,
+            let model = app.engine.loadedModels.first(where: { $0.id == materializingID })?.model
+        {
+            return "Materializing \(model.shortName) weights (first token — large deferred models can take several minutes)…"
+        }
+        if app.engine.isLoadingAnything,
+            let (modelID, fraction) = app.engine.loadingModels.first
+        {
+            let name =
+                app.store.localModels.first(where: { $0.id == modelID })?.shortName ?? "model"
+            if let fraction {
+                let pct = Int((fraction * 100).rounded())
+                return "Loading \(name)… \(pct)%"
+            }
+            return "Loading \(name)…"
+        }
         if !app.inFlightAgentLabels.isEmpty {
             let labels = app.inFlightAgentLabels.values.joined(separator: ", ")
+            if app.isBraveSearchGenerating {
+                return "Agents: \(labels) · Brave researching…"
+            }
             if app.isClaudeGenerating {
                 return "Agents: \(labels) · Claude responding…"
             }
@@ -1077,6 +1033,10 @@ struct ComposerView: View {
                     "Agents: \(labels) · \(count) tokens · \(tps.formatted(.number.precision(.fractionLength(1)))) tok/s"
             }
             return "Agents: \(labels) · \(count) tokens"
+        }
+        if app.isBraveSearchGenerating {
+            return app.braveSearchConfig.enableResearch
+                ? "Brave is researching…" : "Brave is answering…"
         }
         if app.isClaudeGenerating {
             return "Claude is responding…"

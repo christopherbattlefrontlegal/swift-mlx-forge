@@ -218,7 +218,24 @@ private struct InstalledRow: View {
     private var loadedEntry: InferenceEngine.Loaded? {
         app.engine.loadedModels.first { $0.id == model.id }
     }
-    private var isMemoryMapped: Bool { loadedEntry?.mmapReaders != nil }
+
+    private var loadHelp: String {
+        if model.isGGUF {
+            return "Load this GGUF file on the llama.cpp backend."
+        }
+        return "Standard MLX load — fastest for MoE models like Qwen A3B. Use this."
+    }
+
+    private var loadStatusLabel: String {
+        guard let entry = loadedEntry else { return "Loaded" }
+        if entry.weightLoadPolicy == .deferred {
+            return isActive ? "Active · deferred" : "Deferred"
+        }
+        if entry.weightLoadPolicy == .boundedEager {
+            return isActive ? "Active · bounded" : "Bounded"
+        }
+        return isActive ? "Active" : "Loaded"
+    }
 
     var body: some View {
         HStack(spacing: Theme.s3) {
@@ -243,35 +260,76 @@ private struct InstalledRow: View {
 
             if isLoading {
                 HStack(spacing: Theme.s2) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Loading…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if let fraction = app.engine.loadingModels[model.id] ?? nil {
+                        ProgressView(value: fraction)
+                            .controlSize(.small)
+                            .frame(width: 56)
+                        Text("\(Int((fraction * 100).rounded()))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             } else if isLoaded {
-                Label(
-                    isActive ? (isMemoryMapped ? "Active · mmap" : "Active") : (isMemoryMapped ? "Mapped" : "Loaded"),
-                    systemImage: "checkmark.circle.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(isActive ? Theme.emberGlow : Theme.okGreen)
+                VStack(alignment: .trailing, spacing: Theme.s1) {
+                    Label(loadStatusLabel, systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(isActive ? Theme.emberGlow : Theme.okGreen)
+                    if loadedEntry?.weightLoadPolicy == .boundedEager
+                        || loadedEntry?.weightLoadPolicy == .deferred
+                    {
+                        Button("Reload Standard") {
+                            app.reloadModelStandard(model)
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Unload and reload with the fast standard MLX path")
+                    }
+                }
             } else {
                 HStack(spacing: Theme.s2) {
-                    Button("Load") { onLoad() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Theme.ember)
-                        .controlSize(.small)
-                        .help("Load normally")
-                    if model.supportsMemoryMapping {
-                        Button {
-                            app.engine.loadAndActivateMmap(model)
-                            app.scheduleSave()
+                    Button("Load") {
+                        app.engine.loadAndActivate(model, policy: .eager)
+                        app.scheduleSave()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.ember)
+                    .controlSize(.small)
+                    .help(loadHelp)
+
+                    if !model.isGGUF {
+                        Menu {
+                            Button("Bounded eager") {
+                                app.engine.loadAndActivate(model, policy: .boundedEager)
+                                app.scheduleSave()
+                            }
+                            .disabled(model.prefersStandardMLXLoad)
+                            Button("Deferred (lazy)") {
+                                app.engine.loadAndActivate(model, policy: .deferred)
+                                app.scheduleSave()
+                            }
+                            .disabled(model.prefersStandardMLXLoad)
+                            .help(
+                                model.isVeryLargeForDeferredLoad
+                                    ? "Skips final weight eval at load; first send materializes the full checkpoint (several minutes on 100B+ models). UI stays responsive but wait for the status bar."
+                                    : WeightLoadPolicy.deferred.help)
+                            if model.prefersStandardMLXLoad {
+                                Text("MoE models use standard Load only")
+                            }
                         } label: {
-                            Label("Map", systemImage: "memorychip")
+                            Image(systemName: "chevron.down")
+                                .font(.caption.weight(.semibold))
                         }
-                        .buttonStyle(.bordered)
+                        .menuStyle(.borderlessButton)
                         .controlSize(.small)
-                        .help("Explicitly load with memory-mapped safetensors weights")
+                        .help(
+                            "Dense LLMs only — lowers peak RAM while loading. MoE/A3B models ignore this and use Load.")
                     }
                 }
             }

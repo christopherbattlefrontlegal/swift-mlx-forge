@@ -17,6 +17,7 @@ final class HeadlessLauncher {
         ("sonnet", "Sonnet (latest)"),
         ("opus", "Opus (latest)"),
         ("haiku", "Haiku (fast/cheap)"),
+        ("fable", "Fable (latest)"),
         ("claude-sonnet-4-5", "Pinned: Sonnet 4.5"),
         ("claude-opus-4-1", "Pinned: Opus 4.1"),
         ("custom", "Custom..."),
@@ -27,6 +28,7 @@ final class HeadlessLauncher {
         ("sonnet", "Sonnet (latest)"),
         ("opus", "Opus (latest)"),
         ("haiku", "Haiku (fast/cheap)"),
+        ("fable", "Fable (latest)"),
         ("claude-sonnet-4-5", "Pinned: Sonnet 4.5"),
         ("claude-opus-4-1", "Pinned: Opus 4.1"),
         ("custom", "Custom..."),
@@ -58,8 +60,11 @@ final class HeadlessLauncher {
 
     enum PermissionMode: String, CaseIterable, Identifiable {
         case none
+        case defaultMode = "default"
         case plan
+        case auto
         case acceptEdits
+        case dontAsk
         case bypassPermissions
 
         var id: String { rawValue }
@@ -67,8 +72,11 @@ final class HeadlessLauncher {
         var label: String {
             switch self {
             case .none: return "Default (omit)"
+            case .defaultMode: return "Default (--permission-mode default)"
             case .plan: return "Plan only (read, no writes)"
+            case .auto: return "Auto"
             case .acceptEdits: return "Accept edits"
+            case .dontAsk: return "Don't ask"
             case .bypassPermissions: return "Bypass all permissions"
             }
         }
@@ -105,11 +113,26 @@ final class HeadlessLauncher {
 
     enum InputFormat: String, CaseIterable, Identifiable {
         case none
+        case text
         case streamJSON
 
         var id: String { rawValue }
-        var value: String { self == .streamJSON ? "stream-json" : "" }
-        var label: String { self == .none ? "Default (omit)" : "stream-json" }
+
+        var value: String {
+            switch self {
+            case .none: return ""
+            case .text: return "text"
+            case .streamJSON: return "stream-json"
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .none: return "Default (omit -> text)"
+            case .text: return "text"
+            case .streamJSON: return "stream-json"
+            }
+        }
     }
 
     enum ToolRestriction: String, CaseIterable, Identifiable {
@@ -140,6 +163,8 @@ final class HeadlessLauncher {
         case none
         case replace
         case append
+        case replaceFile
+        case appendFile
 
         var id: String { rawValue }
 
@@ -148,6 +173,8 @@ final class HeadlessLauncher {
             case .none: return "None (omit)"
             case .replace: return "Replace prompt (--system-prompt)"
             case .append: return "Append prompt (--append-system-prompt)"
+            case .replaceFile: return "Replace from file (--system-prompt-file)"
+            case .appendFile: return "Append from file (--append-system-prompt-file)"
             }
         }
 
@@ -156,7 +183,13 @@ final class HeadlessLauncher {
             case .none: return nil
             case .replace: return "--system-prompt"
             case .append: return "--append-system-prompt"
+            case .replaceFile: return "--system-prompt-file"
+            case .appendFile: return "--append-system-prompt-file"
             }
+        }
+
+        var usesFile: Bool {
+            self == .replaceFile || self == .appendFile
         }
     }
 
@@ -172,6 +205,80 @@ final class HeadlessLauncher {
             case .none: return "New session"
             case .continueLast: return "--continue"
             case .resume: return "--resume <session id>"
+            }
+        }
+    }
+
+    enum BuiltInToolsMode: String, CaseIterable, Identifiable {
+        case none
+        case defaultTools
+        case custom
+        case disabled
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .none: return "Default (omit)"
+            case .defaultTools: return "--tools default"
+            case .custom: return "Custom --tools"
+            case .disabled: return "Disable all built-in tools"
+            }
+        }
+
+        var commandValue: String? {
+            switch self {
+            case .none: return nil
+            case .defaultTools: return "default"
+            case .custom: return nil
+            case .disabled: return ""
+            }
+        }
+    }
+
+    enum ChromeMode: String, CaseIterable, Identifiable {
+        case none
+        case enable
+        case disable
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .none: return "Chrome default"
+            case .enable: return "--chrome"
+            case .disable: return "--no-chrome"
+            }
+        }
+
+        var flag: String? {
+            switch self {
+            case .none: return nil
+            case .enable: return "--chrome"
+            case .disable: return "--no-chrome"
+            }
+        }
+    }
+
+    enum EffortLevel: String, CaseIterable, Identifiable {
+        case none
+        case low
+        case medium
+        case high
+        case xhigh
+        case max
+
+        var id: String { rawValue }
+        var value: String? { self == .none ? nil : rawValue }
+
+        var label: String {
+            switch self {
+            case .none: return "Default (omit)"
+            case .low: return "low"
+            case .medium: return "medium"
+            case .high: return "high"
+            case .xhigh: return "xhigh"
+            case .max: return "max"
             }
         }
     }
@@ -199,24 +306,56 @@ final class HeadlessLauncher {
     var outputFormat: OutputFormat = .none { didSet { defaults.set(outputFormat.rawValue, forKey: "hl.outputFormat") } }
     var inputFormat: InputFormat = .none { didSet { defaults.set(inputFormat.rawValue, forKey: "hl.inputFormat") } }
     var permissionMode: PermissionMode = .plan { didSet { defaults.set(permissionMode.rawValue, forKey: "hl.permission") } }
+    var allowDangerouslySkipPermissions = false { didSet { defaults.set(allowDangerouslySkipPermissions, forKey: "hl.allowDangerouslySkipPermissions") } }
+    var dangerouslySkipPermissions = false { didSet { defaults.set(dangerouslySkipPermissions, forKey: "hl.dangerouslySkipPermissions") } }
 
     var toolRestriction: ToolRestriction = .none { didSet { defaults.set(toolRestriction.rawValue, forKey: "hl.toolRestriction") } }
     var toolList = "" { didSet { defaults.set(toolList, forKey: "hl.toolList") } }
+    var builtInToolsMode: BuiltInToolsMode = .none { didSet { defaults.set(builtInToolsMode.rawValue, forKey: "hl.builtInToolsMode") } }
+    var builtInTools = "" { didSet { defaults.set(builtInTools, forKey: "hl.builtInTools") } }
+    var permissionPromptTool = "" { didSet { defaults.set(permissionPromptTool, forKey: "hl.permissionPromptTool") } }
 
     var systemPromptMode: SystemPromptMode = .none { didSet { defaults.set(systemPromptMode.rawValue, forKey: "hl.systemPromptMode") } }
     var systemPromptText = "" { didSet { defaults.set(systemPromptText, forKey: "hl.systemPromptText") } }
 
     var maxTurns = "" { didSet { defaults.set(maxTurns, forKey: "hl.maxTurns") } }
+    var maxBudgetUSD = "" { didSet { defaults.set(maxBudgetUSD, forKey: "hl.maxBudgetUSD") } }
     var verbose = false { didSet { defaults.set(verbose, forKey: "hl.verbose") } }
+    var debug = false { didSet { defaults.set(debug, forKey: "hl.debug") } }
+    var debugFilter = "" { didSet { defaults.set(debugFilter, forKey: "hl.debugFilter") } }
+    var debugFile = "" { didSet { defaults.set(debugFile, forKey: "hl.debugFile") } }
 
     var sessionMode: SessionMode = .none { didSet { defaults.set(sessionMode.rawValue, forKey: "hl.sessionMode") } }
     var sessionValue = "" { didSet { defaults.set(sessionValue, forKey: "hl.sessionValue") } }
+    var sessionID = "" { didSet { defaults.set(sessionID, forKey: "hl.sessionID") } }
+    var sessionName = "" { didSet { defaults.set(sessionName, forKey: "hl.sessionName") } }
+    var forkSession = false { didSet { defaults.set(forkSession, forKey: "hl.forkSession") } }
+    var noSessionPersistence = false { didSet { defaults.set(noSessionPersistence, forKey: "hl.noSessionPersistence") } }
+
+    var includePartialMessages = false { didSet { defaults.set(includePartialMessages, forKey: "hl.includePartialMessages") } }
+    var includeHookEvents = false { didSet { defaults.set(includeHookEvents, forKey: "hl.includeHookEvents") } }
+    var replayUserMessages = false { didSet { defaults.set(replayUserMessages, forKey: "hl.replayUserMessages") } }
+    var promptSuggestions = false { didSet { defaults.set(promptSuggestions, forKey: "hl.promptSuggestions") } }
+    var jsonSchema = "" { didSet { defaults.set(jsonSchema, forKey: "hl.jsonSchema") } }
 
     private(set) var discoveredMCP: [DiscoveredMCP] = []
     var selectedMCP: Set<String> = [] {
         didSet { defaults.set(Array(selectedMCP).sorted(), forKey: "hl.selectedMCP") }
     }
     var strictMCP = false { didSet { defaults.set(strictMCP, forKey: "hl.strictMCP") } }
+    var manualMCPConfig = "" { didSet { defaults.set(manualMCPConfig, forKey: "hl.manualMCPConfig") } }
+
+    var settings = "" { didSet { defaults.set(settings, forKey: "hl.settings") } }
+    var settingSources = "" { didSet { defaults.set(settingSources, forKey: "hl.settingSources") } }
+    var bare = false { didSet { defaults.set(bare, forKey: "hl.bare") } }
+    var safeMode = false { didSet { defaults.set(safeMode, forKey: "hl.safeMode") } }
+    var axScreenReader = false { didSet { defaults.set(axScreenReader, forKey: "hl.axScreenReader") } }
+    var disableSlashCommands = false { didSet { defaults.set(disableSlashCommands, forKey: "hl.disableSlashCommands") } }
+    var excludeDynamicSystemPromptSections = false { didSet { defaults.set(excludeDynamicSystemPromptSections, forKey: "hl.excludeDynamicSystemPromptSections") } }
+    var ide = false { didSet { defaults.set(ide, forKey: "hl.ide") } }
+    var chromeMode: ChromeMode = .none { didSet { defaults.set(chromeMode.rawValue, forKey: "hl.chromeMode") } }
+    var effortLevel: EffortLevel = .none { didSet { defaults.set(effortLevel.rawValue, forKey: "hl.effortLevel") } }
+    var advisorModel = "" { didSet { defaults.set(advisorModel, forKey: "hl.advisorModel") } }
 
     var reviewed = false
 
@@ -232,16 +371,46 @@ final class HeadlessLauncher {
         outputFormat = OutputFormat(rawValue: defaults.string(forKey: "hl.outputFormat") ?? "") ?? .none
         inputFormat = InputFormat(rawValue: defaults.string(forKey: "hl.inputFormat") ?? "") ?? .none
         permissionMode = PermissionMode(rawValue: defaults.string(forKey: "hl.permission") ?? "") ?? .plan
+        allowDangerouslySkipPermissions = defaults.bool(forKey: "hl.allowDangerouslySkipPermissions")
+        dangerouslySkipPermissions = defaults.bool(forKey: "hl.dangerouslySkipPermissions")
         toolRestriction = ToolRestriction(rawValue: defaults.string(forKey: "hl.toolRestriction") ?? "") ?? .none
         toolList = defaults.string(forKey: "hl.toolList") ?? ""
+        builtInToolsMode = BuiltInToolsMode(rawValue: defaults.string(forKey: "hl.builtInToolsMode") ?? "") ?? .none
+        builtInTools = defaults.string(forKey: "hl.builtInTools") ?? ""
+        permissionPromptTool = defaults.string(forKey: "hl.permissionPromptTool") ?? ""
         systemPromptMode = SystemPromptMode(rawValue: defaults.string(forKey: "hl.systemPromptMode") ?? "") ?? .none
         systemPromptText = defaults.string(forKey: "hl.systemPromptText") ?? ""
         maxTurns = defaults.string(forKey: "hl.maxTurns") ?? ""
+        maxBudgetUSD = defaults.string(forKey: "hl.maxBudgetUSD") ?? ""
         verbose = defaults.bool(forKey: "hl.verbose")
+        debug = defaults.bool(forKey: "hl.debug")
+        debugFilter = defaults.string(forKey: "hl.debugFilter") ?? ""
+        debugFile = defaults.string(forKey: "hl.debugFile") ?? ""
         sessionMode = SessionMode(rawValue: defaults.string(forKey: "hl.sessionMode") ?? "") ?? .none
         sessionValue = defaults.string(forKey: "hl.sessionValue") ?? ""
+        sessionID = defaults.string(forKey: "hl.sessionID") ?? ""
+        sessionName = defaults.string(forKey: "hl.sessionName") ?? ""
+        forkSession = defaults.bool(forKey: "hl.forkSession")
+        noSessionPersistence = defaults.bool(forKey: "hl.noSessionPersistence")
+        includePartialMessages = defaults.bool(forKey: "hl.includePartialMessages")
+        includeHookEvents = defaults.bool(forKey: "hl.includeHookEvents")
+        replayUserMessages = defaults.bool(forKey: "hl.replayUserMessages")
+        promptSuggestions = defaults.bool(forKey: "hl.promptSuggestions")
+        jsonSchema = defaults.string(forKey: "hl.jsonSchema") ?? ""
         selectedMCP = Set(defaults.stringArray(forKey: "hl.selectedMCP") ?? [])
         strictMCP = defaults.bool(forKey: "hl.strictMCP")
+        manualMCPConfig = defaults.string(forKey: "hl.manualMCPConfig") ?? ""
+        settings = defaults.string(forKey: "hl.settings") ?? ""
+        settingSources = defaults.string(forKey: "hl.settingSources") ?? ""
+        bare = defaults.bool(forKey: "hl.bare")
+        safeMode = defaults.bool(forKey: "hl.safeMode")
+        axScreenReader = defaults.bool(forKey: "hl.axScreenReader")
+        disableSlashCommands = defaults.bool(forKey: "hl.disableSlashCommands")
+        excludeDynamicSystemPromptSections = defaults.bool(forKey: "hl.excludeDynamicSystemPromptSections")
+        ide = defaults.bool(forKey: "hl.ide")
+        chromeMode = ChromeMode(rawValue: defaults.string(forKey: "hl.chromeMode") ?? "") ?? .none
+        effortLevel = EffortLevel(rawValue: defaults.string(forKey: "hl.effortLevel") ?? "") ?? .none
+        advisorModel = defaults.string(forKey: "hl.advisorModel") ?? ""
         refreshMCP()
     }
 
@@ -314,7 +483,7 @@ final class HeadlessLauncher {
     // MARK: - Validation
 
     var isDangerous: Bool {
-        permissionMode.isDangerous || selectedPreset.isDangerous
+        permissionMode.isDangerous || dangerouslySkipPermissions || selectedPreset.isDangerous
     }
 
     var validationMessages: [String] {
@@ -329,11 +498,39 @@ final class HeadlessLauncher {
         if let maxTurnsError {
             messages.append(maxTurnsError)
         }
+        if let maxBudgetError {
+            messages.append(maxBudgetError)
+        }
         if sessionMode == .resume && sessionValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             messages.append("--resume requires a session ID.")
         }
+        let trimmedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSessionID.isEmpty && UUID(uuidString: trimmedSessionID) == nil {
+            messages.append("--session-id must be a valid UUID.")
+        }
+        if forkSession && sessionMode == .none {
+            messages.append("--fork-session requires --resume or --continue.")
+        }
         if systemPromptMode != .none && systemPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            messages.append("System prompt mode is selected but the prompt is empty.")
+            messages.append(systemPromptMode.usesFile ? "System prompt file mode is selected but the path is empty." : "System prompt mode is selected but the prompt is empty.")
+        }
+        if builtInToolsMode == .custom && builtInTools.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            messages.append("Custom --tools is selected but empty.")
+        }
+        if dangerouslySkipPermissions && permissionMode != .none && permissionMode != .bypassPermissions {
+            messages.append("--dangerously-skip-permissions conflicts with the selected permission mode.")
+        }
+        if includePartialMessages && outputFormat != .streamJSON {
+            messages.append("--include-partial-messages requires --output-format stream-json.")
+        }
+        if includeHookEvents && outputFormat != .streamJSON {
+            messages.append("--include-hook-events requires --output-format stream-json.")
+        }
+        if replayUserMessages && (inputFormat != .streamJSON || outputFormat != .streamJSON) {
+            messages.append("--replay-user-messages requires stream-json input and output.")
+        }
+        if promptSuggestions && (outputFormat != .streamJSON || !verbose) {
+            messages.append("--prompt-suggestions requires stream-json output and --verbose.")
         }
         return messages
     }
@@ -347,6 +544,15 @@ final class HeadlessLauncher {
         guard !trimmed.isEmpty else { return nil }
         guard let value = Int(trimmed), value >= 1 else {
             return "--max-turns must be a whole number of 1 or greater."
+        }
+        return nil
+    }
+
+    private var maxBudgetError: String? {
+        let trimmed = maxBudgetUSD.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let value = Decimal(string: trimmed), value > 0 else {
+            return "--max-budget-usd must be a positive number."
         }
         return nil
     }
@@ -383,7 +589,15 @@ final class HeadlessLauncher {
     // MARK: - Command assembly
 
     private var extraDirectoryList: [String] {
-        additionalDirectories
+        lineList(additionalDirectories)
+    }
+
+    private var manualMCPConfigArguments: [String] {
+        lineList(manualMCPConfig)
+    }
+
+    private func lineList(_ raw: String) -> [String] {
+        raw
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -443,6 +657,18 @@ final class HeadlessLauncher {
         }
     }
 
+    private var builtInToolsArgument: String? {
+        switch builtInToolsMode {
+        case .none:
+            return nil
+        case .defaultTools, .disabled:
+            return builtInToolsMode.commandValue
+        case .custom:
+            let trimmed = builtInTools.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
     private var optionSegments: [String] {
         var segments: [String] = []
 
@@ -455,17 +681,33 @@ final class HeadlessLauncher {
         if outputFormat != .none {
             segments.append("--output-format \(shellQuote(outputFormat.value))")
         }
-        if outputFormat == .streamJSON && inputFormat == .streamJSON {
+        if inputFormat != .none {
             segments.append("--input-format \(shellQuote(inputFormat.value))")
         }
-        if let permission = permissionMode.flagValue {
+        if dangerouslySkipPermissions {
+            segments.append("--dangerously-skip-permissions")
+        } else if let permission = permissionMode.flagValue {
             segments.append("--permission-mode \(shellQuote(permission))")
+        }
+        if allowDangerouslySkipPermissions {
+            segments.append("--allow-dangerously-skip-permissions")
         }
         if let turns = Int(maxTurns.trimmingCharacters(in: .whitespacesAndNewlines)), turns >= 1 {
             segments.append("--max-turns \(turns)")
         }
+        let budget = maxBudgetUSD.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !budget.isEmpty, Decimal(string: budget) != nil {
+            segments.append("--max-budget-usd \(shellQuote(budget))")
+        }
         if let toolArgument {
             segments.append("\(toolArgument.flag) \(shellQuote(toolArgument.value))")
+        }
+        if let builtInToolsArgument {
+            segments.append("--tools \(shellQuote(builtInToolsArgument))")
+        }
+        let permissionTool = permissionPromptTool.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !permissionTool.isEmpty {
+            segments.append("--permission-prompt-tool \(shellQuote(permissionTool))")
         }
         if let systemPromptFlag = systemPromptMode.flag {
             let text = systemPromptText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -475,9 +717,12 @@ final class HeadlessLauncher {
         }
         if let mcpConfigArgument {
             segments.append("--mcp-config \(shellQuote(mcpConfigArgument))")
-            if strictMCP {
-                segments.append("--strict-mcp-config")
-            }
+        }
+        for config in manualMCPConfigArguments {
+            segments.append("--mcp-config \(shellQuote(config))")
+        }
+        if strictMCP && (!selectedMCP.isEmpty || !manualMCPConfigArguments.isEmpty) {
+            segments.append("--strict-mcp-config")
         }
         for directory in emittedAdditionalDirectories {
             segments.append("--add-dir \(shellQuote(directory))")
@@ -492,6 +737,80 @@ final class HeadlessLauncher {
             if !value.isEmpty {
                 segments.append("--resume \(shellQuote(value))")
             }
+        }
+        let explicitSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !explicitSessionID.isEmpty {
+            segments.append("--session-id \(shellQuote(explicitSessionID))")
+        }
+        let name = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            segments.append("--name \(shellQuote(name))")
+        }
+        if forkSession {
+            segments.append("--fork-session")
+        }
+        if noSessionPersistence {
+            segments.append("--no-session-persistence")
+        }
+        if includeHookEvents {
+            segments.append("--include-hook-events")
+        }
+        if includePartialMessages {
+            segments.append("--include-partial-messages")
+        }
+        if replayUserMessages {
+            segments.append("--replay-user-messages")
+        }
+        if promptSuggestions {
+            segments.append("--prompt-suggestions")
+        }
+        let schema = jsonSchema.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !schema.isEmpty {
+            segments.append("--json-schema \(shellQuote(schema))")
+        }
+        let settingsValue = settings.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !settingsValue.isEmpty {
+            segments.append("--settings \(shellQuote(settingsValue))")
+        }
+        let sources = settingSources.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sources.isEmpty {
+            segments.append("--setting-sources \(shellQuote(sources))")
+        }
+        if bare {
+            segments.append("--bare")
+        }
+        if safeMode {
+            segments.append("--safe-mode")
+        }
+        if axScreenReader {
+            segments.append("--ax-screen-reader")
+        }
+        if disableSlashCommands {
+            segments.append("--disable-slash-commands")
+        }
+        if excludeDynamicSystemPromptSections {
+            segments.append("--exclude-dynamic-system-prompt-sections")
+        }
+        if ide {
+            segments.append("--ide")
+        }
+        if let chromeFlag = chromeMode.flag {
+            segments.append(chromeFlag)
+        }
+        if debug {
+            let filter = debugFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            segments.append(filter.isEmpty ? "--debug" : "--debug \(shellQuote(filter))")
+        }
+        let debugPath = debugFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !debugPath.isEmpty {
+            segments.append("--debug-file \(shellQuote(debugPath))")
+        }
+        if let effort = effortLevel.value {
+            segments.append("--effort \(shellQuote(effort))")
+        }
+        let advisor = advisorModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !advisor.isEmpty {
+            segments.append("--advisor \(shellQuote(advisor))")
         }
         if verbose {
             segments.append("--verbose")

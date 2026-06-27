@@ -51,7 +51,7 @@ struct PersistedSettings: Codable {
     /// Stored with bookmarks for sandbox persistence.
     var promptDirectories: [String] = []
     var promptDirectoryBookmarks: [Data] = []
-    /// Workspace folders exposed to the built-in Desktop Commander-compatible MCP tools.
+    /// Workspace folders exposed to the built-in Forge commander MCP tools.
     /// Stored with bookmarks so sandboxed builds retain explicit user grants.
     var commanderDirectories: [String] = []
     var commanderDirectoryBookmarks: [Data] = []

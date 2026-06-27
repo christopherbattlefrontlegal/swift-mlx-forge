@@ -9,6 +9,7 @@ enum SecretsStore {
     private static let hfAccount = "huggingface-token"
     private static let anthropicAccount = "anthropic-api-key"
     private static let openRouterAccount = "openrouter-api-key"
+    private static let braveSearchAccount = "brave-search-api-key"
 
     static var huggingFaceToken: String? {
         get { read(account: hfAccount) }
@@ -39,6 +40,17 @@ enum SecretsStore {
                 write(account: openRouterAccount, value: newValue.trimmingCharacters(in: .whitespaces))
             } else {
                 delete(account: openRouterAccount)
+            }
+        }
+    }
+
+    static var braveSearchAPIKey: String? {
+        get { read(account: braveSearchAccount) }
+        set {
+            if let newValue, !newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                write(account: braveSearchAccount, value: newValue.trimmingCharacters(in: .whitespaces))
+            } else {
+                delete(account: braveSearchAccount)
             }
         }
     }

@@ -46,6 +46,12 @@ struct TuningInspector: View {
                     ParameterSlider(
                         label: "Repetition penalty", value: $app.settings.repetitionPenalty,
                         range: 1.0...1.5, hardLimit: 1.0...3.0, fractionDigits: 2)
+                    Picker("API auto-load policy", selection: $app.settings.weightLoadPolicy) {
+                        ForEach(WeightLoadPolicy.allCases) { policy in
+                            Text(policy.label).tag(policy)
+                        }
+                    }
+                    .help(WeightLoadPolicy.eager.help)
                 }
 
                 collapsibleSection(
@@ -59,7 +65,7 @@ struct TuningInspector: View {
                             }
                             ForEach(app.promptPresets) { preset in
                                 Button(preset.name) {
-                                    app.settings.systemPrompt = preset.text
+                                    app.applySystemPrompt(preset.text)
                                 }
                             }
                             Divider()
@@ -103,7 +109,7 @@ struct TuningInspector: View {
                         .help("Open the system prompt in a large resizable editor")
                     }
 
-                    TextEditor(text: $app.settings.systemPrompt)
+                    TextEditor(text: systemPromptBinding)
                         .font(.callout)
                         .scrollContentBackground(.hidden)
                         .frame(minHeight: 56, maxHeight: 120)
@@ -112,14 +118,21 @@ struct TuningInspector: View {
                         .clipShape(.rect(cornerRadius: Theme.radiusSmall))
                 }
 
-                if !app.engine.loadedModels.isEmpty {
-                    collapsibleSection(
-                        "Loaded Models", icon: "cpu", expanded: $modelsExpanded,
-                        detail: "\(app.engine.loadedModels.count) loaded"
-                    ) {
+                collapsibleSection(
+                    "Loaded Models", icon: "cpu", expanded: $modelsExpanded,
+                    detail: ModelMemoryBudget.catalogSubtitle(app.memoryBudgetSnapshot)
+                ) {
+                    Text(ModelMemoryBudget.catalogMenuLabel(app.memoryBudgetSnapshot))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if !app.engine.loadedModels.isEmpty {
                         ForEach(app.engine.loadedModels) { entry in
                             LoadedModelRow(entry: entry)
                         }
+                    } else {
+                        Text("No models resident — load from Model Library (⌘M).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -242,6 +255,16 @@ struct TuningInspector: View {
                 PromptPreset(name: name, text: app.settings.systemPrompt))
         }
         presetNameDraft = ""
+    }
+
+    private var systemPromptBinding: Binding<String> {
+        Binding(
+            get: { app.settings.systemPrompt },
+            set: { newValue in
+                var next = app.settings
+                next.systemPrompt = newValue
+                app.settings = next
+            })
     }
 
     private var promptSummary: String {
@@ -549,6 +572,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .disabled:
             return "Off"
+        case .available:
+            return "Idle"
         case .connecting:
             return "Starting"
         case .connected(let tools):
@@ -639,6 +664,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .disabled:
             return "off"
+        case .available:
+            return "idle"
         case .connecting:
             return "checking"
         case .connected(let tools):
@@ -653,6 +680,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .disabled:
             return "off"
+        case .available:
+            return "idle · click to check"
         case .connecting:
             return entry.config.command == nil ? "checking tools" : "starting stdio"
         case .connected(let tools):
@@ -668,6 +697,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .disabled:
             return "Server is off."
+        case .available:
+            return "Configured. Click refresh to connect and list tools."
         case .connecting:
             return entry.config.command == nil
                 ? "Connecting and listing tools."
@@ -684,6 +715,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .disabled:
             return .gray
+        case .available:
+            return .gray
         case .connected(let tools):
             return tools.isEmpty ? .yellow : Theme.okGreen
         case .connecting:
@@ -697,6 +730,8 @@ private struct MCPInspectorRow: View {
         switch entry.status {
         case .failed:
             return .red
+        case .available:
+            return .secondary
         case .connecting:
             return .yellow
         case .connected(let tools):
@@ -710,7 +745,7 @@ private struct MCPInspectorRow: View {
         if entry.isBuiltIn {
             NSWorkspace.shared.activateFileViewerSelecting([ForgePaths.appSupport])
         } else {
-            NSWorkspace.shared.activateFileViewerSelecting([MCPManager.configFile])
+            NSWorkspace.shared.activateFileViewerSelecting([MCPManager.projectConfigFile])
         }
     }
 }
@@ -721,6 +756,10 @@ private struct LoadedModelRow: View {
     let entry: InferenceEngine.Loaded
 
     private var isActive: Bool { app.engine.activeModelID == entry.id }
+    private var needsStandardReload: Bool {
+        entry.weightLoadPolicy == .boundedEager
+            || entry.weightLoadPolicy == .deferred
+    }
 
     var body: some View {
         HStack(spacing: Theme.s2) {
@@ -742,7 +781,7 @@ private struct LoadedModelRow: View {
                         Format.bytes(entry.model.sizeBytes),
                         entry.model.quantization,
                         entry.model.architecture,
-                        entry.mmapReaders != nil ? "mmap" : nil,
+                        entry.weightLoadPolicy?.shortLabel,
                     ]
                     .compactMap { $0 }.joined(separator: " · ")
                 )
@@ -770,6 +809,16 @@ struct SystemPromptEditor: View {
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
 
+    private var systemPromptBinding: Binding<String> {
+        Binding(
+            get: { app.settings.systemPrompt },
+            set: { newValue in
+                var next = app.settings
+                next.systemPrompt = newValue
+                app.settings = next
+            })
+    }
+
     var body: some View {
         @Bindable var app = app
         VStack(spacing: 0) {
@@ -787,7 +836,7 @@ struct SystemPromptEditor: View {
 
             Divider()
 
-            TextEditor(text: $app.settings.systemPrompt)
+            TextEditor(text: systemPromptBinding)
                 .font(.system(.body, design: .monospaced))
                 .lineSpacing(3)
                 .scrollContentBackground(.hidden)
@@ -799,7 +848,7 @@ struct SystemPromptEditor: View {
 
             HStack {
                 Button("Clear", role: .destructive) {
-                    app.settings.systemPrompt = ""
+                    app.applySystemPrompt("")
                 }
                 .disabled(app.settings.systemPrompt.isEmpty)
                 Text("Changes apply live to the next message.")

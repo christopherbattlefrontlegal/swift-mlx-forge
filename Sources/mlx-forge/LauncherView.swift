@@ -222,14 +222,40 @@ struct LauncherView: View {
                     Text(format.label).tag(format)
                 }
             }
-            if hl.outputFormat == .streamJSON {
-                Picker("Input", selection: $hl.inputFormat) {
-                    ForEach(HeadlessLauncher.InputFormat.allCases) { format in
-                        Text(format.label).tag(format)
+            Picker("Input", selection: $hl.inputFormat) {
+                ForEach(HeadlessLauncher.InputFormat.allCases) { format in
+                    Text(format.label).tag(format)
+                }
+            }
+            .font(.callout)
+            Toggle("include partial messages", isOn: $hl.includePartialMessages)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("include hook events", isOn: $hl.includeHookEvents)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("replay user messages", isOn: $hl.replayUserMessages)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("prompt suggestions", isOn: $hl.promptSuggestions)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            TextEditor(text: $hl.jsonSchema)
+                .font(.callout.monospaced())
+                .scrollContentBackground(.hidden)
+                .frame(height: 46)
+                .padding(Theme.s1)
+                .background(Theme.codeBackground)
+                .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                .overlay(alignment: .topLeading) {
+                    if hl.jsonSchema.isEmpty {
+                        Text("optional --json-schema")
+                            .font(.callout.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .padding(Theme.s2)
+                            .allowsHitTesting(false)
                     }
                 }
-                .font(.callout)
-            }
         }
 
         pickerCard("Permission Mode", icon: "shield.lefthalf.filled", danger: hl.permissionMode.isDangerous) {
@@ -249,6 +275,12 @@ struct LauncherView: View {
                     Text(mode.label).tag(mode)
                 }
             }
+            Toggle("allow skip permissions in mode cycle", isOn: $hl.allowDangerouslySkipPermissions)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("emit --dangerously-skip-permissions", isOn: $hl.dangerouslySkipPermissions)
+                .font(.callout)
+                .toggleStyle(.checkbox)
         }
 
         pickerCard("Tool Restriction", icon: "wrench.and.screwdriver") {
@@ -270,18 +302,89 @@ struct LauncherView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.callout.monospaced())
             }
+            TextField("explicit --session-id uuid", text: $hl.sessionID)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+            TextField("session name (--name)", text: $hl.sessionName)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+            Toggle("fork resumed session", isOn: $hl.forkSession)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("no session persistence", isOn: $hl.noSessionPersistence)
+                .font(.callout)
+                .toggleStyle(.checkbox)
         }
 
         pickerCard("Limits", icon: "speedometer") {
-            TextField("max turns, e.g. 5", text: Binding(
-                get: { hl.maxTurns },
-                set: { hl.maxTurns = $0.filter(\.isNumber) }
-            ))
-            .textFieldStyle(.roundedBorder)
-            .font(.callout.monospaced())
+            HStack(spacing: Theme.s2) {
+                TextField("max turns", text: Binding(
+                    get: { hl.maxTurns },
+                    set: { hl.maxTurns = $0.filter(\.isNumber) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+                TextField("max budget usd", text: $hl.maxBudgetUSD)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+            }
             Toggle("verbose (--verbose)", isOn: $hl.verbose)
                 .font(.callout)
                 .toggleStyle(.checkbox)
+            Toggle("debug (--debug)", isOn: $hl.debug)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            if hl.debug {
+                TextField("debug filter, e.g. api,mcp", text: $hl.debugFilter)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+            }
+            TextField("debug file path", text: $hl.debugFile)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+        }
+
+        pickerCard("Runtime", icon: "gearshape.2") {
+            Picker("Chrome", selection: $hl.chromeMode) {
+                ForEach(HeadlessLauncher.ChromeMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            Toggle("bare mode", isOn: $hl.bare)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("safe mode", isOn: $hl.safeMode)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("screen reader output", isOn: $hl.axScreenReader)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("auto-connect IDE", isOn: $hl.ide)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("disable slash commands", isOn: $hl.disableSlashCommands)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+            Toggle("exclude dynamic prompt sections", isOn: $hl.excludeDynamicSystemPromptSections)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+        }
+
+        pickerCard("Settings", icon: "slider.horizontal.below.rectangle") {
+            TextField("settings file or inline JSON", text: $hl.settings)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+            TextField("setting sources: user,project,local", text: $hl.settingSources)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+            Picker("Effort", selection: $hl.effortLevel) {
+                ForEach(HeadlessLauncher.EffortLevel.allCases) { level in
+                    Text(level.label).tag(level)
+                }
+            }
+            TextField("advisor model, e.g. opus", text: $hl.advisorModel)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
         }
     }
 
@@ -291,6 +394,19 @@ struct LauncherView: View {
     private func toolsSection(_ hl: HeadlessLauncher) -> some View {
         @Bindable var hl = hl
         card("Tools", icon: "hammer") {
+            Picker("Built-in tools", selection: $hl.builtInToolsMode) {
+                ForEach(HeadlessLauncher.BuiltInToolsMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.menu)
+
+            if hl.builtInToolsMode == .custom {
+                TextField("Bash,Edit,Read or default", text: $hl.builtInTools)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+            }
+
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: Theme.s2)], alignment: .leading, spacing: Theme.s2) {
                 ForEach(HeadlessLauncher.commonTools, id: \.self) { tool in
                     Toggle(tool, isOn: Binding(
@@ -318,6 +434,10 @@ struct LauncherView: View {
                             .allowsHitTesting(false)
                     }
                 }
+
+            TextField("permission prompt MCP tool", text: $hl.permissionPromptTool)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
         }
     }
 
@@ -363,13 +483,19 @@ struct LauncherView: View {
                 .disabled(hl.systemPromptMode == .none)
             }
 
-            TextEditor(text: $hl.systemPromptText)
-                .font(.callout.monospaced())
-                .scrollContentBackground(.hidden)
-                .frame(height: 72)
-                .padding(Theme.s1)
-                .background(Theme.codeBackground)
-                .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+            if hl.systemPromptMode.usesFile {
+                TextField("prompt file path", text: $hl.systemPromptText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+            } else {
+                TextEditor(text: $hl.systemPromptText)
+                    .font(.callout.monospaced())
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 72)
+                    .padding(Theme.s1)
+                    .background(Theme.codeBackground)
+                    .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+            }
         }
     }
 
@@ -379,6 +505,23 @@ struct LauncherView: View {
     private func mcpSection(_ hl: HeadlessLauncher) -> some View {
         @Bindable var hl = hl
         card("MCP Servers", icon: "server.rack") {
+            TextEditor(text: $hl.manualMCPConfig)
+                .font(.callout.monospaced())
+                .scrollContentBackground(.hidden)
+                .frame(height: 54)
+                .padding(Theme.s1)
+                .background(Theme.codeBackground)
+                .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                .overlay(alignment: .topLeading) {
+                    if hl.manualMCPConfig.isEmpty {
+                        Text("optional --mcp-config file path or JSON, one per line")
+                            .font(.callout.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .padding(Theme.s2)
+                            .allowsHitTesting(false)
+                    }
+                }
+
             if hl.discoveredMCP.isEmpty {
                 Text("No MCP servers found in ~/.claude.json or the selected project's .mcp.json.")
                     .font(.callout)
@@ -388,11 +531,11 @@ struct LauncherView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 MCPServerChecklist(servers: hl.discoveredMCP, selected: $hl.selectedMCP)
-                Toggle("Strict MCP config (--strict-mcp-config)", isOn: $hl.strictMCP)
-                    .font(.callout)
-                    .toggleStyle(.checkbox)
-                    .disabled(hl.selectedMCP.isEmpty)
             }
+            Toggle("Strict MCP config (--strict-mcp-config)", isOn: $hl.strictMCP)
+                .font(.callout)
+                .toggleStyle(.checkbox)
+                .disabled(hl.selectedMCP.isEmpty && hl.manualMCPConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 
@@ -503,7 +646,6 @@ struct LauncherView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard()
         .pickerStyle(.menu)
-        .labelsHidden()
     }
 
     private func browse(_ binding: Binding<String>, refreshMCP: Bool = false) {

@@ -71,12 +71,10 @@ The App Store-safe MCP path is HTTP/SSE:
 
 - HTTPS MCP servers are allowed.
 - Plain HTTP is allowed only on loopback: `127.0.0.1`, `localhost`, or `::1`.
-- Stdio MCP entries are recognized for compatibility but are not launched by Forge.
+- Stdio MCP entries stay idle at launch and can be checked manually from the MCP UI in developer builds.
 
-Forge first checks for `mcp.json` in the current working directory (useful for development), then falls back to
-`~/Library/Application Support/Forge/mcp-servers.json`.  
-Keep your local MCP configuration in `mcp-servers.json` (portable) and run with a working directory
-that is your repo clone for the local `mcp.json` flow.  
+Forge reads MCP server configuration from the local `mcp.json` in the project working directory.
+Run with a working directory that is your repo clone so Forge and the headless helper use that file only.
 Use `mcp.example.json` as a safe template before adding your own local server paths.
 
 ## Local API Server

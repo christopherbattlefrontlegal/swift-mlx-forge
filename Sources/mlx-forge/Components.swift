@@ -53,6 +53,43 @@ struct ModelPickerControl: View {
                     }
                 }
             }
+            if app.hasOpenRouterKey {
+                Section("OpenRouter presets") {
+                    ForEach(OpenRouterClient.models, id: \.id) { model in
+                        Button {
+                            if app.isOpenRouterModelSelected(model.id) {
+                                app.setPrimaryOpenRouterModel(model.id)
+                            } else {
+                                app.setOpenRouterModel(model.id, selected: true)
+                            }
+                        } label: {
+                            if app.openRouterModelID == model.id {
+                                Label(model.label, systemImage: "checkmark.circle.fill")
+                            } else if app.isOpenRouterModelSelected(model.id) {
+                                Label(model.label, systemImage: "circle.fill")
+                            } else {
+                                Label(model.label, systemImage: "circle")
+                            }
+                        }
+                    }
+                    if !app.openRouterCatalog.isEmpty {
+                        Divider()
+                        ForEach(app.openRouterCatalog) { entry in
+                            if !OpenRouterClient.models.contains(where: { $0.id == entry.id }) {
+                                Button {
+                                    app.setOpenRouterModel(entry.id, selected: true)
+                                } label: {
+                                    Label(entry.label, systemImage: "circle")
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Select all presets") { app.selectAllOpenRouterModels() }
+                    Button("Clear selection") { app.clearOpenRouterModels() }
+                    Button("Refresh live catalog") { app.refreshOpenRouterCatalog() }
+                }
+            }
             Section("Claude (API key)") {
                 ForEach(AnthropicClient.models, id: \.id) { claude in
                     Button {

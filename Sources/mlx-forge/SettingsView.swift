@@ -26,9 +26,11 @@ private struct ClaudeKeySettings: View {
     @State private var anthropicDraft = ""
     @State private var openRouterDraft = ""
     @State private var customOpenRouterModel = ""
+    @State private var braveSearchDraft = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s4) {
+        @Bindable var app = app
+        return VStack(alignment: .leading, spacing: Theme.s4) {
             Label("Cloud API Providers", systemImage: "cloud")
                 .font(.headline)
 
@@ -117,6 +119,73 @@ private struct ClaudeKeySettings: View {
                             Image(systemName: "trash")
                         }
                         .help("Remove the stored OpenRouter key")
+                    }
+                }
+
+                Divider()
+                VStack(alignment: .leading, spacing: Theme.s2) {
+                    Text("Code loop (OpenRouter)")
+                        .font(.caption.weight(.semibold))
+                    Text("Planner → coder → auditor → fixer → tester. Chat toolbar loop button.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Picker("Model", selection: Binding(
+                        get: { app.codingOrchestratorConfig.modelID },
+                        set: { app.codingOrchestratorConfig.modelID = $0 })) {
+                        ForEach(OpenRouterClient.models, id: \.id) { model in
+                            Text(model.label).tag(model.id)
+                        }
+                        ForEach(app.openRouterCatalog) { entry in
+                            Text(entry.label).tag(entry.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Stepper(
+                        "Max rounds: \(app.codingOrchestratorConfig.maxRounds)",
+                        value: Binding(
+                            get: { app.codingOrchestratorConfig.maxRounds },
+                            set: { app.codingOrchestratorConfig.maxRounds = max(1, min(10, $0)) }),
+                        in: 1...10)
+                    Button("Refresh model catalog") { app.refreshOpenRouterCatalog() }
+                        .controlSize(.small)
+                        .disabled(app.isOpenRouterCatalogLoading)
+                    if let error = app.openRouterCatalogError {
+                        Text(error).font(.caption2).foregroundStyle(.red)
+                    }
+                }
+            }
+
+            providerCard(
+                title: "Brave Search Answers",
+                icon: "magnifyingglass.circle",
+                description: app.hasBraveSearchKey
+                    ? "Brave Answers key saved. Toggle Brave in chat or use the globe button to send web-grounded queries."
+                    : "Web-grounded answers via Brave Search Answers API."
+            ) {
+                Toggle("Research mode (multi-search)", isOn: $app.braveSearchConfig.enableResearch)
+                Toggle("Inline citations", isOn: $app.braveSearchConfig.enableCitations)
+                HStack(spacing: Theme.s2) {
+                    SecureField(
+                        app.hasBraveSearchKey ? "Replace key" : "BRAVE_SEARCH_API_KEY",
+                        text: $braveSearchDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    Button("Save") {
+                        let key = braveSearchDraft.trimmingCharacters(in: .whitespaces)
+                        guard !key.isEmpty else { return }
+                        app.setBraveSearchKey(key)
+                        braveSearchDraft = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.ember)
+                    .disabled(braveSearchDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if app.hasBraveSearchKey {
+                        Button(role: .destructive) {
+                            app.setBraveSearchKey(nil)
+                            braveSearchDraft = ""
+                        } label: {
+                            Image(systemName: "trash")
+                        }
                     }
                 }
             }
@@ -222,7 +291,7 @@ private struct MCPSettings: View {
             Label("MCP Servers", systemImage: "server.rack")
                 .font(.headline)
             Text(
-                "Forge includes a built-in desktop-commander server for workspace file tools. External HTTP/SSE and stdio servers are declared in mcp-servers.json using the same format as Claude Desktop."
+                "Forge includes a small built-in forge-commander fallback for workspace file tools. Full MCP servers, including Desktop Commander and memory graph, are declared in the local mcp.json."
             )
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -230,14 +299,14 @@ private struct MCPSettings: View {
 
             VStack(alignment: .leading, spacing: Theme.s2) {
                 HStack {
-                    Label("Built-in Desktop Commander", systemImage: "desktopcomputer")
+                    Label("Built-in Forge Commander", systemImage: "desktopcomputer")
                         .font(.caption.weight(.semibold))
                     Spacer()
                     Text("\(app.commanderDirectories.count + 1) root\(app.commanderDirectories.isEmpty ? "" : "s")")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                Text("Available out of the box as MCP server \"desktop-commander\". It can list, read, write, inspect, and search files under Forge's app-support folder and any workspace folders you grant here.")
+                Text("Available out of the box as MCP server \"forge-commander\". It can list, read, write, inspect, and search files under Forge's app-support folder and any workspace folders you grant here.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -255,7 +324,7 @@ private struct MCPSettings: View {
                     panel.canChooseFiles = false
                     panel.allowsMultipleSelection = false
                     panel.prompt = "Add Workspace"
-                    panel.message = "Select a folder that Forge's built-in desktop-commander tools may access."
+                    panel.message = "Select a folder that Forge's built-in forge-commander tools may access."
                     if panel.runModal() == .OK, let url = panel.url {
                         app.addCommanderDirectory(url)
                     }
@@ -332,7 +401,7 @@ private struct MCPSettings: View {
 
             HStack {
                 Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([MCPManager.configFile])
+                    NSWorkspace.shared.activateFileViewerSelecting([MCPManager.projectConfigFile])
                 } label: {
                     Label("Reveal Config File", systemImage: "folder")
                 }
@@ -342,7 +411,7 @@ private struct MCPSettings: View {
                     Label("Reload", systemImage: "arrow.clockwise")
                 }
                 Spacer()
-                Text(MCPManager.configFile.path)
+                Text(MCPManager.projectConfigFile.path)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -417,6 +486,8 @@ private struct MCPServerRow: View {
         switch entry.status {
         case .disabled:
             Circle().fill(.gray).frame(width: 8, height: 8)
+        case .available:
+            Circle().fill(.secondary).frame(width: 8, height: 8)
         case .connecting:
             ProgressView().controlSize(.mini)
         case .connected:
@@ -431,6 +502,10 @@ private struct MCPServerRow: View {
         switch entry.status {
         case .disabled:
             Text("off")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        case .available:
+            Text("idle")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         case .connecting:

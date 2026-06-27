@@ -23,7 +23,12 @@ final class AppState {
         didSet { autoActivateModel() }
     }
     var settings = GenerationSettings() {
-        didSet { scheduleSave() }
+        didSet {
+            if oldValue.systemPrompt != settings.systemPrompt {
+                engine.invalidateChatSessions()
+            }
+            scheduleSave()
+        }
     }
 
     /// Named system-prompt presets shown in the inspector's dropdown.
@@ -37,7 +42,7 @@ final class AppState {
     var promptDirectories: [URL] = []
     private var promptDirectoryBookmarks: [URL: Data] = [:]
 
-    /// User-granted folders exposed to the built-in Desktop Commander-compatible tools.
+    /// User-granted folders exposed to the built-in Forge commander tools.
     var commanderDirectories: [URL] = [] {
         didSet { mcp.commanderRoots = commanderDirectories }
     }
@@ -48,7 +53,7 @@ final class AppState {
         didSet { scheduleSave() }
     }
 
-    /// MCP servers declared in mcp-servers.json (see MCP.swift).
+    /// MCP servers declared in the local mcp.json (see MCP.swift).
     let mcp = MCPManager()
 
     // MARK: - Claude API provider (additive — parallel to the local engine)
@@ -77,14 +82,12 @@ final class AppState {
         return []
     }() {
         didSet {
-            openRouterModelIDs = Self.uniqueModelIDs(openRouterModelIDs)
-            if let first = openRouterModelIDs.first {
-                UserDefaults.standard.set(openRouterModelIDs, forKey: "openrouter.models")
-                UserDefaults.standard.set(first, forKey: "openrouter.model")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "openrouter.models")
-                UserDefaults.standard.removeObject(forKey: "openrouter.model")
+            let normalized = Self.uniqueModelIDs(openRouterModelIDs)
+            if normalized != openRouterModelIDs {
+                openRouterModelIDs = normalized
+                return
             }
+            persistOpenRouterModelSelection()
         }
     }
     var openRouterModelID: String? {
@@ -114,13 +117,17 @@ final class AppState {
 
     private var claudeSelected: Bool { (claudeModelID?.isEmpty == false) }
     private var openRouterSelected: Bool { !openRouterModelIDs.isEmpty }
+    private var braveSearchSelected: Bool { braveSearchEnabled }
     /// Anything currently producing tokens (local OR Claude).
     var isBusy: Bool {
-        engine.isGenerating || isClaudeGenerating || isOpenRouterGenerating || !inFlightAgentLabels.isEmpty
-            || isMCPRunning
+        engine.isGenerating || engine.isLoadingAnything || engine.materializingModelID != nil
+            || isClaudeGenerating || isOpenRouterGenerating || !inFlightAgentLabels.isEmpty
+            || isMCPRunning || isCodingOrchestratorRunning || isBraveSearchGenerating
     }
     /// Whether a chat target is selected.
-    var canChat: Bool { engine.activeModel != nil || claudeSelected || openRouterSelected }
+    var canChat: Bool {
+        engine.activeModel != nil || claudeSelected || openRouterSelected || braveSearchSelected
+    }
 
     var openRouterSelectionSummary: String {
         switch openRouterModelIDs.count {
@@ -139,9 +146,19 @@ final class AppState {
 
     func setOpenRouterModel(_ id: String, selected: Bool) {
         if selected {
-            openRouterModelIDs = Self.uniqueModelIDs(openRouterModelIDs + [id])
+            openRouterModelIDs = openRouterModelIDs + [id]
         } else {
             openRouterModelIDs.removeAll { $0 == id }
+        }
+    }
+
+    private func persistOpenRouterModelSelection() {
+        if let first = openRouterModelIDs.first {
+            UserDefaults.standard.set(openRouterModelIDs, forKey: "openrouter.models")
+            UserDefaults.standard.set(first, forKey: "openrouter.model")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "openrouter.models")
+            UserDefaults.standard.removeObject(forKey: "openrouter.model")
         }
     }
 
@@ -151,6 +168,171 @@ final class AppState {
 
     func clearOpenRouterModels() {
         openRouterModelIDs = []
+    }
+
+    /// Use a single OpenRouter model for chat (clears multi-select).
+    func setPrimaryOpenRouterModel(_ id: String) {
+        claudeModelID = nil
+        engine.activeModelID = nil
+        openRouterModelIDs = [id.trimmingCharacters(in: .whitespacesAndNewlines)]
+    }
+
+    var openRouterCatalog: [OpenRouterClient.ModelInfo] = []
+    private(set) var isOpenRouterCatalogLoading = false
+    var openRouterCatalogError: String?
+
+    func refreshOpenRouterCatalog() {
+        guard hasOpenRouterKey, let key = SecretsStore.openRouterAPIKey else {
+            openRouterCatalogError = "Add an OpenRouter API key in Settings first."
+            return
+        }
+        isOpenRouterCatalogLoading = true
+        openRouterCatalogError = nil
+        Task {
+            do {
+                let models = try await OpenRouterClient(apiKey: key).fetchModels()
+                self.openRouterCatalog = models
+                self.isOpenRouterCatalogLoading = false
+            } catch {
+                self.openRouterCatalogError = error.localizedDescription
+                self.isOpenRouterCatalogLoading = false
+            }
+        }
+    }
+
+    var codingOrchestratorConfig: CodingOrchestratorConfig = {
+        let modelID =
+            UserDefaults.standard.string(forKey: "codingOrchestrator.modelID")
+            ?? "qwen/qwen3-coder"
+        let rounds = UserDefaults.standard.integer(forKey: "codingOrchestrator.maxRounds")
+        return CodingOrchestratorConfig(
+            modelID: modelID,
+            maxRounds: rounds > 0 ? rounds : 3)
+    }() {
+        didSet {
+            UserDefaults.standard.set(codingOrchestratorConfig.modelID, forKey: "codingOrchestrator.modelID")
+            UserDefaults.standard.set(codingOrchestratorConfig.maxRounds, forKey: "codingOrchestrator.maxRounds")
+        }
+    }
+
+    private(set) var isCodingOrchestratorRunning = false
+    private(set) var codingOrchestratorPhase = ""
+    private var codingOrchestratorTask: Task<Void, Never>?
+
+    func runCodingOrchestrator(task: String) {
+        let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard hasOpenRouterKey, let key = SecretsStore.openRouterAPIKey else { return }
+        guard var conversation = selectedConversation else { return }
+
+        conversation.messages.append(ChatMessage(role: .user, content: trimmed))
+        var assistant = ChatMessage(role: .assistant, content: "# Code loop\n\nStarting…\n")
+        assistant.modelName = "Code loop · \(OpenRouterClient.label(for: codingOrchestratorConfig.modelID))"
+        conversation.messages.append(assistant)
+        conversation.refreshTitle()
+        conversation.updatedAt = Date()
+        selectedConversation = conversation
+
+        let convID = conversation.id
+        let messageID = assistant.id
+        let config = codingOrchestratorConfig
+        let client = OpenRouterClient(apiKey: key)
+
+        isCodingOrchestratorRunning = true
+        codingOrchestratorPhase = "Starting"
+        codingOrchestratorTask?.cancel()
+        codingOrchestratorTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    self.isCodingOrchestratorRunning = false
+                    self.codingOrchestratorPhase = ""
+                    self.codingOrchestratorTask = nil
+                    self.scheduleSave()
+                }
+            }
+            do {
+                _ = try await CodingOrchestrator.run(
+                    task: trimmed,
+                    config: config,
+                    client: client,
+                    onPhaseStart: { round, phase in
+                        self.codingOrchestratorPhase = "R\(round) · \(phase.title)"
+                    },
+                    onPhaseComplete: { _, _, _ in },
+                    onAppend: { chunk in
+                        self.appendToMessage(conversationID: convID, messageID: messageID) {
+                            $0.content += chunk
+                        }
+                    })
+            } catch is CancellationError {
+                self.appendToMessage(conversationID: convID, messageID: messageID) {
+                    $0.content += "\n\n⏹ Code loop stopped.\n"
+                }
+            } catch {
+                self.appendToMessage(conversationID: convID, messageID: messageID) {
+                    $0.content += "\n\n⚠️ Code loop error: \(error.localizedDescription)\n"
+                    $0.isError = true
+                }
+            }
+        }
+        scheduleSave()
+    }
+
+    func stopCodingOrchestrator() {
+        codingOrchestratorTask?.cancel()
+    }
+
+    var hasBraveSearchKey: Bool { SecretsStore.braveSearchAPIKey?.isEmpty == false }
+    func setBraveSearchKey(_ key: String?) {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        SecretsStore.braveSearchAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+
+    /// When true, the next send routes to Brave Search Answers (web-grounded research).
+    var braveSearchEnabled: Bool = UserDefaults.standard.bool(forKey: "braveSearch.enabled") {
+        didSet { UserDefaults.standard.set(braveSearchEnabled, forKey: "braveSearch.enabled") }
+    }
+
+    var braveSearchModeLabel: String {
+        braveSearchConfig.enableResearch ? "Brave Search · Research" : "Brave Search · Answers"
+    }
+
+    var braveSearchConfig: BraveSearchConfig = {
+        if let data = UserDefaults.standard.data(forKey: "braveSearch.config"),
+            let decoded = try? JSONDecoder().decode(BraveSearchConfig.self, from: data)
+        {
+            return decoded
+        }
+        return BraveSearchConfig()
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(braveSearchConfig) {
+                UserDefaults.standard.set(data, forKey: "braveSearch.config")
+            }
+        }
+    }
+
+    private(set) var isBraveSearchGenerating = false
+    private var braveSearchTask: Task<Void, Never>?
+
+    var memoryBudgetSnapshot: ModelMemoryBudget.Snapshot {
+        ModelMemoryBudget.snapshot(
+            loadedModelIDs: engine.loadedModels.map(\.id),
+            models: store.localModels,
+            mlxActiveBytes: engine.activeMemory,
+            loadedSlotCount: engine.loadedModels.count)
+    }
+
+    func admissionDecision(for model: LocalModel) -> ModelMemoryBudget.LoadDecision {
+        let slots = (0..<ModelMemoryBudget.slotCount).map { index -> String? in
+            guard index < engine.loadedModels.count else { return nil }
+            return engine.loadedModels[index].id
+        }
+        return ModelMemoryBudget.canLoad(
+            model,
+            slotAssignments: slots,
+            allModels: store.localModels)
     }
 
     private static func uniqueModelIDs(_ ids: [String]) -> [String] {
@@ -262,10 +444,15 @@ final class AppState {
         mcp.commanderRoots = commanderDirectories
         lastPromptContent = persistedSettings.lastPromptContent
         mcp.start()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            self?.mcp.connectAvailableServers()
+        }
 
         server.engine = engine
         server.store = store
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
+        engine.weightLoadPolicy = { [weak self] in self?.settings.weightLoadPolicy ?? .eager }
 
         // Models are NOT restored across launches: quitting Forge means the
         // models are gone, and a fresh launch starts at zero memory. Loading
@@ -343,7 +530,7 @@ final class AppState {
         return dirs
     }
 
-    /// Resolves persisted Desktop Commander workspace bookmarks.
+    /// Resolves persisted Forge commander workspace bookmarks.
     private func resolveCommanderDirectories(from settings: PersistedSettings) -> [URL] {
         var dirs: [URL] = []
         for data in settings.commanderDirectoryBookmarks {
@@ -398,7 +585,7 @@ final class AppState {
         scheduleSave()
     }
 
-    /// Registers a user-selected workspace for the built-in desktop-commander tools.
+    /// Registers a user-selected workspace for the built-in Forge commander tools.
     func addCommanderDirectory(_ url: URL) {
         if let bookmark = try? url.bookmarkData(options: .withSecurityScope) {
             commanderDirectoryBookmarks[url] = bookmark
@@ -490,19 +677,34 @@ final class AppState {
         "\(model.shortName) · \(model.runtimeDetails)"
     }
 
+    /// Apply the inspector's active system prompt (source of truth for new turns).
+    func applySystemPrompt(_ text: String) {
+        var next = settings
+        next.systemPrompt = text
+        settings = next
+    }
+
     private func historyWithMCPInstructions(_ conversation: Conversation) -> Conversation {
         var copy = conversation
         copy.systemPrompt = systemPrompt(for: conversation, includeMCP: true)
         return copy
     }
 
+    /// Inspector `settings.systemPrompt` wins over per-conversation copies saved at creation.
+    private func baseSystemPrompt(for conversation: Conversation) -> String {
+        let global = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !global.isEmpty { return settings.systemPrompt }
+        return conversation.systemPrompt
+    }
+
     private func systemPrompt(for conversation: Conversation, includeMCP: Bool) -> String {
-        let base = conversation.systemPrompt.isEmpty ? settings.systemPrompt : conversation.systemPrompt
+        let base = baseSystemPrompt(for: conversation)
         guard includeMCP else { return base }
         return systemPromptWithMCPInstructions(base: base)
     }
 
     private func systemPromptWithMCPInstructions(base: String) -> String {
+        mcp.connectAvailableServers()
         let tools = mcp.selectedConnectedTools()
         guard !tools.isEmpty else { return base }
         let toolLines = tools.prefix(80).map { binding in
@@ -535,10 +737,11 @@ final class AppState {
 
     var canSend: Bool {
         let hasText = !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if claudeSelected || openRouterSelected {
+        if claudeSelected || openRouterSelected || braveSearchSelected {
             guard !isBusy && hasText else { return false }
             if claudeSelected && !hasAnthropicKey { return false }
             if openRouterSelected && !hasOpenRouterKey { return false }
+            if braveSearchSelected && !hasBraveSearchKey { return false }
             return true
         }
         return engine.activeModel != nil && !isBusy && hasText
@@ -557,10 +760,11 @@ final class AppState {
         userMessage.attachedImageData = images
         conversation.messages.append(userMessage)
 
-        if claudeSelected || openRouterSelected {
+        if claudeSelected || openRouterSelected || braveSearchSelected {
             let selectedModels = openRouterModelIDs
             var openRouterTargets: [(modelID: String, messageID: UUID)] = []
             var claudeTarget: (modelID: String, messageID: UUID)?
+            var braveTarget: UUID?
             if let claudeID = claudeModelID, !claudeID.isEmpty {
                 var assistant = ChatMessage(role: .assistant, content: "")
                 assistant.modelName = AnthropicClient.label(for: claudeID)
@@ -573,13 +777,21 @@ final class AppState {
                 conversation.messages.append(assistant)
                 openRouterTargets.append((modelID, assistant.id))
             }
+            if braveSearchSelected {
+                var assistant = ChatMessage(role: .assistant, content: "")
+                assistant.modelName = braveSearchModeLabel
+                conversation.messages.append(assistant)
+                braveTarget = assistant.id
+            }
             conversation.refreshTitle()
             conversation.updatedAt = Date()
-            conversation.lastModelID = claudeTarget?.modelID ?? selectedModels.first
+            conversation.lastModelID =
+                claudeTarget?.modelID ?? selectedModels.first ?? (braveSearchSelected ? "brave" : nil)
             selectedConversation = conversation
 
             let conversationID = conversation.id
-            streamingMessageID = openRouterTargets.last?.messageID ?? claudeTarget?.messageID
+            streamingMessageID =
+                braveTarget ?? openRouterTargets.last?.messageID ?? claudeTarget?.messageID
             if let claudeTarget {
                 streamClaude(
                     model: claudeTarget.modelID, history: historySnapshot, prompt: prompt,
@@ -589,6 +801,11 @@ final class AppState {
                 streamOpenRouter(
                     model: target.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: target.messageID)
+            }
+            if let braveTarget {
+                streamBraveSearch(
+                    history: historySnapshot, prompt: prompt,
+                    conversationID: conversationID, messageID: braveTarget)
             }
             scheduleSave()
             return
@@ -623,6 +840,7 @@ final class AppState {
             return
         }
 
+        let systemInstructions = systemPrompt(for: historySnapshot, includeMCP: true)
         let generationHistory = historyWithMCPInstructions(historySnapshot)
         let activeModelID = engine.activeModel?.id
         let activeModelLabel = engine.activeModel.map { localModelLabel($0.model) } ?? "Local"
@@ -631,6 +849,7 @@ final class AppState {
             prompt: prompt,
             images: images,
             settings: settings,
+            systemInstructions: systemInstructions,
             onChunk: { [weak self] delta in
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             },
@@ -760,7 +979,7 @@ final class AppState {
                 )
             } else if let mid = localID {
                 self.engine.generate(
-                    conversation: preSnapshot,
+                    conversation: self.historyWithMCPInstructions(preSnapshot),
                     prompt: p,
                     images: images,
                     settings: self.settings,
@@ -818,7 +1037,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = history.systemPrompt.isEmpty ? settings.systemPrompt : history.systemPrompt
+        let sys = systemPrompt(for: history, includeMCP: false)
         let client = AnthropicClient(apiKey: key)
         do {
             try await client.stream(model: model, system: sys, messages: msgs) { [weak self] delta in
@@ -865,7 +1084,7 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = history.systemPrompt.isEmpty ? settings.systemPrompt : history.systemPrompt
+        let sys = systemPrompt(for: history, includeMCP: false)
         let client = OpenRouterClient(apiKey: key)
         do {
             try await client.stream(
@@ -1033,6 +1252,85 @@ final class AppState {
         }
     }
 
+    /// Routes a chat turn to Brave Search Answers and streams deltas into the message.
+    private func streamBraveSearch(
+        history: Conversation, prompt: String,
+        conversationID: UUID, messageID: UUID
+    ) {
+        guard let key = SecretsStore.braveSearchAPIKey, !key.isEmpty else {
+            appendToMessage(conversationID: conversationID, messageID: messageID) {
+                $0.content = "⚠️ No Brave Search API key set — add one in Settings (⌘,)."
+                $0.isError = true
+            }
+            isBraveSearchGenerating = false
+            if streamingMessageID == messageID { streamingMessageID = nil }
+            return
+        }
+
+        let client = BraveAnswersClient(apiKey: key, config: braveSearchConfig)
+        var citations: [BraveCitation] = []
+
+        isBraveSearchGenerating = true
+        braveSearchTask?.cancel()
+        braveSearchTask = Task { [weak self] in
+            do {
+                try await client.stream(
+                    query: prompt,
+                    onChunk: { delta in
+                        self?.enqueueStreamDelta(
+                            delta, conversationID: conversationID, messageID: messageID)
+                    },
+                    onCitation: { citation in
+                        citations.append(citation)
+                    },
+                    onUsage: { _ in }
+                )
+            } catch is CancellationError {
+                // User pressed stop — leave whatever streamed in place.
+            } catch {
+                self?.finishStreamBuffer(messageID)
+                self?.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                    if $0.content.isEmpty {
+                        $0.content = "⚠️ \(error.localizedDescription)"
+                        $0.isError = true
+                    } else {
+                        $0.content +=
+                            "\n\n⚠️ Brave Search stream interrupted: \(error.localizedDescription)"
+                    }
+                }
+            }
+            self?.finishStreamBuffer(messageID)
+            if let footer = self?.formatBraveCitationsFooter(citations), !footer.isEmpty {
+                self?.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                    if !$0.content.hasSuffix(footer) {
+                        $0.content += footer
+                    }
+                }
+            }
+            self?.isBraveSearchGenerating = false
+            self?.braveSearchTask = nil
+            if self?.streamingMessageID == messageID {
+                self?.streamingMessageID = nil
+            }
+            self?.scheduleSave()
+        }
+    }
+
+    private func formatBraveCitationsFooter(_ citations: [BraveCitation]) -> String {
+        guard braveSearchConfig.enableCitations, !citations.isEmpty else { return "" }
+        let sorted = citations.sorted { $0.number < $1.number }
+        var lines = ["\n\n---\n**Sources**"]
+        for citation in sorted {
+            let title = citation.snippet?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let title, !title.isEmpty {
+                lines.append("\(citation.number). [\(title)](\(citation.url))")
+            } else {
+                lines.append("\(citation.number). \(citation.url)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     @discardableResult
     private func handleMCPToolRequestIfNeeded(
         backend: ResponseBackend,
@@ -1126,8 +1424,10 @@ final class AppState {
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
         var assistant = ChatMessage(role: .assistant, content: "")
         assistant.modelName = "\(backend.modelName) • MCP"
-        conversations[ci].messages.append(assistant)
-        conversations[ci].updatedAt = Date()
+        var conversation = conversations[ci]
+        conversation.messages.append(assistant)
+        conversation.updatedAt = Date()
+        conversations[ci] = conversation
         let messageID = assistant.id
         streamingMessageID = messageID
 
@@ -1143,7 +1443,7 @@ final class AppState {
         switch backend {
         case .local(let modelID, _):
             engine.generate(
-                conversation: history,
+                conversation: historyWithMCPInstructions(history),
                 prompt: prompt,
                 images: images,
                 settings: settings,
@@ -1213,8 +1513,10 @@ final class AppState {
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else {
             return
         }
-        conversations[ci].messages.append(ChatMessage(role: .system, content: content))
-        conversations[ci].updatedAt = Date()
+        var conversation = conversations[ci]
+        conversation.messages.append(ChatMessage(role: .system, content: content))
+        conversation.updatedAt = Date()
+        conversations[ci] = conversation
     }
 
     private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
@@ -1322,15 +1624,26 @@ final class AppState {
         return String(trimmed.prefix(max))
     }
 
+    /// Unload and reload with the fast standard MLX loader (use after bounded/deferred).
+    func reloadModelStandard(_ model: LocalModel) {
+        engine.unload(model.id)
+        engine.loadAndActivate(model, policy: .eager)
+        scheduleSave()
+    }
+
     func stopGenerating() {
         flushAllStreamBuffers()
         engine.stop()
         claudeTask?.cancel()
         openRouterTasks.values.forEach { $0.cancel() }
         openRouterTasks.removeAll()
+        braveSearchTask?.cancel()
+        braveSearchTask = nil
         isClaudeGenerating = false
         isOpenRouterGenerating = false
+        isBraveSearchGenerating = false
         streamingMessageID = nil
+        stopCodingOrchestrator()
         // Cancel any parallel agent dispatches (locals are also covered by engine.stop via gate).
         for t in agentTasks.values { t.cancel() }
         agentTasks.removeAll()
@@ -1341,11 +1654,12 @@ final class AppState {
     private func appendToMessage(
         conversationID: UUID, messageID: UUID, mutate: (inout ChatMessage) -> Void
     ) {
-        guard let ci = conversations.firstIndex(where: { $0.id == conversationID }),
-            let mi = conversations[ci].messages.firstIndex(where: { $0.id == messageID })
-        else { return }
-        mutate(&conversations[ci].messages[mi])
-        conversations[ci].updatedAt = Date()
+        guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+        var conversation = conversations[ci]
+        guard let mi = conversation.messages.firstIndex(where: { $0.id == messageID }) else { return }
+        mutate(&conversation.messages[mi])
+        conversation.updatedAt = Date()
+        conversations[ci] = conversation
     }
 
     private func enqueueStreamDelta(
