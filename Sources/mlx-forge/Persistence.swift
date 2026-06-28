@@ -63,6 +63,10 @@ struct PersistedSettings: Codable {
     var commanderDirectoryBookmarks: [Data] = []
     /// Last selected prompt content from the library (auto-applied to new conversations).
     var lastPromptContent: String = ""
+    /// Saved preset id when the inspector prompt matches a named preset.
+    var activePromptPresetID: UUID?
+    /// Display label when the prompt came from a file/library pick (not a saved preset).
+    var activePromptExternalLabel: String?
     var lastLoadedModelPath: String?
     var loadedModelPaths: [String] = []
     var serverEnabled = false
@@ -78,6 +82,8 @@ struct PersistedSettings: Codable {
         commanderDirectories: [String] = [],
         commanderDirectoryBookmarks: [Data] = [],
         lastPromptContent: String = "",
+        activePromptPresetID: UUID? = nil,
+        activePromptExternalLabel: String? = nil,
         lastLoadedModelPath: String? = nil,
         loadedModelPaths: [String] = [],
         serverEnabled: Bool = false,
@@ -92,6 +98,8 @@ struct PersistedSettings: Codable {
         self.commanderDirectories = commanderDirectories
         self.commanderDirectoryBookmarks = commanderDirectoryBookmarks
         self.lastPromptContent = lastPromptContent
+        self.activePromptPresetID = activePromptPresetID
+        self.activePromptExternalLabel = activePromptExternalLabel
         self.lastLoadedModelPath = lastLoadedModelPath
         self.loadedModelPaths = loadedModelPaths
         self.serverEnabled = serverEnabled
@@ -127,6 +135,9 @@ struct PersistedSettings: Codable {
             (try? c.decodeIfPresent([Data].self, forKey: .commanderDirectoryBookmarks))
             .flatMap { $0 } ?? []
         lastPromptContent = (try? c.decodeIfPresent(String.self, forKey: .lastPromptContent)) ?? ""
+        activePromptPresetID = try? c.decodeIfPresent(UUID.self, forKey: .activePromptPresetID)
+        activePromptExternalLabel =
+            (try? c.decodeIfPresent(String.self, forKey: .activePromptExternalLabel)).flatMap { $0 }
         lastLoadedModelPath = try? c.decodeIfPresent(String.self, forKey: .lastLoadedModelPath)
         loadedModelPaths =
             (try? c.decodeIfPresent([String].self, forKey: .loadedModelPaths))

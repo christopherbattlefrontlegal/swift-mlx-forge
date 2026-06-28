@@ -622,7 +622,8 @@ struct ComposerView: View {
                                             Button(name) {
                                                 if let content = app.loadPromptContent(from: url) {
                                                     app.lastPromptContent = content
-                                                    app.applySystemPrompt(content)
+                                                    app.applySystemPrompt(
+                                                        content, externalLabel: name)
                                                     if var conv = app.selectedConversation {
                                                         conv.systemPrompt = content
                                                         app.selectedConversation = conv

@@ -104,7 +104,7 @@ struct TuningInspector: View {
 
                 collapsibleSection(
                     "System Prompt", icon: "text.quote", expanded: $promptExpanded,
-                    detail: app.settings.systemPrompt.isEmpty ? "empty" : promptSummary
+                    detail: systemPromptSectionDetail
                 ) {
                     HStack {
                         Menu {
@@ -112,8 +112,14 @@ struct TuningInspector: View {
                                 Text("No presets saved yet")
                             }
                             ForEach(app.promptPresets) { preset in
-                                Button(preset.name) {
-                                    app.applySystemPrompt(preset.text)
+                                Button {
+                                    app.applySystemPrompt(preset.text, preset: preset)
+                                } label: {
+                                    Label(
+                                        preset.name,
+                                        systemImage: app.activePromptPresetID == preset.id
+                                            && preset.text == app.settings.systemPrompt
+                                            ? "checkmark" : "")
                                 }
                             }
                             Divider()
@@ -128,7 +134,7 @@ struct TuningInspector: View {
                                 Menu("Delete Preset") {
                                     ForEach(app.promptPresets) { preset in
                                         Button(preset.name, role: .destructive) {
-                                            app.promptPresets.removeAll { $0.id == preset.id }
+                                            app.removePromptPreset(preset)
                                         }
                                     }
                                 }
@@ -142,6 +148,12 @@ struct TuningInspector: View {
 
                         Spacer()
 
+                        if !app.settings.systemPrompt.isEmpty {
+                            Text(app.systemPromptSourceLabel)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Theme.emberGlow)
+                                .lineLimit(1)
+                        }
                         Text(promptSummary)
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
@@ -349,13 +361,21 @@ struct TuningInspector: View {
         let name = presetNameDraft.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
         // Same name = overwrite, so presets stay editable in place.
+        let preset: PromptPreset
         if let index = app.promptPresets.firstIndex(where: { $0.name == name }) {
             app.promptPresets[index].text = app.settings.systemPrompt
+            preset = app.promptPresets[index]
         } else {
-            app.promptPresets.append(
-                PromptPreset(name: name, text: app.settings.systemPrompt))
+            preset = PromptPreset(name: name, text: app.settings.systemPrompt)
+            app.promptPresets.append(preset)
         }
+        app.applySystemPrompt(app.settings.systemPrompt, preset: preset)
         presetNameDraft = ""
+    }
+
+    private var systemPromptSectionDetail: String {
+        if app.settings.systemPrompt.isEmpty { return "empty" }
+        return "\(app.systemPromptSourceLabel) · \(promptSummary)"
     }
 
     private var systemPromptBinding: Binding<String> {

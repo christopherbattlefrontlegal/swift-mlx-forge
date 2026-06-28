@@ -24,6 +24,9 @@ final class AppState {
     }
     var settings = GenerationSettings() {
         didSet {
+            if oldValue.systemPrompt != settings.systemPrompt {
+                reconcileActivePromptLabel()
+            }
             if oldValue.systemPrompt != settings.systemPrompt
                 || oldValue.localThinkingEnabled != settings.localThinkingEnabled
             {
@@ -31,6 +34,15 @@ final class AppState {
             }
             scheduleSave()
         }
+    }
+
+    /// Which saved preset (if any) is driving the inspector system prompt.
+    var activePromptPresetID: UUID? {
+        didSet { scheduleSave() }
+    }
+    /// Human label when the prompt came from a file/library pick instead of a saved preset.
+    var activePromptExternalLabel: String? {
+        didSet { scheduleSave() }
     }
 
     /// Named system-prompt presets shown in the inspector's dropdown.
@@ -491,6 +503,9 @@ final class AppState {
         commanderDirectories = resolveCommanderDirectories(from: persistedSettings)
         mcp.commanderRoots = commanderDirectories
         lastPromptContent = persistedSettings.lastPromptContent
+        activePromptPresetID = persistedSettings.activePromptPresetID
+        activePromptExternalLabel = persistedSettings.activePromptExternalLabel
+        reconcileActivePromptLabel()
 
         server.engine = engine
         server.store = store
@@ -756,11 +771,80 @@ final class AppState {
         "\(model.shortName) · \(model.runtimeDetails)"
     }
 
+    /// Short label for the tuning panel — preset name, library file, custom, or empty.
+    var systemPromptSourceLabel: String {
+        let prompt = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if prompt.isEmpty { return "empty" }
+        if let id = activePromptPresetID,
+            let preset = promptPresets.first(where: { $0.id == id }),
+            preset.text == settings.systemPrompt
+        {
+            return preset.name
+        }
+        if let external = activePromptExternalLabel,
+            !external.isEmpty,
+            lastPromptContent == settings.systemPrompt
+        {
+            return external
+        }
+        if let match = promptPresets.first(where: { $0.text == settings.systemPrompt }) {
+            return match.name
+        }
+        return "Custom"
+    }
+
     /// Apply the inspector's active system prompt (source of truth for new turns).
-    func applySystemPrompt(_ text: String) {
+    func applySystemPrompt(
+        _ text: String,
+        preset: PromptPreset? = nil,
+        externalLabel: String? = nil
+    ) {
+        if let preset {
+            activePromptPresetID = preset.id
+            activePromptExternalLabel = nil
+        } else if let externalLabel, !externalLabel.isEmpty {
+            activePromptPresetID = nil
+            activePromptExternalLabel = externalLabel
+        } else if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activePromptPresetID = nil
+            activePromptExternalLabel = nil
+        }
         var next = settings
         next.systemPrompt = text
         settings = next
+    }
+
+    func removePromptPreset(_ preset: PromptPreset) {
+        promptPresets.removeAll { $0.id == preset.id }
+        if activePromptPresetID == preset.id {
+            activePromptPresetID = nil
+            reconcileActivePromptLabel()
+        }
+    }
+
+    private func reconcileActivePromptLabel() {
+        let prompt = settings.systemPrompt
+        if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            activePromptPresetID = nil
+            activePromptExternalLabel = nil
+            return
+        }
+        if let id = activePromptPresetID,
+            let preset = promptPresets.first(where: { $0.id == id }),
+            preset.text == prompt
+        {
+            activePromptExternalLabel = nil
+            return
+        }
+        if let match = promptPresets.first(where: { $0.text == prompt }) {
+            activePromptPresetID = match.id
+            activePromptExternalLabel = nil
+            return
+        }
+        activePromptPresetID = nil
+        if activePromptExternalLabel != nil, lastPromptContent != prompt {
+            activePromptExternalLabel = nil
+        }
     }
 
     private func historyWithMCPInstructions(
@@ -2091,6 +2175,8 @@ final class AppState {
                     commanderDirectoryBookmarks[$0]
                 },
                 lastPromptContent: lastPromptContent,
+                activePromptPresetID: activePromptPresetID,
+                activePromptExternalLabel: activePromptExternalLabel,
                 lastLoadedModelPath: nil,
                 loadedModelPaths: [],
                 serverEnabled: serverEnabled,
