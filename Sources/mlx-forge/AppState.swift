@@ -548,10 +548,7 @@ final class AppState {
         guard !didBeginMCP else { return }
         didBeginMCP = true
         mcp.start()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(750))
-            self?.mcp.connectAvailableServers()
-        }
+        mcp.connectAvailableServers()
     }
 
     // MARK: - User model directories (sandbox-safe)
@@ -968,10 +965,15 @@ final class AppState {
         - Example: FORGE_MCP_CALL {"server":"desktop-commander","tool":"read_file","arguments":{"path":"/path/to/file"}}
         - After Forge returns the MCP result in the chat, answer the user using that result.
         """
+        let trimmedInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmedInstruction
         }
-        return base + "\n\n" + instruction
+        // Large custom prompts bury appended MCP instructions; put tools first.
+        if base.count > 3_000 {
+            return trimmedInstruction + "\n\n" + base
+        }
+        return base + "\n\n" + trimmedInstruction
     }
 
     // MARK: - Sending

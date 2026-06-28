@@ -405,6 +405,13 @@ final class MCPManager {
         selectedToolsByServer[entryID] ?? []
     }
 
+    /// Persisted selection when set; otherwise all tools on a connected server.
+    func effectiveSelectedTools(for entryID: String) -> [String] {
+        let persisted = selectedToolsByServer[entryID] ?? []
+        if !persisted.isEmpty { return persisted }
+        return tools(for: entryID).map(\.name)
+    }
+
     func setSelectedTool(_ toolName: String, for entryID: String) {
         let value = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedToolsByServer[entryID] = value.isEmpty ? nil : [value]
@@ -448,31 +455,35 @@ final class MCPManager {
         }
     }
 
-    /// Tools to embed in the LLM system prompt. Uses persisted selections immediately
-    /// (so the model sees the catalog even while stdio servers are still starting) and
-    /// enriches with live descriptions once a server reports connected.
+    /// Tools to embed in the LLM system prompt. Uses persisted selections when present;
+    /// otherwise exposes every tool on connected servers so the model always sees MCP.
     func selectedPromptTools() -> [MCPToolBinding] {
         entries.flatMap { entry -> [MCPToolBinding] in
             guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return [] }
-            let selected = selectedToolsByServer[entry.id] ?? []
-            guard !selected.isEmpty else { return [] }
-            let catalog: [String: MCPTool]
-            if case .connected(let tools) = entry.status {
-                catalog = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
-            } else {
-                catalog = [:]
+            let persisted = selectedToolsByServer[entry.id] ?? []
+            if case .connected(let tools) = entry.status, !tools.isEmpty {
+                let catalog = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+                let names = persisted.isEmpty ? tools.map(\.name) : persisted
+                return names.compactMap { name in
+                    guard let tool = catalog[name] else {
+                        return persisted.isEmpty ? nil : MCPToolBinding(
+                            serverID: entry.id, tool: MCPTool(name: name, description: ""))
+                    }
+                    return MCPToolBinding(serverID: entry.id, tool: tool)
+                }
             }
-            return selected.map { name in
-                let tool = catalog[name] ?? MCPTool(name: name, description: "")
-                return MCPToolBinding(serverID: entry.id, tool: tool)
+            guard !persisted.isEmpty else { return [] }
+            return persisted.map { name in
+                MCPToolBinding(
+                    serverID: entry.id, tool: MCPTool(name: name, description: ""))
             }
         }
     }
 
-    /// Connect enabled MCP servers and wait briefly so prompt tool descriptions are live.
+    /// Connect enabled MCP servers and wait so prompt tool descriptions are live.
     func prepareToolCatalogForPrompt() async -> [MCPToolBinding] {
         connectAvailableServers()
-        for _ in 0..<80 {
+        for _ in 0..<240 {
             let pending = entries.contains { entry in
                 guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return false }
                 switch entry.status {
@@ -485,7 +496,17 @@ final class MCPManager {
             if !pending { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
+        syncDefaultToolSelections()
         return selectedPromptTools()
+    }
+
+    /// Ensures connected servers have tool selections — defaults to all tools when empty.
+    private func syncDefaultToolSelections() {
+        for entry in entries {
+            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { continue }
+            guard case .connected(let tools) = entry.status else { continue }
+            configureDefaultTool(for: entry.id, tools: tools)
+        }
     }
 
     private func setStatus(_ id: String, _ status: Status) {
@@ -1140,14 +1161,20 @@ final class MCPStdioSession: @unchecked Sendable {
     func request(id: Int, method: String, params: Any) throws -> [String: Any] {
         try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
         while true {
-            let payload = try readMessage(timeout: 45)
-            if let number = payload["id"] as? NSNumber, number.intValue == id {
+            let payload = try readMessage(timeout: 90)
+            if Self.payloadID(payload) == id {
                 if let error = payload["error"] as? [String: Any] {
                     throw MCPError.server((error["message"] as? String) ?? "MCP server error")
                 }
                 return (payload["result"] as? [String: Any]) ?? [:]
             }
         }
+    }
+
+    private static func payloadID(_ payload: [String: Any]) -> Int? {
+        if let number = payload["id"] as? NSNumber { return number.intValue }
+        if let int = payload["id"] as? Int { return int }
+        return nil
     }
 
     func notify(method: String) throws {

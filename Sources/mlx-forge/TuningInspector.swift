@@ -591,10 +591,13 @@ private struct MCPInspectorRow: View {
 
     private var enabled: Bool { app.mcp.isServerEnabled(entry.id) }
     private var tools: [MCPTool] { app.mcp.tools(for: entry.id) }
-    private var selectedToolNames: [String] { app.mcp.selectedTools(for: entry.id) }
+    private var selectedToolNames: [String] { app.mcp.effectiveSelectedTools(for: entry.id) }
     private var selectedTools: [MCPTool] {
         let selected = Set(selectedToolNames)
         return tools.filter { selected.contains($0.name) }
+    }
+    private var usesImplicitAllTools: Bool {
+        app.mcp.selectedTools(for: entry.id).isEmpty && !tools.isEmpty
     }
 
     var body: some View {
@@ -742,7 +745,9 @@ private struct MCPInspectorRow: View {
     private var selectedToolTitle: String {
         guard !tools.isEmpty else { return "No tools" }
         guard !selectedTools.isEmpty else { return "None enabled" }
-        if selectedTools.count == tools.count { return "All enabled" }
+        if selectedTools.count == tools.count {
+            return usesImplicitAllTools ? "All enabled (default)" : "All enabled"
+        }
         if selectedTools.count == 1 {
             return Self.shortToolTitle(selectedTools[0].name)
         }
