@@ -13,39 +13,24 @@ struct ChatView: View {
 
     var body: some View {
         @Bindable var app = app
-        HStack(spacing: 0) {
-            Group {
-                if let conversation = app.selectedConversation {
-                    if conversation.isEmpty && !app.canChat {
-                        WelcomeView()
-                    } else {
-                        TranscriptView(conversation: conversation, onShowLargeText: { content in
-                            largeTextPopupContent = content
-                            showLargeTextPopup = true
-                        })
-                    }
-                } else {
+        Group {
+            if let conversation = app.selectedConversation {
+                if conversation.isEmpty && !app.canChat {
                     WelcomeView()
+                } else {
+                    TranscriptView(conversation: conversation, onShowLargeText: { content in
+                        largeTextPopupContent = content
+                        showLargeTextPopup = true
+                    })
                 }
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                ComposerView()
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if app.showInspector {
-                TuningInspector()
-                    .frame(width: Theme.inspectorWidth)
-                    .frame(maxHeight: .infinity)
-                    .overlay(alignment: .leading) {
-                        Rectangle()
-                            .fill(.white.opacity(0.08))
-                            .frame(width: 1)
-                    }
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            } else {
+                WelcomeView()
             }
         }
-        .animation(.easeInOut(duration: 0.18), value: app.showInspector)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            ComposerView()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.backgroundGradient)
         .sheet(isPresented: $showLargeTextPopup) {
             LargeTextView(text: largeTextPopupContent) {
