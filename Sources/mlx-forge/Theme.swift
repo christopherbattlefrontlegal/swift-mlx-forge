@@ -64,6 +64,27 @@ extension View {
     }
 }
 
+/// Solid graphite panel for the tuning inspector (darker than glass/material).
+struct DarkPanel: ViewModifier {
+    var radius: CGFloat = Theme.radiusMedium
+
+    func body(content: Content) -> some View {
+        content
+            .background(Theme.codeBackground)
+            .clipShape(.rect(cornerRadius: radius))
+            .overlay(
+                RoundedRectangle(cornerRadius: radius)
+                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            )
+    }
+}
+
+extension View {
+    func darkPanel(radius: CGFloat = Theme.radiusMedium) -> some View {
+        modifier(DarkPanel(radius: radius))
+    }
+}
+
 /// The Forge mark: a living flame. Procedural — layered tongues swaying on
 /// incommensurate sine frequencies, so the motion never visibly repeats.
 /// Gentle by design: low sway amplitude, slow flicker, soft additive glow.

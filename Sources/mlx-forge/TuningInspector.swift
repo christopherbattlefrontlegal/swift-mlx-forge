@@ -106,7 +106,7 @@ struct TuningInspector: View {
                     "System Prompt", icon: "text.quote", expanded: $promptExpanded,
                     detail: systemPromptSectionDetail
                 ) {
-                    HStack {
+                    HStack(spacing: Theme.s2) {
                         Menu {
                             if app.promptPresets.isEmpty {
                                 Text("No presets saved yet")
@@ -148,15 +148,10 @@ struct TuningInspector: View {
 
                         Spacer()
 
-                        if !app.settings.systemPrompt.isEmpty {
-                            Text(app.systemPromptSourceLabel)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(Theme.emberGlow)
-                                .lineLimit(1)
-                        }
                         Text(promptSummary)
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
+                            .fixedSize()
 
                         Button {
                             showPromptEditor = true
@@ -167,6 +162,15 @@ struct TuningInspector: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Open the system prompt in a large resizable editor")
+                    }
+
+                    if !activePromptName.isEmpty {
+                        Text(activePromptName)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(Theme.emberGlow)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
                     }
 
                     TextEditor(text: systemPromptBinding)
@@ -266,7 +270,7 @@ struct TuningInspector: View {
             .padding(Theme.s3)
         }
         .scrollContentBackground(.hidden)
-        .background(.black.opacity(0.15))
+        .background(Theme.codeBackground)
         .sheet(isPresented: $showPromptEditor) {
             SystemPromptEditor()
                 .environment(app)
@@ -373,9 +377,17 @@ struct TuningInspector: View {
         presetNameDraft = ""
     }
 
-    private var systemPromptSectionDetail: String {
+    /// Loaded preset or library file name — full text, no truncation.
+    private var activePromptName: String {
+        let label = app.systemPromptSourceLabel
+        guard label != "empty", label != "Custom" else { return "" }
+        return label
+    }
+
+    private var systemPromptSectionDetail: String? {
         if app.settings.systemPrompt.isEmpty { return "empty" }
-        return "\(app.systemPromptSourceLabel) · \(promptSummary)"
+        if !activePromptName.isEmpty { return activePromptName }
+        return promptSummary
     }
 
     private var systemPromptBinding: Binding<String> {
@@ -418,7 +430,7 @@ struct TuningInspector: View {
         }
         .padding(Theme.s3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
+        .darkPanel()
     }
 
     @ViewBuilder
@@ -433,26 +445,33 @@ struct TuningInspector: View {
                     expanded.wrappedValue.toggle()
                 }
             } label: {
-                HStack {
-                    Label(title, systemImage: icon)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
-                    Spacer()
+                VStack(alignment: .leading, spacing: Theme.s1) {
+                    HStack(alignment: .center) {
+                        Label(title, systemImage: icon)
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                        Spacer()
+                        if badge && !expanded.wrappedValue {
+                            Circle()
+                                .fill(Theme.okGreen)
+                                .frame(width: 7, height: 7)
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(expanded.wrappedValue ? 90 : 0))
+                    }
                     if let detail, !expanded.wrappedValue {
                         Text(detail)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .font(title == "System Prompt" ? .caption.weight(.semibold) : .caption2)
+                            .foregroundStyle(
+                                title == "System Prompt" && !activePromptName.isEmpty
+                                    ? Theme.emberGlow : .secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
                     }
-                    if badge && !expanded.wrappedValue {
-                        Circle()
-                            .fill(Theme.okGreen)
-                            .frame(width: 7, height: 7)
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.tertiary)
-                        .rotationEffect(.degrees(expanded.wrappedValue ? 90 : 0))
                 }
                 .contentShape(.rect)
             }
@@ -463,7 +482,7 @@ struct TuningInspector: View {
         }
         .padding(Theme.s3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
+        .darkPanel()
     }
 
     private func labeledValue(_ label: String, _ value: String) -> some View {
