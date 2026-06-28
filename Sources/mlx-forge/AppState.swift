@@ -29,6 +29,7 @@ final class AppState {
             }
             if oldValue.systemPrompt != settings.systemPrompt
                 || oldValue.localThinkingEnabled != settings.localThinkingEnabled
+                || oldValue.localThinkingEffort != settings.localThinkingEffort
             {
                 engine.invalidateChatSessions()
             }

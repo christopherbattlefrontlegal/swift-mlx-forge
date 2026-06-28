@@ -462,6 +462,7 @@ final class InferenceEngine {
         var messageCount: Int
         var systemPrompt: String
         var localThinkingEnabled: Bool
+        var localThinkingEffort: String
     }
 
     private var sessions: [UUID: SessionBox] = [:]
@@ -534,34 +535,16 @@ final class InferenceEngine {
                     }
                 }
                 let start = Date()
-                var completionInfo: GenerateCompletionInfo?
                 do {
-                    // TODO: Convert [Data] -> [UserInput.Image] once the exact public initializer
-                    // in this version of MLXLMCommon is confirmed (currently no accessible inits
-                    // in this context). For now we pass empty so text path works.
-                    // The attachedImageData on the ChatMessage is still captured and available
-                    // for manual MCP tool calls (base64 in arguments) and future VLM wiring.
-                    for try await item in session.streamDetails(
-                        to: userPrompt, role: .user, images: [], videos: [])
-                    {
-                        if Task.isCancelled { break }
-                        switch item {
-                        case .chunk(let text):
-                            if self.materializingModelID == entry.id {
-                                self.materializingModelID = nil
-                            }
-                            self.liveTokenCount += 1
-                            let elapsed = Date().timeIntervalSince(start)
-                            if elapsed > 0.2 {
-                                self.liveTokensPerSecond = Double(self.liveTokenCount) / elapsed
-                            }
-                            onChunk(text)
-                        case .info(let info):
-                            completionInfo = info
-                        case .toolCall:
-                            break
-                        }
-                    }
+                    let completionInfo = try await self.streamMLXResponse(
+                        session: session,
+                        userPrompt: userPrompt,
+                        conversation: conversation,
+                        entry: entry,
+                        settings: settings,
+                        systemInstructions: resolvedSystem,
+                        start: start,
+                        onChunk: onChunk)
                     self.sessions[conversation.id]?.messageCount += 2
                     self.finishGeneration()
                     onComplete(completionInfo, nil)
@@ -673,7 +656,8 @@ final class InferenceEngine {
             box.modelID == entry.id,
             box.systemPrompt == systemPrompt,
             box.messageCount == conversation.messages.count,
-            box.localThinkingEnabled == settings.localThinkingEnabled
+            box.localThinkingEnabled == settings.localThinkingEnabled,
+            box.localThinkingEffort == settings.localThinkingEffort
         {
             box.session.additionalContext = Self.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled)
@@ -709,7 +693,8 @@ final class InferenceEngine {
         sessions[conversation.id] = SessionBox(
             session: session, modelID: entry.id,
             messageCount: conversation.messages.count, systemPrompt: systemPrompt,
-            localThinkingEnabled: settings.localThinkingEnabled)
+            localThinkingEnabled: settings.localThinkingEnabled,
+            localThinkingEffort: settings.localThinkingEffort)
         let userPrompt = Self.userPrompt(
             prompt: conversation.messages.last?.content ?? "",
             system: systemPrompt,
@@ -811,6 +796,133 @@ final class InferenceEngine {
             gguf: loadedModels[index].gguf,
             supportsChatSystemRole: loadedModels[index].supportsChatSystemRole,
             templateCaps: caps)
+    }
+
+    /// Qwen-style early stop when a thinking budget is reached mid-reasoning.
+    static let thinkingBudgetEarlyStopSuffix =
+        "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+
+    private func streamMLXResponse(
+        session: ChatSession,
+        userPrompt: String,
+        conversation: Conversation,
+        entry: Loaded,
+        settings: GenerationSettings,
+        systemInstructions: String,
+        start: Date,
+        onChunk: @escaping @MainActor (String) -> Void
+    ) async throws -> GenerateCompletionInfo? {
+        let budgetLimit =
+            Self.thinkingBudgetApplies(to: entry, settings: settings)
+            ? settings.localThinkingTokenLimit : nil
+        var accumulated = ""
+        var thinkingTokens = 0
+        var completionInfo: GenerateCompletionInfo?
+        var hitBudget = false
+
+        for try await item in session.streamDetails(
+            to: userPrompt, role: .user, images: [], videos: [])
+        {
+            if Task.isCancelled { break }
+            switch item {
+            case .chunk(let text):
+                if materializingModelID == entry.id {
+                    materializingModelID = nil
+                }
+                accumulated += text
+                if let budgetLimit,
+                    Self.isInThinkingPhase(accumulated, entry: entry, settings: settings)
+                {
+                    thinkingTokens += 1
+                    if thinkingTokens >= budgetLimit {
+                        hitBudget = true
+                        break
+                    }
+                }
+                liveTokenCount += 1
+                let elapsed = Date().timeIntervalSince(start)
+                if elapsed > 0.2 {
+                    liveTokensPerSecond = Double(liveTokenCount) / elapsed
+                }
+                onChunk(text)
+            case .info(let info):
+                completionInfo = info
+            case .toolCall:
+                break
+            }
+        }
+
+        guard hitBudget, !Task.isCancelled else { return completionInfo }
+
+        if !accumulated.contains("</think>") {
+            onChunk(Self.thinkingBudgetEarlyStopSuffix)
+            accumulated += Self.thinkingBudgetEarlyStopSuffix
+        }
+
+        sessions.removeValue(forKey: conversation.id)
+        let continuation = assistantContinuationSession(
+            for: conversation, entry: entry, settings: settings,
+            systemInstructions: systemInstructions)
+        for try await item in continuation.streamDetails(
+            to: accumulated, role: .assistant, images: [], videos: [])
+        {
+            if Task.isCancelled { break }
+            switch item {
+            case .chunk(let text):
+                liveTokenCount += 1
+                let elapsed = Date().timeIntervalSince(start)
+                if elapsed > 0.2 {
+                    liveTokensPerSecond = Double(liveTokenCount) / elapsed
+                }
+                onChunk(text)
+            case .info(let info):
+                completionInfo = info
+            case .toolCall:
+                break
+            }
+        }
+        return completionInfo
+    }
+
+    private func assistantContinuationSession(
+        for conversation: Conversation,
+        entry: Loaded,
+        settings: GenerationSettings,
+        systemInstructions: String
+    ) -> ChatSession {
+        let systemPrompt = systemInstructions
+        let history: [Chat.Message] = conversation.messages.compactMap { message in
+            switch message.role {
+            case .user: return .user(message.content)
+            case .assistant:
+                return message.isErrorMessage ? nil : .assistant(message.content)
+            case .system: return .system(message.content)
+            }
+        }
+        let instructionsForSession =
+            (!systemPrompt.isEmpty && entry.supportsChatSystemRole) ? systemPrompt : nil
+        return ChatSession(
+            entry.container!,
+            instructions: instructionsForSession,
+            history: history,
+            generateParameters: Self.parameters(from: settings),
+            additionalContext: Self.thinkingAdditionalContext(
+                for: entry, enabled: settings.localThinkingEnabled))
+    }
+
+    static func thinkingBudgetApplies(to entry: Loaded, settings: GenerationSettings) -> Bool {
+        guard settings.localThinkingTokenLimit != nil else { return false }
+        if entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn { return true }
+        return entry.chatTemplateSupportsThinkingToggle && settings.localThinkingEnabled
+    }
+
+    static func isInThinkingPhase(
+        _ accumulated: String, entry: Loaded, settings: GenerationSettings
+    ) -> Bool {
+        if accumulated.contains("</think>") { return false }
+        if entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn { return true }
+        if accumulated.contains("<think>") { return true }
+        return entry.chatTemplateSupportsThinkingToggle && settings.localThinkingEnabled
     }
 
     /// Qwen/QwQ chat templates read `enable_thinking` from template kwargs.

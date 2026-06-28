@@ -295,6 +295,9 @@ struct TuningInspector: View {
                         active.chatTemplateThinkingOnly
                             ? "This model's chat template is thinking-only — enable_thinking cannot be turned off."
                             : "Passes enable_thinking into the chat template. On = reasoning blocks; off = direct answers.")
+                if app.settings.localThinkingEnabled || active.chatTemplateThinkingOnly {
+                    localThinkingEffortPicker
+                }
             } else if active.chatTemplateThinkingBuiltIn {
                 HStack {
                     Text("Thinking mode")
@@ -307,6 +310,7 @@ struct TuningInspector: View {
                 .help(
                     "This checkpoint's chat template always opens a reasoning block at generation time "
                         + "(typical stock Qwen3). Turn on \"Show reasoning in chat\" below to see it.")
+                localThinkingEffortPicker
             } else if active.chatTemplateHasTemplate {
                 Text(
                     "No enable_thinking toggle in this model's template — reasoning follows the checkpoint as-is.")
@@ -323,6 +327,29 @@ struct TuningInspector: View {
         }
     }
 
+    private var localThinkingEffortPicker: some View {
+        Picker(
+            "Thinking effort",
+            selection: Binding(
+                get: {
+                    LocalThinkingEffort(rawValue: app.settings.localThinkingEffort) ?? .infinity
+                },
+                set: { level in
+                    var next = app.settings
+                    next.localThinkingEffort = level.rawValue
+                    app.settings = next
+                })
+        ) {
+            ForEach(LocalThinkingEffort.allCases) { level in
+                Text(level.menuLabel).tag(level)
+            }
+        }
+        .pickerStyle(.menu)
+        .help(
+            "Caps how long the model may reason in a thinking block before answering. "
+                + "Low 100 · Medium 250 · High 350 · Max 750 · Infinity = no cap.")
+    }
+
     private var reasoningSectionDetail: String {
         var parts: [String] = []
         if let active = app.engine.activeModel, !active.model.isGGUF {
@@ -332,6 +359,9 @@ struct TuningInspector: View {
                 parts.append("think·on")
             } else if !active.chatTemplateHasTemplate {
                 parts.append("n/a")
+            }
+            if InferenceEngine.thinkingBudgetApplies(to: active, settings: app.settings) {
+                parts.append("cap \(app.settings.resolvedLocalThinkingEffort.shortDetail)")
             }
         }
         parts.append(app.settings.reasoningEnabled ? "show · \(app.settings.anthropicEffort)" : "hidden")
