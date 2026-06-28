@@ -374,9 +374,43 @@ final class InferenceEngine {
 
     func unloadAll() {
         stop()
+        tearDownLoadedModels(scheduleAsyncPurge: true)
+    }
+
+    /// Quit-safe teardown: wait for in-flight MLX/GGUF work to drain before
+    /// dropping containers (avoids scheduler/Metal faults on app exit).
+    func shutdown() async {
+        let generationSnapshot = Array(generationTasks.values)
+        loadedModels.compactMap(\.gguf).forEach { $0.stop() }
+        generationSnapshot.forEach { $0.cancel() }
+
+        let loadSnapshot = Array(loadTasks.values)
         let inFlight = Set(loadTasks.keys).union(loadingModels.keys)
         discardedLoads.formUnion(inFlight)
-        loadTasks.values.forEach { $0.cancel() }
+        loadSnapshot.forEach { $0.cancel() }
+
+        for task in generationSnapshot { await task.value }
+        for task in loadSnapshot { _ = try? await task.value }
+
+        generationTasks.removeAll()
+        materializingModelID = nil
+        activeGenerationCount = 0
+        isGenerating = false
+
+        tearDownLoadedModels(scheduleAsyncPurge: false)
+
+        await gate.withTurn {
+            await Task.detached(priority: .utility) {
+                Memory.clearCache()
+            }.value
+            self.refreshMemory()
+            Self.log.info(
+                "shutdown purge: active=\(self.activeMemory) cache=\(self.cacheMemory) peak=\(self.peakMemory)"
+            )
+        }
+    }
+
+    private func tearDownLoadedModels(scheduleAsyncPurge: Bool) {
         loadTasks.removeAll()
         loadTaskPolicies.removeAll()
         loadingModels.removeAll()
@@ -384,7 +418,9 @@ final class InferenceEngine {
         loadedModels.removeAll()
         activeModelID = nil
         lastError = nil
-        scheduleCachePurge()
+        if scheduleAsyncPurge {
+            scheduleCachePurge()
+        }
     }
 
     /// Abort a background load and drop its progress indicator immediately.

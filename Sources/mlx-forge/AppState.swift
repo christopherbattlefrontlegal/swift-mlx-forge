@@ -2078,6 +2078,14 @@ final class AppState {
         scheduleSave()
     }
 
+    /// Ordered quit path — drain MLX/GGUF before the process tears down Metal.
+    func shutdownForQuit() async {
+        stopGenerating()
+        if case .running = server.state { server.stop() }
+        await engine.shutdown()
+        saveNow()
+    }
+
     func stopGenerating() {
         flushAllStreamBuffers()
         engine.stop()

@@ -68,6 +68,7 @@ struct ForgeApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dockFlame = DockFlame()
+    private var isShuttingDown = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Before the first window paints, replace the static .icns in the Dock.
@@ -79,11 +80,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.beginMCP()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        AppState.shared.stopGenerating()
-        AppState.shared.engine.unloadAll()
-        AppState.shared.saveNow()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isShuttingDown else { return .terminateNow }
+        isShuttingDown = true
         dockFlame.stop()
+        Task { @MainActor in
+            await AppState.shared.shutdownForQuit()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
 
@@ -150,17 +155,7 @@ struct RootView: View {
                 .help("Show generation parameters")
             }
         }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: NSApplication.willTerminateNotification)
-        ) { _ in
-            app.stopGenerating()
-            app.engine.unloadAll()
-            app.saveNow()
-        }
         .onDisappear {
-            app.stopGenerating()
-            app.engine.unloadAll()
             app.saveNow()
         }
     }
