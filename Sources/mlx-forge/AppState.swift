@@ -757,6 +757,16 @@ final class AppState {
         scheduleSave()
     }
 
+    func clearAllConversations() {
+        if streamingMessageID != nil {
+            stopGenerating()
+        }
+        conversations.removeAll()
+        selectedConversationID = nil
+        newConversation()
+        scheduleSave()
+    }
+
     /// When switching to a conversation that last used a model which is
     /// currently resident, make that model active automatically.
     private func autoActivateModel() {

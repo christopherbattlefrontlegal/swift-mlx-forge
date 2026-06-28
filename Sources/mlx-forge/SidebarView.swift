@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @Environment(AppState.self) private var app
+    @State private var showClearAllConfirm = false
 
     var body: some View {
         @Bindable var app = app
@@ -33,6 +34,18 @@ struct SidebarView: View {
                 .padding(Theme.s3)
         }
         .background(.black.opacity(0.2))
+        .confirmationDialog(
+            "Clear all conversations?",
+            isPresented: $showClearAllConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Clear All", role: .destructive) {
+                app.clearAllConversations()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes every chat in the sidebar. You can’t undo this.")
+        }
     }
 
     private var header: some View {
@@ -43,6 +56,14 @@ struct SidebarView: View {
                 .kerning(3)
                 .foregroundStyle(Theme.emberGradient)
             Spacer()
+            Button("Clear All") {
+                showClearAllConfirm = true
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.plain)
+            .foregroundStyle(app.conversations.isEmpty ? .tertiary : .secondary)
+            .disabled(app.conversations.isEmpty)
+            .help("Delete every conversation in the sidebar")
             Button {
                 app.newConversation()
             } label: {
