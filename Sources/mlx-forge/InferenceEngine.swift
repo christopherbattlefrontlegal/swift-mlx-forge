@@ -651,8 +651,9 @@ final class InferenceEngine {
         for conversation: Conversation, entry: Loaded, settings: GenerationSettings,
         systemInstructions: String
     ) -> (ChatSession, String) {
-        let systemPrompt = Self.systemInstructionsWithThinkingBudget(
-            systemInstructions, entry: entry, settings: settings)
+        let systemPrompt = systemInstructions
+        let thinkingDirective = Self.thinkingBudgetFrontDirective(
+            for: entry, settings: settings)
         if var box = sessions[conversation.id],
             box.modelID == entry.id,
             box.systemPrompt == systemPrompt,
@@ -666,7 +667,8 @@ final class InferenceEngine {
             let userPrompt = Self.userPrompt(
                 prompt: conversation.messages.last?.content ?? "",
                 system: systemPrompt,
-                supportsSystemRole: entry.supportsChatSystemRole)
+                supportsSystemRole: entry.supportsChatSystemRole,
+                thinkingDirective: thinkingDirective)
             return (box.session, userPrompt)
         }
 
@@ -699,7 +701,8 @@ final class InferenceEngine {
         let userPrompt = Self.userPrompt(
             prompt: conversation.messages.last?.content ?? "",
             system: systemPrompt,
-            supportsSystemRole: entry.supportsChatSystemRole)
+            supportsSystemRole: entry.supportsChatSystemRole,
+            thinkingDirective: thinkingDirective)
         return (session, userPrompt)
     }
 
@@ -718,12 +721,16 @@ final class InferenceEngine {
     }
 
     private static func userPrompt(
-        prompt: String, system: String, supportsSystemRole: Bool
+        prompt: String,
+        system: String,
+        supportsSystemRole: Bool,
+        thinkingDirective: String? = nil
     ) -> String {
-        guard !supportsSystemRole else { return prompt }
+        let front = thinkingDirective.map { $0 + "\n\n" } ?? ""
+        guard !supportsSystemRole else { return front + prompt }
         let trimmedSystem = system.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSystem.isEmpty else { return prompt }
-        return """
+        guard !trimmedSystem.isEmpty else { return front + prompt }
+        return front + """
             System instructions:
             \(trimmedSystem)
 
@@ -818,22 +825,17 @@ final class InferenceEngine {
         target + thinkingBudgetGraceTokens(for: target)
     }
 
-    /// Tells the model the budget up front so it can close `</think>` naturally before Forge intervenes.
-    static func systemInstructionsWithThinkingBudget(
-        _ base: String, entry: Loaded, settings: GenerationSettings
-    ) -> String {
+    /// First line of the active user turn when a thinking cap is set — models see this before the task.
+    static func thinkingBudgetFrontDirective(
+        for entry: Loaded, settings: GenerationSettings
+    ) -> String? {
         guard thinkingBudgetApplies(to: entry, settings: settings),
               let limit = settings.localThinkingTokenLimit
-        else { return base }
-        let grace = thinkingBudgetGraceTokens(for: limit)
-        let hint = """
-
-        [Thinking budget] You have about \(limit) reasoning tokens (±\(grace)) inside a <think>...</think> block before your answer. Plan to finish and close </think> within that budget — do not ramble past it. If you are not done when the budget is nearly exhausted, conclude briefly and answer.
+        else { return nil }
+        let hardStop = thinkingBudgetHardLimit(for: limit)
+        return """
+        [Thinking budget] You have \(limit) thinking tokens — do not exceed \(hardStop). Open <think>, finish all reasoning inside it, close </think>, then answer. Wrap up before you hit the limit.
         """
-        if base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return hint.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return base + hint
     }
 
     private func streamMLXResponse(
