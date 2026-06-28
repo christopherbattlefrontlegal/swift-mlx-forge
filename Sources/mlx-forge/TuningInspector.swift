@@ -385,8 +385,9 @@ struct TuningInspector: View {
         }
         .pickerStyle(.menu)
         .help(
-            "Caps how long the model may reason in a thinking block before answering. "
-                + "Low 100 · Medium 250 · High 350 · Max 750 · Infinity = no cap.")
+            "Target reasoning budget inside <think> — the model is told the limit up front "
+                + "and gets ~10% grace before Forge closes the block. "
+                + "Low ~100 · Medium ~250 · High ~350 · Max ~750 · Infinity = no cap.")
     }
 
     private var reasoningSectionDetail: String {

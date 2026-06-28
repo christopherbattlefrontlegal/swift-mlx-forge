@@ -398,11 +398,11 @@ enum LocalThinkingEffort: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Menu label with approximate token cap.
+    /// Menu label with approximate target cap (Forge allows ~10% grace after).
     var menuLabel: String {
         switch self {
         case .infinity: "Infinity (no cap)"
-        default: "\(label) (\(tokenLimit!) tokens)"
+        default: "\(label) (~\(tokenLimit!) think)"
         }
     }
 

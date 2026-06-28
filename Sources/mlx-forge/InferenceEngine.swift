@@ -651,7 +651,8 @@ final class InferenceEngine {
         for conversation: Conversation, entry: Loaded, settings: GenerationSettings,
         systemInstructions: String
     ) -> (ChatSession, String) {
-        let systemPrompt = systemInstructions
+        let systemPrompt = Self.systemInstructionsWithThinkingBudget(
+            systemInstructions, entry: entry, settings: settings)
         if var box = sessions[conversation.id],
             box.modelID == entry.id,
             box.systemPrompt == systemPrompt,
@@ -798,9 +799,42 @@ final class InferenceEngine {
             templateCaps: caps)
     }
 
-    /// Qwen-style early stop when a thinking budget is reached mid-reasoning.
-    static let thinkingBudgetEarlyStopSuffix =
+    /// Grace above the target thinking cap before Forge force-closes an open `</think>` block.
+    static let thinkingBudgetGraceFraction = 0.10
+
+    /// Injected when the target budget is reached but the model has not closed thinking yet.
+    static let thinkingBudgetWrapUpSuffix =
+        "\n\nI've used the allotted reasoning time — wrapping up and answering now.\n</think>\n\n"
+
+    /// Last resort when grace is exhausted and thinking is still open.
+    static let thinkingBudgetForceCloseSuffix =
         "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+
+    static func thinkingBudgetGraceTokens(for target: Int) -> Int {
+        max(1, Int((Double(target) * thinkingBudgetGraceFraction).rounded()))
+    }
+
+    static func thinkingBudgetHardLimit(for target: Int) -> Int {
+        target + thinkingBudgetGraceTokens(for: target)
+    }
+
+    /// Tells the model the budget up front so it can close `</think>` naturally before Forge intervenes.
+    static func systemInstructionsWithThinkingBudget(
+        _ base: String, entry: Loaded, settings: GenerationSettings
+    ) -> String {
+        guard thinkingBudgetApplies(to: entry, settings: settings),
+              let limit = settings.localThinkingTokenLimit
+        else { return base }
+        let grace = thinkingBudgetGraceTokens(for: limit)
+        let hint = """
+
+        [Thinking budget] You have about \(limit) reasoning tokens (±\(grace)) inside a <think>...</think> block before your answer. Plan to finish and close </think> within that budget — do not ramble past it. If you are not done when the budget is nearly exhausted, conclude briefly and answer.
+        """
+        if base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return hint.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return base + hint
+    }
 
     private func streamMLXResponse(
         session: ChatSession,
@@ -812,13 +846,15 @@ final class InferenceEngine {
         start: Date,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws -> GenerateCompletionInfo? {
-        let budgetLimit =
+        let budgetTarget =
             Self.thinkingBudgetApplies(to: entry, settings: settings)
             ? settings.localThinkingTokenLimit : nil
+        let budgetHardLimit = budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) }
         var accumulated = ""
         var thinkingTokens = 0
         var completionInfo: GenerateCompletionInfo?
-        var hitBudget = false
+        var hitThinkingBudget = false
+        var usedForceClose = false
 
         for try await item in session.streamDetails(
             to: userPrompt, role: .user, images: [], videos: [])
@@ -830,12 +866,17 @@ final class InferenceEngine {
                     materializingModelID = nil
                 }
                 accumulated += text
-                if let budgetLimit,
+                if let budgetHardLimit,
                     Self.isInThinkingPhase(accumulated, entry: entry, settings: settings)
                 {
                     thinkingTokens += 1
-                    if thinkingTokens >= budgetLimit {
-                        hitBudget = true
+                    if thinkingTokens >= budgetHardLimit {
+                        hitThinkingBudget = true
+                        usedForceClose = true
+                        break
+                    }
+                    if let budgetTarget, thinkingTokens >= budgetTarget {
+                        hitThinkingBudget = true
                         break
                     }
                 }
@@ -852,11 +893,14 @@ final class InferenceEngine {
             }
         }
 
-        guard hitBudget, !Task.isCancelled else { return completionInfo }
+        guard hitThinkingBudget, !Task.isCancelled else { return completionInfo }
 
         if !accumulated.contains("</think>") {
-            onChunk(Self.thinkingBudgetEarlyStopSuffix)
-            accumulated += Self.thinkingBudgetEarlyStopSuffix
+            let suffix = usedForceClose
+                ? Self.thinkingBudgetForceCloseSuffix
+                : Self.thinkingBudgetWrapUpSuffix
+            onChunk(suffix)
+            accumulated += suffix
         }
 
         sessions.removeValue(forKey: conversation.id)
