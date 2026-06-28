@@ -236,14 +236,14 @@ final class AppState {
         }
         isOpenRouterCatalogLoading = true
         openRouterCatalogError = nil
-        Task {
+        Task { @MainActor in
             do {
                 let models = try await OpenRouterClient(apiKey: key).fetchModels()
-                self.openRouterCatalog = models
-                self.isOpenRouterCatalogLoading = false
+                openRouterCatalog = models
+                isOpenRouterCatalogLoading = false
             } catch {
-                self.openRouterCatalogError = error.localizedDescription
-                self.isOpenRouterCatalogLoading = false
+                openRouterCatalogError = error.localizedDescription
+                isOpenRouterCatalogLoading = false
             }
         }
     }

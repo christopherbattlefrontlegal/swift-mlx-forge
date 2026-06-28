@@ -69,6 +69,9 @@ extension View {
 /// Gentle by design: low sway amplitude, slow flicker, soft additive glow.
 struct ForgeMark: View {
     var size: CGFloat = 20
+    /// When false, draws one static frame (no TimelineView). Use in lists and
+    /// message headers so dozens of flames don't run 30fps animations.
+    var animated: Bool = true
 
     // Ember palette, base → tip.
     private static let deep = Color(red: 0.86, green: 0.22, blue: 0.10)
@@ -78,10 +81,18 @@ struct ForgeMark: View {
     private static let core = Color(red: 1.00, green: 0.97, blue: 0.85)
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            Canvas { ctx, canvasSize in
-                Self.draw(&ctx, size: canvasSize, t: t)
+        Group {
+            if animated {
+                TimelineView(.animation(minimumInterval: 1.0 / 12.0)) { timeline in
+                    let t = timeline.date.timeIntervalSinceReferenceDate
+                    Canvas { ctx, canvasSize in
+                        Self.draw(&ctx, size: canvasSize, t: t)
+                    }
+                }
+            } else {
+                Canvas { ctx, canvasSize in
+                    Self.draw(&ctx, size: canvasSize, t: 0)
+                }
             }
         }
         .frame(width: size * 1.3, height: size * 1.45)

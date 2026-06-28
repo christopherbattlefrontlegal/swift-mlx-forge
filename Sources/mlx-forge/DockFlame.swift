@@ -4,13 +4,10 @@
 // .icns). But while the app is RUNNING we own the Dock icon — so Forge's Dock
 // icon literally burns.
 //
-// Transport: `NSApp.applicationIconImage`, pushed ~20×/sec. We deliberately do
-// NOT use `dockTile.contentView`: custom tile views render inside the Dock's
-// shared tile-host process, and a buggy third-party dock plugin crashing that
-// host (observed in the wild: OpenAI Codex's plugin segfaulting it) silently
-// kills every app's tile animation until relaunch. Icon-image updates go to the
-// main Dock process and are re-sent every frame, so the flame self-heals even
-// after a Dock crash. On quit the bundle's static icon is restored.
+// Transport: `NSApp.applicationIconImage`, pushed ~8×/sec. Frames render OFF the
+// main thread; only the NSImage handoff runs on main. The timer uses the default
+// run-loop mode (not `.common`) and pauses during live window resize so split
+// bars and edge drags stay responsive.
 
 import AppKit
 
@@ -18,11 +15,18 @@ import AppKit
 final class DockFlame {
     private var timer: Timer?
     private let renderer = FlameIconRenderer()
+    private var pausedForResize = false
+    private var renderGeneration = 0
+
+    /// Paint the first animated frame immediately so the Dock never flashes the
+    /// static bundle icon before the flame loop starts.
+    func prime() {
+        NSApp.applicationIconImage = renderer.renderNextFrame()
+    }
 
     func start() {
+        prime()
         startTimer()
-        // Stop burning CPU (20 wakeups/sec) while the app is hidden — there's no
-        // visible Dock animation worth paying for then.
         let nc = NotificationCenter.default
         nc.addObserver(
             self, selector: #selector(pause),
@@ -30,26 +34,39 @@ final class DockFlame {
         nc.addObserver(
             self, selector: #selector(resume),
             name: NSApplication.didUnhideNotification, object: nil)
+        nc.addObserver(
+            self, selector: #selector(pauseForResize),
+            name: NSWindow.willStartLiveResizeNotification, object: nil)
+        nc.addObserver(
+            self, selector: #selector(resumeFromResize),
+            name: NSWindow.didEndLiveResizeNotification, object: nil)
     }
 
     func stop() {
         NotificationCenter.default.removeObserver(self)
         timer?.invalidate()
         timer = nil
-        NSApp.applicationIconImage = nil  // restore the bundle's static icon
+        renderGeneration += 1
+        NSApp.applicationIconImage = nil
     }
 
     private func startTimer() {
         guard timer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 20.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                NSApp.applicationIconImage = self.renderer.nextFrame()
-            }
+        let timer = Timer(timeInterval: 1.0 / 8.0, repeats: true) { [weak self] _ in
+            self?.pushNextFrame()
         }
-        // .common so the flame keeps burning during menu tracking / window resize.
-        RunLoop.main.add(timer, forMode: .common)
+        // Default mode — do NOT use `.common` (that fires during resize drags and
+        // competes with window splitters / sliders for main-thread time).
+        RunLoop.main.add(timer, forMode: .default)
         self.timer = timer
+    }
+
+    private func pushNextFrame() {
+        guard !pausedForResize else { return }
+        let generation = renderGeneration
+        let image = renderer.renderNextFrame()
+        guard generation == renderGeneration else { return }
+        NSApp.applicationIconImage = image
     }
 
     @objc private func pause() {
@@ -58,7 +75,21 @@ final class DockFlame {
     }
 
     @objc private func resume() {
+        guard !pausedForResize else { return }
         startTimer()
+        pushNextFrame()
+    }
+
+    @objc private func pauseForResize() {
+        pausedForResize = true
+        timer?.invalidate()
+        timer = nil
+    }
+
+    @objc private func resumeFromResize() {
+        pausedForResize = false
+        startTimer()
+        pushNextFrame()
     }
 
     deinit {
@@ -66,40 +97,38 @@ final class DockFlame {
     }
 }
 
-/// Renders one flame frame as an NSImage: dark glass base, breathing ember
-/// glow, three nested flame tongues swaying on incommensurate frequencies
-/// (so the motion never visibly repeats), and drifting sparks. Mirrors the
-/// in-app ForgeMark flame so the Dock and the sidebar burn the same fire.
-@MainActor
-private final class FlameIconRenderer {
+/// Renders one flame frame as an NSImage. Thread-safe — drawing never blocks UI.
+private final class FlameIconRenderer: @unchecked Sendable {
+    private let lock = NSLock()
     private var phase: Double = 0
     private let side: CGFloat = 256
 
-    // Ember palette (matches Theme.swift / ForgeMark).
     private let deep = NSColor(red: 0.86, green: 0.22, blue: 0.10, alpha: 1)
     private let ember = NSColor(red: 1.00, green: 0.42, blue: 0.21, alpha: 1)
     private let glow = NSColor(red: 1.00, green: 0.62, blue: 0.26, alpha: 1)
     private let gold = NSColor(red: 1.00, green: 0.86, blue: 0.45, alpha: 1)
     private let core = NSColor(red: 1.00, green: 0.97, blue: 0.85, alpha: 1)
 
-    func nextFrame() -> NSImage {
-        phase += 1.0 / 20.0
+    func renderNextFrame() -> NSImage {
+        lock.lock()
+        phase += 1.0 / 8.0
+        let t = phase
+        lock.unlock()
+
         let size = NSSize(width: side, height: side)
         let image = NSImage(size: size)
         image.lockFocus()
         if let ctx = NSGraphicsContext.current?.cgContext {
-            draw(ctx, w: side, h: side, t: phase)
+            draw(ctx, w: side, h: side, t: t)
         }
         image.unlockFocus()
         return image
     }
 
-    // CG coordinates: origin bottom-left, y grows upward.
     private func draw(_ ctx: CGContext, w: CGFloat, h: CGFloat, t: Double) {
         let cx = w / 2
         let baseY = h * 0.14
 
-        // --- Dark glass base (rounded square, like a real app icon) ---
         let inset = w * 0.06
         let basePath = CGPath(
             roundedRect: CGRect(x: inset, y: inset, width: w - inset * 2, height: h - inset * 2),
@@ -115,7 +144,6 @@ private final class FlameIconRenderer {
             locations: [0, 1],
             start: CGPoint(x: 0, y: h), end: CGPoint(x: 0, y: 0))
 
-        // --- Breathing ember glow ---
         let pulse = 0.75 + 0.25 * sin(t * 1.9) * sin(t * 0.63)
         if let g = gradient(
             [ember.withAlphaComponent(0.50 * pulse), deep.withAlphaComponent(0)],
@@ -127,7 +155,6 @@ private final class FlameIconRenderer {
                 endCenter: center, endRadius: w * 0.46, options: [])
         }
 
-        // --- Three nested tongues (additive for glow) ---
         ctx.setBlendMode(.plusLighter)
         tongue(
             ctx, cx: cx, baseY: baseY, width: w * 0.56, height: h * 0.66,
@@ -142,7 +169,6 @@ private final class FlameIconRenderer {
             t: t + 2.18, f: 3.3, sway: w * 0.035,
             colors: [gold, core], locations: [0, 1])
 
-        // --- Drifting sparks, faded in and out over their rise ---
         for i in 0..<5 {
             let fi = Double(i)
             let speed = 0.15 + 0.045 * fi
@@ -158,8 +184,6 @@ private final class FlameIconRenderer {
         ctx.setBlendMode(.normal)
     }
 
-    /// One flame tongue: teardrop with a rounded belly; tip sway and height
-    /// flicker driven by two incommensurate sine frequencies.
     private func tongue(
         _ ctx: CGContext, cx: CGFloat, baseY: CGFloat, width: CGFloat,
         height: CGFloat, t: Double, f: Double, sway: CGFloat,

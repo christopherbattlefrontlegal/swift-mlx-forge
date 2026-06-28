@@ -714,6 +714,17 @@ final class MCPManager {
     private static func normalizedArguments(
         _ arguments: [String: Any], toolName: String, entry: Entry
     ) -> [String: Any] {
+        if toolName == "sequentialthinking",
+           entry.id == "sequential-thinking"
+            || (([entry.config.command] + (entry.config.args ?? []))
+                .compactMap { $0 }
+                .joined(separator: " ")
+                .lowercased()
+                .contains("server-sequential-thinking"))
+        {
+            return normalizedSequentialThinkingArguments(arguments)
+        }
+
         let commandLine = ([entry.config.command] + (entry.config.args ?? []))
             .compactMap { $0 }
             .joined(separator: " ")
@@ -738,6 +749,92 @@ final class MCPManager {
             }
         }
         return result
+    }
+
+    /// Local models often emit a convenient planning object (`thoughts`,
+    /// `problem`, `steps`) instead of the MCP server's strict one-thought schema.
+    /// Normalize those shapes before they hit the server so a recoverable model
+    /// formatting miss does not become a visible tool failure.
+    private static func normalizedSequentialThinkingArguments(_ arguments: [String: Any]) -> [String: Any] {
+        var result = arguments
+
+        if let thought = result["thought"] {
+            result["thought"] = stringValue(thought)
+        } else if let thoughts = result["thoughts"] as? [Any] {
+            let joined = thoughts
+                .compactMap { stringValue($0) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            if !joined.isEmpty { result["thought"] = joined }
+        } else if let problem = result["problem"] {
+            result["thought"] = stringValue(problem)
+        } else if let prompt = result["prompt"] {
+            result["thought"] = stringValue(prompt)
+        } else if let input = result["input"] {
+            result["thought"] = stringValue(input)
+        }
+
+        result["thoughtNumber"] =
+            intValue(result["thoughtNumber"] ?? result["thought_number"]) ?? 1
+
+        let inferredTotal =
+            intValue(result["totalThoughts"] ?? result["total_thoughts"])
+            ?? intValue(result["steps"])
+            ?? ((result["thoughts"] as? [Any])?.count)
+            ?? 1
+        result["totalThoughts"] = max(1, inferredTotal)
+
+        if let next = boolValue(result["nextThoughtNeeded"] ?? result["next_thought_needed"]) {
+            result["nextThoughtNeeded"] = next
+        } else {
+            let current = intValue(result["thoughtNumber"]) ?? 1
+            let total = intValue(result["totalThoughts"]) ?? 1
+            result["nextThoughtNeeded"] = current < total
+        }
+
+        result.removeValue(forKey: "thoughts")
+        result.removeValue(forKey: "thought_number")
+        result.removeValue(forKey: "total_thoughts")
+        result.removeValue(forKey: "next_thought_needed")
+        result.removeValue(forKey: "steps")
+        result.removeValue(forKey: "problem")
+        result.removeValue(forKey: "prompt")
+        result.removeValue(forKey: "input")
+        return result
+    }
+
+    private static func stringValue(_ value: Any) -> String? {
+        if let string = value as? String { return string }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
+           let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return String(describing: value)
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int { return int }
+        if let double = value as? Double { return Int(double) }
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String {
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private static func boolValue(_ value: Any?) -> Bool? {
+        if let bool = value as? Bool { return bool }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = value as? String {
+            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        }
+        return nil
     }
 
     private static func relativeToHome(_ path: String) -> String {
