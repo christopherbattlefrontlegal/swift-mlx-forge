@@ -108,7 +108,7 @@ struct TranscriptView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Theme.s4) {
-                if !conversation.copyableTranscript.isEmpty {
+                if app.streamingMessageID == nil, !conversation.copyableTranscript.isEmpty {
                     HStack {
                         Spacer()
                         CopyClipButton(
@@ -117,16 +117,10 @@ struct TranscriptView: View {
                     .padding(.bottom, Theme.s1)
                 }
                 ForEach(Array(conversation.messages.enumerated()), id: \.element.id) {
-                    index, message in
-                    let precedingUser =
-                        index > 0 && conversation.messages[index - 1].role == .user
-                        ? conversation.messages[index - 1].content : nil
+                    _, message in
                     MessageView(
                         message: message,
                         isStreaming: app.streamingMessageID == message.id,
-                        turnSystemPrompt: message.role == .assistant
-                            ? app.effectiveSystemPrompt(for: conversation) : nil,
-                        precedingUserPrompt: message.role == .assistant ? precedingUser : nil,
                         onShowLargeText: onShowLargeText)
                         .id(message.id)
                 }
@@ -143,10 +137,6 @@ struct TranscriptView: View {
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
-    /// System instructions sent before this assistant turn (delineated context).
-    var turnSystemPrompt: String? = nil
-    /// User message immediately before this assistant turn.
-    var precedingUserPrompt: String? = nil
     var onShowLargeText: (String) -> Void = { _ in }
 
     var body: some View {
@@ -197,12 +187,6 @@ struct MessageView: View {
             }
         case .assistant:
             VStack(alignment: .leading, spacing: Theme.s2) {
-                if showsTurnContext {
-                    TurnContextPanel(
-                        systemPrompt: turnSystemPrompt ?? "",
-                        userPrompt: precedingUserPrompt ?? "",
-                        isGenerating: isStreaming && message.content.isEmpty)
-                }
                 header
                 bubble
                 if !isStreaming, message.tokensPerSecond != nil {
@@ -231,12 +215,6 @@ struct MessageView: View {
         }
     }
 
-    private var showsTurnContext: Bool {
-        let sys = turnSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let user = precedingUserPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return !sys.isEmpty || !user.isEmpty
-    }
-
     private var bubble: some View {
         VStack(alignment: .leading, spacing: Theme.s3) {
             if message.content.isEmpty && isStreaming {
@@ -255,16 +233,12 @@ struct MessageView: View {
                         if segment.text.isEmpty && isStreaming {
                             EmptyView()
                         } else {
-                            MarkdownText(text: segment.text)
+                            streamingText(segment.text)
                         }
                     }
                 }
-            } else if isStreaming {
-                Text(message.content)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
             } else {
-                MarkdownText(text: message.content)
+                streamingText(message.content)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -296,74 +270,17 @@ struct MessageView: View {
         }
         .padding(.leading, Theme.s1)
     }
-}
 
-/// Shows the ordered turn context: system prompt received, then user prompt, before reasoning.
-private struct TurnContextPanel: View {
-    let systemPrompt: String
-    let userPrompt: String
-    var isGenerating: Bool = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s2) {
-            if !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                contextStep(
-                    number: 1, title: "System prompt", icon: "gearshape",
-                    body: systemPrompt)
-            }
-            if !userPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                contextStep(
-                    number: systemPrompt.isEmpty ? 1 : 2, title: "User prompt",
-                    icon: "person.fill", body: userPrompt)
-            }
-            if isGenerating {
-                HStack(spacing: Theme.s2) {
-                    Image(systemName: "brain")
-                        .foregroundStyle(Theme.emberGlow)
-                    Text("Reasoning…")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    ProgressView()
-                        .controlSize(.mini)
-                }
-                .padding(.horizontal, Theme.s3)
-                .padding(.vertical, Theme.s2)
-            }
-        }
-        .padding(Theme.s3)
-        .background(.white.opacity(0.025))
-        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.radiusSmall)
-                .strokeBorder(.white.opacity(0.05), lineWidth: 1)
-        )
-    }
-
-    private func contextStep(
-        number: Int, title: String, icon: String, body: String
-    ) -> some View {
-        DisclosureGroup {
-            Text(body)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+    /// Plain text while tokens arrive — markdown parsing on every chunk was freezing the UI.
+    @ViewBuilder
+    private func streamingText(_ text: String) -> some View {
+        if isStreaming {
+            Text(text)
+                .font(.body)
                 .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, Theme.s1)
-        } label: {
-            HStack(spacing: Theme.s2) {
-                Text("\(number)")
-                    .font(.caption2.weight(.bold).monospacedDigit())
-                    .foregroundStyle(Theme.ember)
-                    .frame(width: 18, height: 18)
-                    .background(Theme.ember.opacity(0.15))
-                    .clipShape(Circle())
-                Image(systemName: icon)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            MarkdownText(text: text)
         }
     }
 }
@@ -428,24 +345,35 @@ struct ThinkingBlock: View {
     @State private var expanded = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            Text(text)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, Theme.s2)
-        } label: {
-            HStack(spacing: Theme.s2) {
-                Image(systemName: "brain")
-                    .foregroundStyle(Theme.emberGlow)
-                Text(done ? "Reasoning" : "Reasoning…")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                if !done && isStreaming {
-                    ProgressView()
-                        .controlSize(.mini)
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: Theme.s2) {
+                    Image(systemName: "brain")
+                        .foregroundStyle(Theme.emberGlow)
+                    Text(done ? "Reasoning" : "Reasoning…")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if !done && isStreaming {
+                        ProgressView()
+                            .controlSize(.mini)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
                 }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                Text(text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(Theme.s3)
