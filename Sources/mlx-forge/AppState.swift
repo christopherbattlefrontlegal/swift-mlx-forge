@@ -443,8 +443,15 @@ final class AppState {
 
     var composerText = ""
 
-    /// ID of the assistant message currently being streamed, if any.
+    /// Last-started stream (live bar / legacy). Parallel dispatches may stream several at once.
     private(set) var streamingMessageID: UUID?
+    private(set) var streamingMessageIDs: Set<UUID> = []
+    /// Live token buffer shown in the transcript without rewriting `conversations` each flush.
+    private(set) var streamingTextByMessageID: [UUID: String] = [:]
+
+    func isMessageStreaming(_ messageID: UUID) -> Bool {
+        streamingMessageIDs.contains(messageID)
+    }
 
     private var saveTask: Task<Void, Never>?
     private var streamBuffers: [UUID: String] = [:]
@@ -1042,9 +1049,10 @@ final class AppState {
             selectedConversation = conversation
 
             let conversationID = conversation.id
-            streamingMessageID =
-                braveTarget ?? openAITarget?.messageID ?? openRouterTargets.last?.messageID
-                ?? claudeTarget?.messageID
+            if let braveTarget { beginStreaming(messageID: braveTarget) }
+            if let openAITarget { beginStreaming(messageID: openAITarget.messageID) }
+            for target in openRouterTargets { beginStreaming(messageID: target.messageID) }
+            if let claudeTarget { beginStreaming(messageID: claudeTarget.messageID) }
             if let claudeTarget {
                 streamClaude(
                     model: claudeTarget.modelID, history: historySnapshot, prompt: prompt,
@@ -1085,7 +1093,7 @@ final class AppState {
 
         let conversationID = conversation.id
         let messageID = assistant.id
-        streamingMessageID = messageID
+        beginStreaming(messageID: messageID)
 
         if let claudeID = claudeModelID, !claudeID.isEmpty {
             // Images for Claude vision require richer Message content (array of text+image blocks).
@@ -1135,7 +1143,7 @@ final class AppState {
                             }
                         }
                     }
-                    self.streamingMessageID = nil
+                    self.endStreaming(messageID: messageID)
                     self.scheduleSave()
                     if let activeModelID {
                         Task { @MainActor in
@@ -1207,6 +1215,7 @@ final class AppState {
         let messageID = assistant.id
         conversation.lastModelID = localID ?? claudeID ?? openRouterID ?? conversation.lastModelID
         selectedConversation = conversation
+        beginStreaming(messageID: messageID)
 
         inFlightAgentLabels[messageID] = label
 
@@ -1391,7 +1400,7 @@ final class AppState {
                 $0.isError = true
             }
             isClaudeGenerating = false
-            streamingMessageID = nil
+            endStreaming(messageID: messageID)
             return
         }
 
@@ -1440,9 +1449,7 @@ final class AppState {
             }
             self?.finishStreamBuffer(messageID)
             self?.isClaudeGenerating = false
-            if self?.streamingMessageID == messageID {
-                self?.streamingMessageID = nil
-            }
+            self?.endStreaming(messageID: messageID)
             if allowMCPFollowup {
                 _ = await self?.handleMCPToolRequestIfNeeded(
                     backend: .claude(modelID: model),
@@ -1468,7 +1475,7 @@ final class AppState {
                 $0.isError = true
             }
             isOpenRouterGenerating = false
-            streamingMessageID = nil
+            endStreaming(messageID: messageID)
             return
         }
 
@@ -1521,9 +1528,7 @@ final class AppState {
             self?.finishStreamBuffer(messageID)
             self?.openRouterTasks.removeValue(forKey: messageID)
             self?.isOpenRouterGenerating = self?.openRouterTasks.isEmpty == false
-            if self?.streamingMessageID == messageID {
-                self?.streamingMessageID = nil
-            }
+            self?.endStreaming(messageID: messageID)
             if allowMCPFollowup {
                 _ = await self?.handleMCPToolRequestIfNeeded(
                     backend: .openRouter(modelID: model),
@@ -1549,7 +1554,7 @@ final class AppState {
                 $0.isError = true
             }
             isOpenAIGenerating = false
-            streamingMessageID = nil
+            endStreaming(messageID: messageID)
             return
         }
 
@@ -1600,9 +1605,7 @@ final class AppState {
             }
             self?.finishStreamBuffer(messageID)
             self?.isOpenAIGenerating = false
-            if self?.streamingMessageID == messageID {
-                self?.streamingMessageID = nil
-            }
+            self?.endStreaming(messageID: messageID)
             if allowMCPFollowup {
                 _ = await self?.handleMCPToolRequestIfNeeded(
                     backend: .openAI(modelID: model),
@@ -1627,7 +1630,7 @@ final class AppState {
                 $0.isError = true
             }
             isBraveSearchGenerating = false
-            if streamingMessageID == messageID { streamingMessageID = nil }
+            endStreaming(messageID: messageID)
             return
         }
 
@@ -1673,9 +1676,7 @@ final class AppState {
             }
             self?.isBraveSearchGenerating = false
             self?.braveSearchTask = nil
-            if self?.streamingMessageID == messageID {
-                self?.streamingMessageID = nil
-            }
+            self?.endStreaming(messageID: messageID)
             self?.scheduleSave()
         }
     }
@@ -1805,7 +1806,7 @@ final class AppState {
         conversation.updatedAt = Date()
         conversations[ci] = conversation
         let messageID = assistant.id
-        streamingMessageID = messageID
+        beginStreaming(messageID: messageID)
 
         let prompt = """
             The MCP tool \(requestLabel) returned this result:
@@ -1852,7 +1853,7 @@ final class AppState {
                             }
                         }
                     }
-                    self.streamingMessageID = nil
+                    self.endStreaming(messageID: messageID)
                     self.scheduleSave()
                 })
             }
@@ -1898,7 +1899,24 @@ final class AppState {
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }),
               let mi = conversations[ci].messages.firstIndex(where: { $0.id == messageID })
         else { return nil }
+        if let live = streamingTextByMessageID[messageID], !live.isEmpty {
+            return live
+        }
         return conversations[ci].messages[mi].content
+    }
+
+    private func beginStreaming(messageID: UUID) {
+        streamingMessageIDs.insert(messageID)
+        streamingMessageID = messageID
+        streamingTextByMessageID[messageID] = ""
+    }
+
+    private func endStreaming(messageID: UUID) {
+        streamingMessageIDs.remove(messageID)
+        if streamingMessageID == messageID {
+            streamingMessageID = streamingMessageIDs.first
+        }
+        streamingTextByMessageID.removeValue(forKey: messageID)
     }
 
     private func appendSystemMessage(conversationID: UUID, content: String) {
@@ -2104,6 +2122,8 @@ final class AppState {
         isOpenAIGenerating = false
         isBraveSearchGenerating = false
         streamingMessageID = nil
+        streamingMessageIDs.removeAll()
+        streamingTextByMessageID.removeAll()
         stopCodingOrchestrator()
         // Cancel any parallel agent dispatches (locals are also covered by engine.stop via gate).
         for t in agentTasks.values { t.cancel() }
@@ -2131,8 +2151,8 @@ final class AppState {
         streamBuffers[messageID, default: ""] += delta
         guard streamFlushTasks[messageID] == nil else { return }
         streamFlushTasks[messageID] = Task { [weak self] in
-            // Batch UI updates so scroll gestures stay responsive during long streams.
-            try? await Task.sleep(for: .milliseconds(200))
+            // Batch UI updates — rewriting conversations every flush blocked scroll input.
+            try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
             self?.flushStreamBuffer(messageID)
         }
@@ -2141,17 +2161,27 @@ final class AppState {
     private func flushStreamBuffer(_ messageID: UUID) {
         streamFlushTasks[messageID]?.cancel()
         streamFlushTasks[messageID] = nil
-        guard let delta = streamBuffers.removeValue(forKey: messageID),
-              !delta.isEmpty,
-              let conversationID = streamBufferConversationIDs[messageID]
-        else { return }
-        appendToMessage(conversationID: conversationID, messageID: messageID) {
-            $0.content += delta
+        guard let delta = streamBuffers.removeValue(forKey: messageID), !delta.isEmpty else {
+            return
         }
+        streamingTextByMessageID[messageID, default: ""] += delta
     }
 
     private func finishStreamBuffer(_ messageID: UUID) {
-        flushStreamBuffer(messageID)
+        streamFlushTasks[messageID]?.cancel()
+        streamFlushTasks[messageID] = nil
+        if let delta = streamBuffers.removeValue(forKey: messageID), !delta.isEmpty {
+            streamingTextByMessageID[messageID, default: ""] += delta
+        }
+        guard let conversationID = streamBufferConversationIDs[messageID] else {
+            streamingTextByMessageID.removeValue(forKey: messageID)
+            return
+        }
+        if let text = streamingTextByMessageID[messageID] {
+            appendToMessage(conversationID: conversationID, messageID: messageID) {
+                $0.content = text
+            }
+        }
         streamBufferConversationIDs[messageID] = nil
     }
 

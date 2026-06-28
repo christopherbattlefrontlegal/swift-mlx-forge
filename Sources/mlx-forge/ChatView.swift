@@ -105,13 +105,14 @@ struct TranscriptView: View {
     let conversation: Conversation
     var onShowLargeText: (String) -> Void = { _ in }
 
-    /// Anchors the viewport to a message while the user reads above the live stream.
-    @State private var scrollPosition: UUID?
+    private var anyMessageStreaming: Bool {
+        !app.streamingMessageIDs.isEmpty
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.s4) {
-                if app.streamingMessageID == nil, !conversation.copyableTranscript.isEmpty {
+                if !anyMessageStreaming, !conversation.copyableTranscript.isEmpty {
                     HStack {
                         Spacer()
                         CopyClipButton(
@@ -121,27 +122,44 @@ struct TranscriptView: View {
                 }
                 ForEach(Array(conversation.messages.enumerated()), id: \.element.id) {
                     _, message in
-                    MessageView(
+                    MessageRow(
                         message: message,
-                        isStreaming: app.streamingMessageID == message.id,
-                        onShowLargeText: onShowLargeText)
-                        .id(message.id)
+                        isStreaming: app.isMessageStreaming(message.id),
+                        streamingText: app.streamingTextByMessageID[message.id],
+                        onShowLargeText: onShowLargeText
+                    )
+                    .equatable()
+                    .id(message.id)
                 }
             }
             .padding(Theme.s5)
             .frame(maxWidth: 860)
             .frame(maxWidth: .infinity)
-            .scrollTargetLayout()
         }
-        .scrollPosition(id: $scrollPosition, anchor: .top)
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
-            return geometry.contentSize.height - visibleBottom <= 64
-        } action: { _, nearBottom in
-            if nearBottom {
-                scrollPosition = nil
-            }
+    }
+}
+
+/// Equatable wrapper so finished transcript rows skip re-layout when another message streams.
+private struct MessageRow: View, Equatable {
+    let message: ChatMessage
+    let isStreaming: Bool
+    let streamingText: String?
+    var onShowLargeText: (String) -> Void
+
+    nonisolated static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        guard lhs.message == rhs.message, lhs.isStreaming == rhs.isStreaming else { return false }
+        if lhs.isStreaming || rhs.isStreaming {
+            return lhs.streamingText == rhs.streamingText
         }
+        return true
+    }
+
+    var body: some View {
+        MessageView(
+            message: message,
+            isStreaming: isStreaming,
+            streamingText: streamingText,
+            onShowLargeText: onShowLargeText)
     }
 }
 
@@ -150,7 +168,13 @@ struct TranscriptView: View {
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
+    var streamingText: String? = nil
     var onShowLargeText: (String) -> Void = { _ in }
+
+    private var liveAssistantText: String {
+        if isStreaming, let streamingText { return streamingText }
+        return message.content
+    }
 
     var body: some View {
         switch message.role {
@@ -230,28 +254,30 @@ struct MessageView: View {
 
     private var bubble: some View {
         VStack(alignment: .leading, spacing: Theme.s3) {
-            if message.content.isEmpty && isStreaming {
-                Text("Reasoning…")
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
+            if isStreaming {
+                if liveAssistantText.isEmpty {
+                    Text("Reasoning…")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    StreamingPlainTextView(text: liveAssistantText)
+                }
             } else if !message.segments.isEmpty {
                 ForEach(message.segments) { segment in
                     switch segment.kind {
                     case .thinking(let done):
                         ThinkingBlock(
                             text: segment.text,
-                            done: done && !isStreaming,
-                            isStreaming: isStreaming && !done)
+                            done: done,
+                            isStreaming: false)
                     case .answer:
-                        if segment.text.isEmpty && isStreaming {
-                            EmptyView()
-                        } else {
-                            streamingText(segment.text)
+                        if !segment.text.isEmpty {
+                            MarkdownText(text: segment.text)
                         }
                     }
                 }
-            } else {
-                streamingText(message.content)
+            } else if !message.content.isEmpty {
+                MarkdownText(text: message.content)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -284,18 +310,48 @@ struct MessageView: View {
         .padding(.leading, Theme.s1)
     }
 
-    /// Plain text while tokens arrive — markdown parsing on every chunk was freezing the UI.
-    @ViewBuilder
-    private func streamingText(_ text: String) -> some View {
-        if isStreaming {
-            Text(text)
-                .font(.body)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .transaction { $0.animation = nil }
-        } else {
-            MarkdownText(text: text)
+}
+
+// MARK: - Streaming text (AppKit)
+
+/// Non-scrollable NSTextView that appends deltas instead of relayouting SwiftUI `Text` every flush.
+private struct StreamingPlainTextView: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: 0, height: CGFloat.greatestFiniteMagnitude)
+        textView.font = NSFont.preferredFont(forTextStyle: .body)
+        textView.textColor = .labelColor
+        context.coordinator.textView = textView
+        return textView
+    }
+
+    func updateNSView(_ textView: NSTextView, context: Context) {
+        let current = textView.string
+        if text.count > current.count, text.hasPrefix(current) {
+            let delta = String(text.dropFirst(current.count))
+            textView.textStorage?.append(
+                NSAttributedString(
+                    string: delta,
+                    attributes: [.font: textView.font as Any, .foregroundColor: textView.textColor as Any]))
+        } else if text != current {
+            textView.string = text
         }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var textView: NSTextView?
     }
 }
 
