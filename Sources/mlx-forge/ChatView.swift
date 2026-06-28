@@ -105,9 +105,12 @@ struct TranscriptView: View {
     let conversation: Conversation
     var onShowLargeText: (String) -> Void = { _ in }
 
+    /// Anchors the viewport to a message while the user reads above the live stream.
+    @State private var scrollPosition: UUID?
+
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: Theme.s4) {
+            VStack(alignment: .leading, spacing: Theme.s4) {
                 if app.streamingMessageID == nil, !conversation.copyableTranscript.isEmpty {
                     HStack {
                         Spacer()
@@ -128,6 +131,16 @@ struct TranscriptView: View {
             .padding(Theme.s5)
             .frame(maxWidth: 860)
             .frame(maxWidth: .infinity)
+            .scrollTargetLayout()
+        }
+        .scrollPosition(id: $scrollPosition, anchor: .top)
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            let visibleBottom = geometry.contentOffset.y + geometry.containerSize.height
+            return geometry.contentSize.height - visibleBottom <= 64
+        } action: { _, nearBottom in
+            if nearBottom {
+                scrollPosition = nil
+            }
         }
     }
 }
@@ -278,7 +291,8 @@ struct MessageView: View {
             Text(text)
                 .font(.body)
                 .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transaction { $0.animation = nil }
         } else {
             MarkdownText(text: text)
         }
@@ -373,7 +387,8 @@ struct ThinkingBlock: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transaction { $0.animation = nil }
             }
         }
         .padding(Theme.s3)

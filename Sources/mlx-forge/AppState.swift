@@ -2131,8 +2131,8 @@ final class AppState {
         streamBuffers[messageID, default: ""] += delta
         guard streamFlushTasks[messageID] == nil else { return }
         streamFlushTasks[messageID] = Task { [weak self] in
-            // Batch UI updates — sub-100ms flushes reparsed markdown on the main thread per token.
-            try? await Task.sleep(for: .milliseconds(120))
+            // Batch UI updates so scroll gestures stay responsive during long streams.
+            try? await Task.sleep(for: .milliseconds(200))
             guard !Task.isCancelled else { return }
             self?.flushStreamBuffer(messageID)
         }
