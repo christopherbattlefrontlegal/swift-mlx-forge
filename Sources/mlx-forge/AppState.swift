@@ -439,6 +439,7 @@ final class AppState {
     var showInspector = true
     var showHeadlessHelper = false
     var showDesignPrompt = false
+    var showSystemPromptEditor = false
 
     var composerText = ""
 

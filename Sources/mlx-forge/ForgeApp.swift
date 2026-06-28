@@ -126,6 +126,10 @@ struct RootView: View {
             DesignPromptView()
                 .environment(app)
         }
+        .sheet(isPresented: $app.showSystemPromptEditor) {
+            SystemPromptEditor()
+                .environment(app)
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 ModelPickerControl()

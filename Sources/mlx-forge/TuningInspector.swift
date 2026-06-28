@@ -5,7 +5,6 @@ import SwiftUI
 
 struct TuningInspector: View {
     @Environment(AppState.self) private var app
-    @State private var showPromptEditor = false
     @State private var showPresetNamePrompt = false
     @State private var presetNameDraft = ""
     @AppStorage("inspector.serverExpanded") private var serverExpanded = false
@@ -156,7 +155,7 @@ struct TuningInspector: View {
                             .fixedSize()
 
                         Button {
-                            showPromptEditor = true
+                            app.showSystemPromptEditor = true
                         } label: {
                             Image(systemName: "arrow.up.left.and.arrow.down.right")
                                 .font(.caption)
@@ -175,13 +174,23 @@ struct TuningInspector: View {
                             .textSelection(.enabled)
                     }
 
-                    TextEditor(text: systemPromptBinding)
-                        .font(.callout)
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 56, maxHeight: 120)
-                        .padding(Theme.s2)
-                        .background(.black.opacity(0.25))
-                        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                    if !app.showSystemPromptEditor {
+                        TextEditor(text: systemPromptBinding)
+                            .font(.callout)
+                            .scrollContentBackground(.hidden)
+                            .frame(minHeight: 56, maxHeight: 120)
+                            .padding(Theme.s2)
+                            .background(.black.opacity(0.25))
+                            .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                    } else {
+                        Text("Editing in expanded window…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 56, maxHeight: 120, alignment: .topLeading)
+                            .padding(Theme.s2)
+                            .background(.black.opacity(0.25))
+                            .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+                    }
                 }
 
                 collapsibleSection(
@@ -275,10 +284,6 @@ struct TuningInspector: View {
         }
         .frame(maxHeight: .infinity)
         .background(Theme.codeBackground)
-        .sheet(isPresented: $showPromptEditor) {
-            SystemPromptEditor()
-                .environment(app)
-        }
         .alert("Save Preset", isPresented: $showPresetNamePrompt) {
             TextField("Preset name", text: $presetNameDraft)
             Button("Save") { savePreset() }
@@ -1017,24 +1022,15 @@ private struct LoadedModelRow: View {
     }
 }
 
-/// Large, resizable system prompt editor opened from the inspector.
+/// Large system prompt editor — single TextEditor with a local draft (never
+/// duplicates the inline inspector field; presenting both crashed AppKit).
 struct SystemPromptEditor: View {
     @Environment(AppState.self) private var app
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
-
-    private var systemPromptBinding: Binding<String> {
-        Binding(
-            get: { app.settings.systemPrompt },
-            set: { newValue in
-                var next = app.settings
-                next.systemPrompt = newValue
-                app.settings = next
-            })
-    }
+    @State private var draft = ""
 
     var body: some View {
-        @Bindable var app = app
         VStack(spacing: 0) {
             HStack(spacing: Theme.s2) {
                 Image(systemName: "text.quote")
@@ -1050,7 +1046,7 @@ struct SystemPromptEditor: View {
 
             Divider()
 
-            TextEditor(text: systemPromptBinding)
+            TextEditor(text: $draft)
                 .font(.system(.body, design: .monospaced))
                 .lineSpacing(3)
                 .scrollContentBackground(.hidden)
@@ -1062,31 +1058,43 @@ struct SystemPromptEditor: View {
 
             HStack {
                 Button("Clear", role: .destructive) {
-                    app.applySystemPrompt("")
+                    draft = ""
                 }
-                .disabled(app.settings.systemPrompt.isEmpty)
-                Text("Changes apply live to the next message.")
+                .disabled(draft.isEmpty)
+                Text("Press Done to apply to the next message.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                 Spacer()
-                Button("Done") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Theme.ember)
-                    .keyboardShortcut(.defaultAction)
+                Button("Done") {
+                    commitDraft()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.ember)
+                .keyboardShortcut(.defaultAction)
             }
             .padding(Theme.s4)
         }
-        .frame(
-            minWidth: 560, idealWidth: 720, maxWidth: .infinity,
-            minHeight: 420, idealHeight: 540, maxHeight: .infinity)
+        .frame(width: 720, height: 540)
         .background(Theme.backgroundGradient)
-        .onAppear { focused = true }
+        .onAppear {
+            draft = app.settings.systemPrompt
+            DispatchQueue.main.async {
+                focused = true
+            }
+        }
+    }
+
+    private func commitDraft() {
+        guard draft != app.settings.systemPrompt else { return }
+        app.applySystemPrompt(draft)
     }
 
     private var footerSummary: String {
-        let prompt = app.settings.systemPrompt
-        let words = prompt.split(whereSeparator: \.isWhitespace).count
-        return "\(words) words · \(prompt.count) chars"
+        let chars = draft.count
+        if chars > 50_000 { return "\(chars) chars" }
+        let words = draft.split { $0.isWhitespace }.prefix(10_000).count
+        return words >= 10_000 ? "\(words)+ words · \(chars) chars" : "\(words) words · \(chars) chars"
     }
 }
 
