@@ -17,8 +17,10 @@ struct TuningInspector: View {
 
     var body: some View {
         @Bindable var app = app
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.s3) {
+        VStack(spacing: 0) {
+            inspectorPanelHeader
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.s3) {
                 collapsibleSection(
                     "Sampling & Limits", icon: "dice", expanded: $samplingExpanded,
                     detail:
@@ -266,10 +268,12 @@ struct TuningInspector: View {
                     MCPInspectorPanel()
                         .environment(app)
                 }
+                }
+                .padding(Theme.s3)
             }
-            .padding(Theme.s3)
+            .scrollContentBackground(.hidden)
         }
-        .scrollContentBackground(.hidden)
+        .frame(maxHeight: .infinity)
         .background(Theme.codeBackground)
         .sheet(isPresented: $showPromptEditor) {
             SystemPromptEditor()
@@ -283,6 +287,36 @@ struct TuningInspector: View {
         } message: {
             Text("Stores the current system prompt under a name in the Presets menu.")
         }
+    }
+
+    /// Tap the header to hide the panel — open again from the toolbar Tuning button.
+    private var inspectorPanelHeader: some View {
+        Button {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                app.showInspector.toggle()
+            }
+        } label: {
+            HStack(spacing: Theme.s2) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("Tuning")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, Theme.s3)
+            .padding(.vertical, Theme.s2)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help("Hide tuning panel")
     }
 
     @ViewBuilder

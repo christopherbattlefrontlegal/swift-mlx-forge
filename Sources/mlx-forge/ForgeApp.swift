@@ -94,28 +94,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct RootView: View {
     @Environment(AppState.self) private var app
-    /// Inspector attaches one frame after the window appears so launch doesn't
-    /// resize twice (window open → inspector column → window jump).
-    @State private var inspectorAttached = false
 
     var body: some View {
         @Bindable var app = app
-        NavigationSplitView {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
-        } detail: {
-            ChatView()
-        }
-        .inspector(isPresented: inspectorPresented) {
-            TuningInspector()
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
-        }
-        .background(Theme.backgroundGradient)
-        .onAppear {
-            DispatchQueue.main.async {
-                inspectorAttached = true
+        HStack(spacing: 0) {
+            NavigationSplitView {
+                SidebarView()
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+            } detail: {
+                ChatView()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if app.showInspector {
+                Divider()
+                TuningInspector()
+                    .frame(width: Theme.inspectorWidth)
             }
         }
+        .animation(nil, value: app.showInspector)
+        .background(Theme.backgroundGradient)
         .sheet(isPresented: $app.showModelBrowser) {
             ModelBrowserView()
                 .environment(app)
@@ -144,15 +142,11 @@ struct RootView: View {
                 }
                 MemoryBadge()
                 Button {
-                    var transaction = Transaction()
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) {
-                        app.showInspector.toggle()
-                    }
+                    toggleInspectorPanel()
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
-                .help("Show generation parameters")
+                .help("Show or hide the tuning panel (fixed width — no drag resize)")
             }
         }
         .onDisappear {
@@ -160,13 +154,11 @@ struct RootView: View {
         }
     }
 
-    private var inspectorPresented: Binding<Bool> {
-        Binding(
-            get: { inspectorAttached && app.showInspector },
-            set: { newValue in
-                inspectorAttached = true
-                app.showInspector = newValue
-            }
-        )
+    private func toggleInspectorPanel() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            app.showInspector.toggle()
+        }
     }
 }
