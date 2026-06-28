@@ -276,7 +276,12 @@ final class ForgeServer {
         }
 
         // Stateless API: fresh session per request, full history each time.
-        let session = ChatSession(container, generateParameters: parameters)
+        let settings = defaultSettings()
+        let session = ChatSession(
+            container,
+            generateParameters: parameters,
+            additionalContext: InferenceEngine.thinkingAdditionalContext(
+                for: entry, enabled: settings.localThinkingEnabled))
         let responseID = "chatcmpl-\(UUID().uuidString.prefix(12))"
         let created = Int(Date().timeIntervalSince1970)
 

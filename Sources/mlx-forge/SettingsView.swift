@@ -25,6 +25,7 @@ private struct ClaudeKeySettings: View {
     @Environment(AppState.self) private var app
     @State private var anthropicDraft = ""
     @State private var openRouterDraft = ""
+    @State private var openAIDraft = ""
     @State private var customOpenRouterModel = ""
     @State private var braveSearchDraft = ""
 
@@ -164,6 +165,11 @@ private struct ClaudeKeySettings: View {
             ) {
                 Toggle("Research mode (multi-search)", isOn: $app.braveSearchConfig.enableResearch)
                 Toggle("Inline citations", isOn: $app.braveSearchConfig.enableCitations)
+                    .disabled(app.braveSearchConfig.enableResearch)
+                    .help(
+                        app.braveSearchConfig.enableResearch
+                            ? "Citations are not supported in Brave Research mode."
+                            : "Include inline citation markers in answers.")
                 HStack(spacing: Theme.s2) {
                     SecureField(
                         app.hasBraveSearchKey ? "Replace key" : "BRAVE_SEARCH_API_KEY",
@@ -186,6 +192,47 @@ private struct ClaudeKeySettings: View {
                         } label: {
                             Image(systemName: "trash")
                         }
+                    }
+                }
+            }
+
+            providerCard(
+                title: "OpenAI",
+                icon: "brain.head.profile",
+                description: app.hasOpenAIKey
+                    ? "OpenAI key saved. Chat uses the Responses API with reasoning.effort and reasoning.summary."
+                    : "Stored in the macOS Keychain. Uses POST /v1/responses for reasoning models."
+            ) {
+                Picker("Model", selection: Binding(
+                    get: { app.openAIModelID ?? OpenAIClient.models[0].id },
+                    set: { app.setPrimaryOpenAIModel($0) }
+                )) {
+                    ForEach(OpenAIClient.models, id: \.id) { model in
+                        Text(model.label).tag(model.id)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                HStack(spacing: Theme.s2) {
+                    SecureField(
+                        app.hasOpenAIKey ? "Replace key (sk-…)" : "sk-…",
+                        text: $openAIDraft
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    .onSubmit { saveOpenAI() }
+                    Button("Save") { saveOpenAI() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.ember)
+                        .disabled(openAIDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if app.hasOpenAIKey {
+                        Button(role: .destructive) {
+                            app.setOpenAIKey(nil)
+                            openAIDraft = ""
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .help("Remove the stored OpenAI key")
                     }
                 }
             }
@@ -269,6 +316,16 @@ private struct ClaudeKeySettings: View {
         app.setOpenRouterKey(key)
         app.openRouterModelID = app.openRouterModelID ?? OpenRouterClient.defaultModelID
         openRouterDraft = ""
+    }
+
+    private func saveOpenAI() {
+        let key = openAIDraft.trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty else { return }
+        app.setOpenAIKey(key)
+        if app.openAIModelID == nil {
+            app.setPrimaryOpenAIModel(OpenAIClient.models[0].id)
+        }
+        openAIDraft = ""
     }
 
     private var customOpenRouterSelections: [String] {

@@ -12,6 +12,9 @@ enum Theme {
     static let s5: CGFloat = 24
     static let s6: CGFloat = 32
 
+    /// Fixed width for the Tuning panel — fully open or fully closed, no partial resize.
+    static let inspectorWidth: CGFloat = 340
+
     // Radius
     static let radiusSmall: CGFloat = 8
     static let radiusMedium: CGFloat = 12

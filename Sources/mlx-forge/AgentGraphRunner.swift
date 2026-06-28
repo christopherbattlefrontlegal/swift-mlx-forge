@@ -130,7 +130,9 @@ final class AgentGraphRunner {
             container,
             instructions: node.prompt.isEmpty ? nil : node.prompt,
             history: [],
-            generateParameters: InferenceEngine.parameters(from: app.settings))
+            generateParameters: InferenceEngine.parameters(from: app.settings),
+            additionalContext: InferenceEngine.thinkingAdditionalContext(
+                for: entry, enabled: app.settings.localThinkingEnabled))
 
         try await app.engine.gate.withTurn { [weak self] in
             for try await item in session.streamDetails(

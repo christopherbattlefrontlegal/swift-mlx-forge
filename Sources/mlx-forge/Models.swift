@@ -74,6 +74,21 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         return result
     }
 
+    /// Assistant answer text for clipboard — excludes `` reasoning segments.
+    var copyableText: String {
+        switch role {
+        case .user, .system:
+            return content
+        case .assistant:
+            let answers = segments.compactMap { segment -> String? in
+                if case .answer = segment.kind, !segment.text.isEmpty { return segment.text }
+                return nil
+            }
+            if !answers.isEmpty { return answers.joined(separator: "\n\n") }
+            return content
+        }
+    }
+
     struct Segment: Identifiable, Equatable {
         enum Kind: Equatable {
             case answer
@@ -96,6 +111,18 @@ struct Conversation: Identifiable, Codable, Equatable {
     var lastModelID: String?
 
     var isEmpty: Bool { messages.isEmpty }
+
+    /// User + assistant turns for clipboard (no system, no thinking blocks).
+    var copyableTranscript: String {
+        messages.compactMap { message -> String? in
+            guard message.role == .user || message.role == .assistant else { return nil }
+            let text = message.copyableText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            let role = message.role == .user ? "User" : "Assistant"
+            return "\(role):\n\(text)"
+        }
+        .joined(separator: "\n\n---\n\n")
+    }
 
     /// Auto-title from the first user message.
     mutating func refreshTitle() {
@@ -129,6 +156,8 @@ struct LocalModel: Identifiable, Equatable, Hashable {
     var isManaged: Bool
     /// Root folder to remove when deleting (cache `models--…` dir, not the snapshot).
     var deletableRoot: URL?
+    /// Sniffed at catalog scan from tokenizer files (nil for GGUF).
+    var chatTemplateCaps: ChatTemplateSniffer.Capabilities?
 
     var shortName: String {
         name.split(separator: "/").last.map(String.init) ?? name
@@ -292,8 +321,31 @@ struct GenerationSettings: Codable, Equatable {
     var repetitionPenalty: Double = 1.0
     var systemPrompt: String = ""
     var maxKVSize: Int = 0  // 0 = unlimited
+    /// When true, surface reasoning blocks in chat (local `` + Anthropic adaptive thinking).
+    var reasoningEnabled: Bool = true
+    /// For Qwen/QwQ MLX models: pass `enable_thinking` into `applyChatTemplate`.
+    var localThinkingEnabled: Bool = true
+    /// Cloud reasoning effort (Anthropic effort, OpenAI reasoning.effort, OpenRouter reasoning.effort).
+    var anthropicEffort: String = "high"
+    /// Request summarized thinking text from Anthropic (required on Opus 4.8+ to see reasoning).
+    var anthropicThinkingSummarized: Bool = true
 
     init() {}
+
+    /// Factory defaults for sampling sliders (does not touch system prompt or cloud reasoning).
+    static let samplingDefaults = GenerationSettings()
+
+    mutating func resetSamplingToDefaults() {
+        let defaults = Self.samplingDefaults
+        weightLoadPolicy = defaults.weightLoadPolicy
+        temperature = defaults.temperature
+        topP = defaults.topP
+        topK = defaults.topK
+        minP = defaults.minP
+        maxTokens = defaults.maxTokens
+        repetitionPenalty = defaults.repetitionPenalty
+        maxKVSize = defaults.maxKVSize
+    }
 
     // Tolerant decoding so new fields never invalidate an older settings file.
     init(from decoder: Decoder) throws {
@@ -312,6 +364,36 @@ struct GenerationSettings: Codable, Equatable {
         systemPrompt =
             (try? c.decodeIfPresent(String.self, forKey: .systemPrompt)).flatMap { $0 } ?? ""
         maxKVSize = (try? c.decodeIfPresent(Int.self, forKey: .maxKVSize)).flatMap { $0 } ?? 0
+        reasoningEnabled =
+            (try? c.decodeIfPresent(Bool.self, forKey: .reasoningEnabled)).flatMap { $0 } ?? true
+        localThinkingEnabled =
+            (try? c.decodeIfPresent(Bool.self, forKey: .localThinkingEnabled)).flatMap { $0 }
+            ?? true
+        anthropicEffort =
+            (try? c.decodeIfPresent(String.self, forKey: .anthropicEffort)).flatMap { $0 } ?? "high"
+        anthropicThinkingSummarized =
+            (try? c.decodeIfPresent(Bool.self, forKey: .anthropicThinkingSummarized))
+            .flatMap { $0 } ?? true
+    }
+}
+
+/// Shared effort knob for Anthropic, OpenAI Responses API, and OpenRouter reasoning.
+/// Stored in `GenerationSettings.anthropicEffort` for backward-compatible persistence.
+enum CloudReasoningEffort: String, CaseIterable, Identifiable, Codable {
+    case none, minimal, low, medium, high, xhigh, max
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none: return "None"
+        case .minimal: return "Minimal"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        case .xhigh: return "Extra high"
+        case .max: return "Max"
+        }
     }
 }
 

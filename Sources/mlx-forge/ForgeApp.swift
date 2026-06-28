@@ -11,6 +11,9 @@ struct ForgeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        // Load Keychain secrets once before AppState touches any has*Key checks.
+        SecretsStore.warmCache()
+
         // Required when running as a bare SPM executable (no bundle): give the
         // process a real UI lifecycle so windows, menus, and focus work.
         NSApplication.shared.setActivationPolicy(.regular)
@@ -68,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockFlame.start()
+        AppState.shared.beginMCP()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -96,6 +100,10 @@ struct RootView: View {
         }
         .sheet(isPresented: $app.showHeadlessHelper) {
             LauncherView()
+                .environment(app)
+        }
+        .sheet(isPresented: $app.showDesignPrompt) {
+            DesignPromptView()
                 .environment(app)
         }
         .toolbar {

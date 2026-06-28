@@ -10,6 +10,7 @@ struct TuningInspector: View {
     @State private var presetNameDraft = ""
     @AppStorage("inspector.serverExpanded") private var serverExpanded = false
     @AppStorage("inspector.samplingExpanded") private var samplingExpanded = true
+    @AppStorage("inspector.reasoningExpanded") private var reasoningExpanded = true
     @AppStorage("inspector.promptExpanded") private var promptExpanded = true
     @AppStorage("inspector.modelsExpanded") private var modelsExpanded = true
     @AppStorage("inspector.mcpExpanded") private var mcpExpanded = true
@@ -25,7 +26,8 @@ struct TuningInspector: View {
                 ) {
                     ParameterSlider(
                         label: "Temperature", value: $app.settings.temperature,
-                        range: 0...2, hardLimit: 0...10, fractionDigits: 2)
+                        range: 0...1, hardLimit: 0...2, fractionDigits: 2)
+                        .help("Usual range 0–1. MLX allows up to 2 if you type it in.")
                     ParameterSlider(
                         label: "Top P", value: $app.settings.topP,
                         range: 0...1, hardLimit: 0...1, fractionDigits: 2)
@@ -42,16 +44,62 @@ struct TuningInspector: View {
                     IntField(
                         label: "Max KV cache", value: $app.settings.maxKVSize,
                         limit: 0...10_000_000, zeroMeans: "∞")
-                        .help("Caps context memory (tokens); ∞ keeps everything.")
-                    ParameterSlider(
-                        label: "Repetition penalty", value: $app.settings.repetitionPenalty,
-                        range: 1.0...1.5, hardLimit: 1.0...3.0, fractionDigits: 2)
+                        .help(
+                            "Caps how many past tokens stay in GPU memory (the KV cache). "
+                                + "0 = unlimited. Lower this if long chats run out of RAM.")
+                    RepetitionPenaltySlider(value: $app.settings.repetitionPenalty)
+                    Button("Reset sampling to defaults") {
+                        var next = app.settings
+                        next.resetSamplingToDefaults()
+                        app.settings = next
+                    }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help(
+                        "Temperature 0.7, top-p 0.95, repetition 1.0 (off), max tokens 4096, KV cache unlimited.")
                     Picker("API auto-load policy", selection: $app.settings.weightLoadPolicy) {
                         ForEach(WeightLoadPolicy.allCases) { policy in
                             Text(policy.label).tag(policy)
                         }
                     }
                     .help(WeightLoadPolicy.eager.help)
+                }
+
+                collapsibleSection(
+                    "Reasoning", icon: "brain", expanded: $reasoningExpanded,
+                    detail: reasoningSectionDetail
+                ) {
+                    localThinkingSection
+                    Toggle("Show reasoning in chat", isOn: $app.settings.reasoningEnabled)
+                        .help(
+                            "System prompt → user prompt → reasoning → answer. "
+                                + "For local Qwen models, use Thinking mode above to control whether the model thinks; "
+                                + "this toggle controls whether `` blocks appear in the transcript. "
+                                + "Claude: adaptive thinking + effort. "
+                                + "OpenAI: reasoning.effort + summary. "
+                                + "OpenRouter: reasoning.effort.")
+                    if app.settings.reasoningEnabled {
+                        Picker(
+                            "Cloud reasoning effort",
+                            selection: Binding(
+                                get: {
+                                    CloudReasoningEffort(rawValue: app.settings.anthropicEffort)
+                                        ?? .high
+                                },
+                                set: { app.settings.anthropicEffort = $0.rawValue })
+                        ) {
+                            ForEach(CloudReasoningEffort.allCases) { level in
+                                Text(level.label).tag(level)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        Toggle(
+                            "Reasoning summary (Claude + OpenAI)",
+                            isOn: $app.settings.anthropicThinkingSummarized)
+                        .help(
+                            "Claude Opus 4.8+ and OpenAI Responses API reasoning.summary: auto.")
+                    }
                 }
 
                 collapsibleSection(
@@ -221,6 +269,59 @@ struct TuningInspector: View {
         }
     }
 
+    @ViewBuilder
+    private var localThinkingSection: some View {
+        if let active = app.engine.activeModel, !active.model.isGGUF {
+            if active.chatTemplateSupportsThinkingToggle {
+                Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
+                    .disabled(active.chatTemplateThinkingOnly)
+                    .help(
+                        active.chatTemplateThinkingOnly
+                            ? "This model's chat template is thinking-only — enable_thinking cannot be turned off."
+                            : "Passes enable_thinking into the chat template. On = reasoning blocks; off = direct answers.")
+            } else if active.chatTemplateThinkingBuiltIn {
+                HStack {
+                    Text("Thinking mode")
+                        .font(.callout)
+                    Spacer()
+                    Text("Always on")
+                        .font(.callout)
+                        .foregroundStyle(Theme.emberGlow)
+                }
+                .help(
+                    "This checkpoint's chat template always opens a reasoning block at generation time "
+                        + "(typical stock Qwen3). Turn on \"Show reasoning in chat\" below to see it.")
+            } else if active.chatTemplateHasTemplate {
+                Text(
+                    "No enable_thinking toggle in this model's template — reasoning follows the checkpoint as-is.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(
+                    "No chat template on this model (e.g. ASR/embedding) — thinking controls don't apply.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var reasoningSectionDetail: String {
+        var parts: [String] = []
+        if let active = app.engine.activeModel, !active.model.isGGUF {
+            if active.chatTemplateSupportsThinkingToggle {
+                parts.append(app.settings.localThinkingEnabled ? "think" : "no-think")
+            } else if active.chatTemplateThinkingBuiltIn {
+                parts.append("think·on")
+            } else if !active.chatTemplateHasTemplate {
+                parts.append("n/a")
+            }
+        }
+        parts.append(app.settings.reasoningEnabled ? "show · \(app.settings.anthropicEffort)" : "hidden")
+        return parts.joined(separator: " · ")
+    }
+
     private var serverRunning: Bool {
         if case .running = app.server.state { return true }
         return false
@@ -263,6 +364,16 @@ struct TuningInspector: View {
             set: { newValue in
                 var next = app.settings
                 next.systemPrompt = newValue
+                app.settings = next
+            })
+    }
+
+    private var localThinkingEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { app.settings.localThinkingEnabled },
+            set: { newValue in
+                var next = app.settings
+                next.localThinkingEnabled = newValue
                 app.settings = next
             })
     }
@@ -878,6 +989,47 @@ struct SystemPromptEditor: View {
 
 /// Slider with a directly-editable numeric field. Typed values may exceed the
 /// slider's visual range (up to `hardLimit`); the slider just pins at its end.
+/// Repetition penalty: 1.0 = off (MLX standard). Useful tuning is usually 1.05–1.15.
+private struct RepetitionPenaltySlider: View {
+    @Binding var value: Double
+
+    var body: some View {
+        VStack(spacing: Theme.s1) {
+            HStack {
+                Text("Repetition penalty")
+                    .font(.callout)
+                Spacer()
+                if value <= 1.0001 {
+                    Text("off")
+                        .font(.callout)
+                        .foregroundStyle(Theme.emberGlow)
+                }
+                TextField(
+                    "", value: Binding(
+                        get: { value },
+                        set: { value = min(max($0, 1.0), 2.0) }),
+                    format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.plain)
+                    .multilineTextAlignment(.trailing)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 64)
+                    .padding(.horizontal, Theme.s1)
+                    .background(.white.opacity(0.06))
+                    .clipShape(.rect(cornerRadius: 4))
+            }
+            Slider(
+                value: Binding(
+                    get: { min(max(value, 1.0), 1.2) },
+                    set: { value = $0 }),
+                in: 1.0...1.2)
+                .tint(Theme.ember)
+                .controlSize(.small)
+        }
+        .help("1.0 = off. Values above 1.0 discourage repetition (try 1.05–1.1).")
+    }
+}
+
 struct ParameterSlider: View {
     let label: String
     @Binding var value: Double

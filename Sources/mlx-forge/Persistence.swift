@@ -25,6 +25,12 @@ enum ForgePaths {
     static var settingsFile: URL {
         appSupport.appendingPathComponent("settings.json")
     }
+
+    /// User-editable MCP server list. Always under Application Support so launch
+    /// never blocks on an external dev volume path baked into Info.plist.
+    static var mcpConfigFile: URL {
+        appSupport.appendingPathComponent("mcp.json")
+    }
 }
 
 struct PersistedState: Codable {

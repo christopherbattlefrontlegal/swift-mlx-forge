@@ -18,8 +18,15 @@ final class GGUFRuntime: @unchecked Sendable {
     private let llm: LLM
     private let fileURL: URL
 
-    init?(fileURL: URL, maxTokens: Int32 = 4096) {
-        guard let llm = LLM(from: fileURL, maxTokenCount: maxTokens) else { return nil }
+    init?(fileURL: URL, maxTokens: Int32 = 8192) {
+        guard fileURL.isFileURL else { return nil }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fileURL.path) else { return nil }
+        guard fm.isReadableFile(atPath: fileURL.path)
+            || FileHandle(forReadingAtPath: fileURL.path) != nil
+        else { return nil }
+        let ctx = max(2048, min(maxTokens, 131_072))
+        guard let llm = LLM(from: fileURL, maxTokenCount: ctx) else { return nil }
         self.fileURL = fileURL
         self.llm = llm
     }
@@ -32,8 +39,15 @@ final class GGUFRuntime: @unchecked Sendable {
         let system = (system?.isEmpty == false) ? system : nil
         if name.contains("mistral") { return .mistral }
         if name.contains("gemma") { return .gemma }
+        if name.contains("deepseek") || name.contains("r1") || name.contains("qwen")
+            || name.contains("thinking")
+        {
+            return .chatML(system)
+        }
         if name.contains("llama") || name.contains("bonsai") { return .llama(system) }
         if name.contains("alpaca") { return .alpaca(system) }
+        if name.contains("mistral") { return .mistral }
+        if name.contains("gemma") { return .gemma }
         return .chatML(system)
     }
 

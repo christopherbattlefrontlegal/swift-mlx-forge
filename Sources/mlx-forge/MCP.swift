@@ -221,10 +221,19 @@ final class MCPManager {
 
     /// Choose the single Forge MCP config location.
     private static func resolveProjectConfigFile() -> URL {
-        if let configuredPath = Bundle.main.object(forInfoDictionaryKey: "ForgeMCPConfigPath") as? String {
+        let userConfig = ForgePaths.mcpConfigFile
+        seedUserConfigIfNeeded(at: userConfig)
+
+        // Dev builds launched from the repo can opt into a repo-local mcp.json.
+        if !Bundle.main.bundlePath.hasPrefix("/Applications/"),
+            let configuredPath = Bundle.main.object(forInfoDictionaryKey: "ForgeMCPConfigPath") as? String
+        {
             let trimmed = configuredPath.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                return URL(filePath: trimmed)
+                let configured = URL(filePath: trimmed)
+                if FileManager.default.fileExists(atPath: configured.path) {
+                    return configured
+                }
             }
         }
 
@@ -233,8 +242,18 @@ final class MCPManager {
             return existing
         }
 
-        let localDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        return localDir.appendingPathComponent("mcp.json")
+        return userConfig
+    }
+
+    /// Copies the bundled template into Application Support on first launch.
+    private static func seedUserConfigIfNeeded(at url: URL) {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        if let bundled = Bundle.main.url(forResource: "mcp", withExtension: "json") {
+            try? FileManager.default.copyItem(at: bundled, to: url)
+            return
+        }
+        let template = "{\n  \"mcpServers\": {\n  }\n}\n"
+        try? template.data(using: .utf8)?.write(to: url)
     }
 
     private static func discoverCandidateProjectConfigPaths() -> [URL] {

@@ -70,7 +70,8 @@ struct BraveAnswersClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-subscription-token")
 
-        let body: [String: Any] = [
+        // Research mode rejects enable_citations (Brave API validation 422).
+        var body: [String: Any] = [
             "model": "brave",
             "stream": true,
             "messages": [
@@ -78,10 +79,12 @@ struct BraveAnswersClient {
             ],
             "country": config.country,
             "language": config.language,
-            "enable_citations": config.enableCitations,
             "enable_entities": config.enableEntities,
             "enable_research": config.enableResearch,
         ]
+        if !config.enableResearch {
+            body["enable_citations"] = config.enableCitations
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response) = try await URLSession.shared.bytes(for: request)

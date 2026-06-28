@@ -423,6 +423,43 @@ struct CodeBlock: View {
     }
 }
 
+// MARK: - Copy
+
+/// LM Studio–style copy control — icon-only or labeled.
+struct CopyClipButton: View {
+    var label: String? = nil
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            guard !text.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task {
+                try? await Task.sleep(for: .seconds(1.2))
+                copied = false
+            }
+        } label: {
+            if let label {
+                Label(
+                    copied ? "Copied" : label,
+                    systemImage: copied ? "checkmark" : "square.on.square")
+                    .font(.caption.weight(.medium))
+            } else {
+                Image(systemName: copied ? "checkmark" : "square.on.square")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 28, height: 28)
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(copied ? Theme.okGreen : .secondary)
+        .help(copied ? "Copied" : (label ?? "Copy"))
+        .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+}
+
 // MARK: - Small bits
 
 struct StatChip: View {

@@ -2,6 +2,7 @@
 //
 // Uses OpenRouter's OpenAI-compatible chat completions endpoint:
 // https://openrouter.ai/api/v1/chat/completions
+// Reasoning: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
 
 import Foundation
 
@@ -20,6 +21,31 @@ enum OpenRouterError: LocalizedError {
             return "OpenRouter stream error: \(message)"
         }
     }
+}
+
+/// OpenRouter unified `reasoning.effort` values.
+enum OpenRouterReasoningEffort: String, CaseIterable, Identifiable, Codable {
+    case none, minimal, low, medium, high, xhigh, max
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none: return "None"
+        case .minimal: return "Minimal"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        case .xhigh: return "Extra high"
+        case .max: return "Max"
+        }
+    }
+}
+
+struct OpenRouterStreamConfig: Equatable {
+    var reasoningEnabled: Bool = true
+    var effort: OpenRouterReasoningEffort = .high
+    var maxTokens: Int = 8192
 }
 
 struct OpenRouterClient {
@@ -83,7 +109,6 @@ struct OpenRouterClient {
     }
 
     var apiKey: String
-    var maxTokens: Int = 8192
 
     func fetchModels() async throws -> [ModelInfo] {
         guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
@@ -116,7 +141,7 @@ struct OpenRouterClient {
         model: String,
         system: String?,
         messages: [Message],
-        maxTokens: Int? = nil
+        config: OpenRouterStreamConfig = OpenRouterStreamConfig()
     ) async throws -> String {
         guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
 
@@ -133,14 +158,8 @@ struct OpenRouterClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
 
-        var body: [String: Any] = [
-            "model": model,
-            "stream": false,
-            "messages": payloadMessages,
-        ]
-        if model != "openrouter/fusion" {
-            body["max_tokens"] = maxTokens ?? self.maxTokens
-        }
+        var body = Self.baseBody(
+            model: model, messages: payloadMessages, config: config, stream: false)
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -152,9 +171,14 @@ struct OpenRouterClient {
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let choices = obj["choices"] as? [[String: Any]],
             let first = choices.first,
-            let message = first["message"] as? [String: Any],
-            let content = message["content"] as? String
+            let message = first["message"] as? [String: Any]
         else {
+            throw OpenRouterError.stream("empty completion response")
+        }
+        if let reasoning = message["reasoning"] as? String, !reasoning.isEmpty {
+            return "``\n\n" + (message["content"] as? String ?? "")
+        }
+        guard let content = message["content"] as? String else {
             throw OpenRouterError.stream("empty completion response")
         }
         return content
@@ -164,6 +188,7 @@ struct OpenRouterClient {
         model: String,
         system: String?,
         messages: [Message],
+        config: OpenRouterStreamConfig = OpenRouterStreamConfig(),
         sessionID: String? = nil,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws {
@@ -182,14 +207,8 @@ struct OpenRouterClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
 
-        var body: [String: Any] = [
-            "model": model,
-            "stream": true,
-            "messages": payloadMessages,
-        ]
-        if model != "openrouter/fusion" {
-            body["max_tokens"] = maxTokens
-        }
+        var body = Self.baseBody(
+            model: model, messages: payloadMessages, config: config, stream: true)
         if let sessionID, !sessionID.isEmpty {
             body["session_id"] = sessionID
         }
@@ -205,6 +224,8 @@ struct OpenRouterClient {
             }
             throw OpenRouterError.http(status, Self.extractError(from: data) ?? "request failed")
         }
+
+        var assembler = OpenRouterReasoningStreamAssembler()
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -222,12 +243,38 @@ struct OpenRouterClient {
             guard
                 let choices = obj["choices"] as? [[String: Any]],
                 let first = choices.first,
-                let delta = first["delta"] as? [String: Any],
-                let text = delta["content"] as? String,
-                !text.isEmpty
+                let delta = first["delta"] as? [String: Any]
             else { continue }
-            await onChunk(text)
+
+            if let chunk = assembler.ingest(delta: delta) {
+                await onChunk(chunk)
+            }
         }
+        if let tail = assembler.finish() {
+            await onChunk(tail)
+        }
+    }
+
+    private static func baseBody(
+        model: String,
+        messages: [[String: String]],
+        config: OpenRouterStreamConfig,
+        stream: Bool
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "model": model,
+            "stream": stream,
+            "messages": messages,
+        ]
+        if model != "openrouter/fusion" {
+            body["max_tokens"] = config.maxTokens
+        }
+        if config.reasoningEnabled {
+            body["reasoning"] = ["effort": config.effort.rawValue, "exclude": false]
+        } else {
+            body["reasoning"] = ["effort": OpenRouterReasoningEffort.none.rawValue]
+        }
+        return body
     }
 
     private static func extractError(from data: Data) -> String? {
@@ -246,5 +293,53 @@ struct OpenRouterClient {
             }
         }
         return nil
+    }
+}
+
+/// Wraps OpenRouter reasoning fields into `` markers for the chat UI.
+private struct OpenRouterReasoningStreamAssembler {
+    private var thinkingOpen = false
+    private var thinkingClosed = false
+
+    mutating func ingest(delta: [String: Any]) -> String? {
+        if let details = delta["reasoning_details"] as? [[String: Any]] {
+            for detail in details {
+                let kind = detail["type"] as? String ?? ""
+                let text =
+                    (detail["text"] as? String)
+                    ?? (detail["summary"] as? String)
+                    ?? ""
+                if !text.isEmpty, kind.hasPrefix("reasoning") {
+                    return appendThinking(text)
+                }
+            }
+        }
+        if let reasoning = delta["reasoning"] as? String, !reasoning.isEmpty {
+            return appendThinking(reasoning)
+        }
+        if let content = delta["content"] as? String, !content.isEmpty {
+            var out = closeThinkingIfNeeded() ?? ""
+            out += content
+            return out.isEmpty ? nil : out
+        }
+        return nil
+    }
+
+    private mutating func appendThinking(_ text: String) -> String {
+        if !thinkingOpen {
+            thinkingOpen = true
+            return "``" + text
+        }
+        return text
+    }
+
+    private mutating func closeThinkingIfNeeded() -> String? {
+        guard thinkingOpen, !thinkingClosed else { return nil }
+        thinkingClosed = true
+        return "``\n\n"
+    }
+
+    mutating func finish() -> String? {
+        closeThinkingIfNeeded()
     }
 }

@@ -79,14 +79,15 @@ final class ModelStore {
     }
 
     /// Whether a Hugging Face token is stored in the Keychain.
-    private(set) var hasToken = SecretsStore.huggingFaceToken != nil
+    private(set) var hasToken = false
 
     func setToken(_ token: String?) {
         SecretsStore.huggingFaceToken = token
-        hasToken = SecretsStore.huggingFaceToken != nil
+        hasToken = SecretsStore.hasHuggingFaceToken
     }
 
     init() {
+        hasToken = SecretsStore.hasHuggingFaceToken
         refreshLocal()
     }
 
@@ -150,7 +151,7 @@ final class ModelStore {
             hasWeights(root)
         {
             return [
-                LocalModel(
+                makeLocalModel(
                     name: root.lastPathComponent,
                     directory: root,
                     sizeBytes: directorySize(root),
@@ -189,7 +190,7 @@ final class ModelStore {
                 // Plain model folder.
                 if hasWeights(entry) {
                     models.append(
-                        LocalModel(
+                        makeLocalModel(
                             name: entry.lastPathComponent,
                             directory: entry,
                             sizeBytes: directorySize(entry),
@@ -210,7 +211,7 @@ final class ModelStore {
     /// GGUF files in `dir`, descending one extra directory level (covers the
     /// common org/<model>-gguf/ layout).
     private nonisolated static func ggufModels(in dir: URL, depth: Int = 0) -> [LocalModel] {
-        guard depth <= 1,
+        guard depth <= 4,
             let items = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles])
@@ -232,14 +233,15 @@ final class ModelStore {
     private nonisolated static func ggufModel(file: URL) -> LocalModel {
         let size =
             (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-        return LocalModel(
+        return makeLocalModel(
             name: file.deletingPathExtension().lastPathComponent,
             directory: file,
             sizeBytes: size,
             architecture: "gguf · llama.cpp",
             quantization: ggufQuantization(from: file.lastPathComponent),
             isManaged: false,
-            deletableRoot: nil)
+            deletableRoot: nil,
+            isGGUF: true)
     }
 
     /// Pull "Q4_K_M" / "Q8_0" / "IQ2_XS" / "TQ1_0" / "F16" out of a filename.
@@ -288,7 +290,7 @@ final class ModelStore {
             hasWeights(snapshot)
         else { return nil }
 
-        return LocalModel(
+        return makeLocalModel(
             name: name,
             directory: snapshot,
             sizeBytes: directorySize(entry.appendingPathComponent("blobs")),
@@ -336,6 +338,34 @@ final class ModelStore {
             let bits = q["bits"] as? Int
         else { return nil }
         return "\(bits)-bit"
+    }
+
+    private nonisolated static func sniffTemplateCaps(
+        directory: URL, isGGUF: Bool
+    ) -> ChatTemplateSniffer.Capabilities? {
+        if isGGUF { return nil }
+        return ChatTemplateSniffer.sniff(modelDirectory: directory)
+    }
+
+    private nonisolated static func makeLocalModel(
+        name: String,
+        directory: URL,
+        sizeBytes: Int64,
+        architecture: String?,
+        quantization: String?,
+        isManaged: Bool,
+        deletableRoot: URL?,
+        isGGUF: Bool = false
+    ) -> LocalModel {
+        LocalModel(
+            name: name,
+            directory: directory,
+            sizeBytes: sizeBytes,
+            architecture: architecture,
+            quantization: quantization,
+            isManaged: isManaged,
+            deletableRoot: deletableRoot,
+            chatTemplateCaps: sniffTemplateCaps(directory: directory, isGGUF: isGGUF))
     }
 
     // MARK: - Hugging Face discovery

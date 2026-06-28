@@ -1,5 +1,6 @@
 // Forge — chat surface: transcript, streaming bubbles, composer, tuning inspector.
 
+import AppKit
 import SwiftUI
 
 struct ChatView: View {
@@ -12,27 +13,39 @@ struct ChatView: View {
 
     var body: some View {
         @Bindable var app = app
-        Group {
-            if let conversation = app.selectedConversation {
-                if conversation.isEmpty && !app.canChat {
-                    WelcomeView()
+        HStack(spacing: 0) {
+            Group {
+                if let conversation = app.selectedConversation {
+                    if conversation.isEmpty && !app.canChat {
+                        WelcomeView()
+                    } else {
+                        TranscriptView(conversation: conversation, onShowLargeText: { content in
+                            largeTextPopupContent = content
+                            showLargeTextPopup = true
+                        })
+                    }
                 } else {
-                    TranscriptView(conversation: conversation, onShowLargeText: { content in
-                        largeTextPopupContent = content
-                        showLargeTextPopup = true
-                    })
+                    WelcomeView()
                 }
-            } else {
-                WelcomeView()
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                ComposerView()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if app.showInspector {
+                TuningInspector()
+                    .frame(width: Theme.inspectorWidth)
+                    .frame(maxHeight: .infinity)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(.white.opacity(0.08))
+                            .frame(width: 1)
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            ComposerView()
-        }
-        .inspector(isPresented: $app.showInspector) {
-            TuningInspector()
-                .inspectorColumnWidth(min: 240, ideal: 280, max: 340)
-        }
+        .animation(.easeInOut(duration: 0.18), value: app.showInspector)
         .background(Theme.backgroundGradient)
         .sheet(isPresented: $showLargeTextPopup) {
             LargeTextView(text: largeTextPopupContent) {
@@ -90,15 +103,7 @@ struct WelcomeView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.ember)
 
-                    if let first = app.store.localModels.first {
-                        Button {
-                            app.engine.loadAndActivate(first)
-                        } label: {
-                            Label("Load \(first.shortName)", systemImage: "bolt.fill")
-                                .padding(.horizontal, Theme.s2)
-                        }
-                        .controlSize(.large)
-                    }
+
                 }
             }
             Spacer()
@@ -118,10 +123,25 @@ struct TranscriptView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Theme.s4) {
-                ForEach(conversation.messages) { message in
+                if !conversation.copyableTranscript.isEmpty {
+                    HStack {
+                        Spacer()
+                        CopyClipButton(
+                            label: "Copy all", text: conversation.copyableTranscript)
+                    }
+                    .padding(.bottom, Theme.s1)
+                }
+                ForEach(Array(conversation.messages.enumerated()), id: \.element.id) {
+                    index, message in
+                    let precedingUser =
+                        index > 0 && conversation.messages[index - 1].role == .user
+                        ? conversation.messages[index - 1].content : nil
                     MessageView(
                         message: message,
                         isStreaming: app.streamingMessageID == message.id,
+                        turnSystemPrompt: message.role == .assistant
+                            ? app.effectiveSystemPrompt(for: conversation) : nil,
+                        precedingUserPrompt: message.role == .assistant ? precedingUser : nil,
                         onShowLargeText: onShowLargeText)
                         .id(message.id)
                 }
@@ -138,13 +158,21 @@ struct TranscriptView: View {
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
+    /// System instructions sent before this assistant turn (delineated context).
+    var turnSystemPrompt: String? = nil
+    /// User message immediately before this assistant turn.
+    var precedingUserPrompt: String? = nil
     var onShowLargeText: (String) -> Void = { _ in }
 
     var body: some View {
         switch message.role {
         case .user:
-            HStack {
+            HStack(alignment: .top, spacing: Theme.s2) {
                 Spacer(minLength: 80)
+                VStack(alignment: .trailing, spacing: Theme.s1) {
+                    if !message.copyableText.isEmpty {
+                        CopyClipButton(text: message.copyableText)
+                    }
                 // Scrollable container for long user messages (pastes, logs, etc.).
                 // Internal ScrollView + maxHeight prevents the bubble (and transcript)
                 // from stretching the entire window. "View full" button appears for
@@ -180,9 +208,16 @@ struct MessageView: View {
                     RoundedRectangle(cornerRadius: Theme.radiusLarge)
                         .strokeBorder(.white.opacity(0.06), lineWidth: 1)
                 )
+                }
             }
         case .assistant:
             VStack(alignment: .leading, spacing: Theme.s2) {
+                if showsTurnContext {
+                    TurnContextPanel(
+                        systemPrompt: turnSystemPrompt ?? "",
+                        userPrompt: precedingUserPrompt ?? "",
+                        isGenerating: isStreaming && message.content.isEmpty)
+                }
                 header
                 bubble
                 if !isStreaming, message.tokensPerSecond != nil {
@@ -204,30 +239,47 @@ struct MessageView: View {
                 ProgressView()
                     .controlSize(.mini)
             }
+            Spacer(minLength: 0)
+            if !isStreaming, !message.copyableText.isEmpty {
+                CopyClipButton(text: message.copyableText)
+            }
         }
+    }
+
+    private var showsTurnContext: Bool {
+        let sys = turnSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let user = precedingUserPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !sys.isEmpty || !user.isEmpty
     }
 
     private var bubble: some View {
         VStack(alignment: .leading, spacing: Theme.s3) {
             if message.content.isEmpty && isStreaming {
-                Text("Thinking…")
+                Text("Reasoning…")
                     .font(.callout)
                     .foregroundStyle(.tertiary)
+            } else if !message.segments.isEmpty {
+                ForEach(message.segments) { segment in
+                    switch segment.kind {
+                    case .thinking(let done):
+                        ThinkingBlock(
+                            text: segment.text,
+                            done: done && !isStreaming,
+                            isStreaming: isStreaming && !done)
+                    case .answer:
+                        if segment.text.isEmpty && isStreaming {
+                            EmptyView()
+                        } else {
+                            MarkdownText(text: segment.text)
+                        }
+                    }
+                }
             } else if isStreaming {
                 Text(message.content)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if message.segments.isEmpty {
-                MarkdownText(text: message.content)
             } else {
-                ForEach(message.segments) { segment in
-                    switch segment.kind {
-                    case .thinking(let done):
-                        ThinkingBlock(text: segment.text, done: done, isStreaming: isStreaming)
-                    case .answer:
-                        MarkdownText(text: segment.text)
-                    }
-                }
+                MarkdownText(text: message.content)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -258,6 +310,76 @@ struct MessageView: View {
             }
         }
         .padding(.leading, Theme.s1)
+    }
+}
+
+/// Shows the ordered turn context: system prompt received, then user prompt, before reasoning.
+private struct TurnContextPanel: View {
+    let systemPrompt: String
+    let userPrompt: String
+    var isGenerating: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            if !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                contextStep(
+                    number: 1, title: "System prompt", icon: "gearshape",
+                    body: systemPrompt)
+            }
+            if !userPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                contextStep(
+                    number: systemPrompt.isEmpty ? 1 : 2, title: "User prompt",
+                    icon: "person.fill", body: userPrompt)
+            }
+            if isGenerating {
+                HStack(spacing: Theme.s2) {
+                    Image(systemName: "brain")
+                        .foregroundStyle(Theme.emberGlow)
+                    Text("Reasoning…")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                .padding(.horizontal, Theme.s3)
+                .padding(.vertical, Theme.s2)
+            }
+        }
+        .padding(Theme.s3)
+        .background(.white.opacity(0.025))
+        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusSmall)
+                .strokeBorder(.white.opacity(0.05), lineWidth: 1)
+        )
+    }
+
+    private func contextStep(
+        number: Int, title: String, icon: String, body: String
+    ) -> some View {
+        DisclosureGroup {
+            Text(body)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, Theme.s1)
+        } label: {
+            HStack(spacing: Theme.s2) {
+                Text("\(number)")
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .foregroundStyle(Theme.ember)
+                    .frame(width: 18, height: 18)
+                    .background(Theme.ember.opacity(0.15))
+                    .clipShape(Circle())
+                Image(systemName: icon)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -365,6 +487,7 @@ struct ComposerView: View {
     @State private var showAPIModelPicker = false
     @State private var showOpenRouterModelPicker = false
     @State private var showAnthropicModelPicker = false
+    @State private var showOpenAIModelPicker = false
     @State private var customOpenRouterModel = ""
 
     var body: some View {
@@ -517,6 +640,14 @@ struct ComposerView: View {
                         .help("Prompt library — add your prompting folders and select a prompt for the chat (categorized scroll menu)")
 
                         Button {
+                            app.showDesignPrompt = true
+                        } label: {
+                            ToolbarIcon("paintpalette.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Design prompt generator — build structured web/UI design prompts in a WebView, then paste into chat")
+
+                        Button {
                             app.braveSearchEnabled.toggle()
                         } label: {
                             ToolbarIcon("globe")
@@ -665,6 +796,46 @@ struct ComposerView: View {
                                 selection: Binding(
                                     get: { app.claudeModelID ?? AnthropicClient.models[0].id },
                                     set: { app.claudeModelID = $0 }),
+                                customModel: .constant(""),
+                                allowsCustom: false)
+                        }
+
+                        Toggle("OpenAI", isOn: Binding(
+                            get: { app.openAIModelID != nil },
+                            set: { enabled in
+                                if enabled {
+                                    app.setPrimaryOpenAIModel(
+                                        app.openAIModelID ?? OpenAIClient.models[0].id)
+                                    showOpenAIModelPicker = true
+                                } else {
+                                    app.openAIModelID = nil
+                                }
+                            }
+                        ))
+                            .font(.callout.weight(.semibold))
+                            .controlSize(.regular)
+                            .toggleStyle(.switch)
+                            .help("OpenAI API key — Responses API with reasoning.effort")
+                            .popover(isPresented: $showOpenAIModelPicker, arrowEdge: .top) {
+                                CloudModelPicker(
+                                    title: "OpenAI Model",
+                                    systemImage: "brain.head.profile",
+                                    models: OpenAIClient.models,
+                                    selection: Binding(
+                                        get: { app.openAIModelID ?? OpenAIClient.models[0].id },
+                                        set: { app.setPrimaryOpenAIModel($0) }),
+                                    customModel: .constant(""),
+                                    allowsCustom: false)
+                            }
+
+                        if let openAIID = app.openAIModelID, !openAIID.isEmpty {
+                            cloudModelMenu(
+                                title: OpenAIClient.label(for: openAIID),
+                                systemImage: "brain.head.profile",
+                                models: OpenAIClient.models,
+                                selection: Binding(
+                                    get: { app.openAIModelID ?? OpenAIClient.models[0].id },
+                                    set: { app.setPrimaryOpenAIModel($0) }),
                                 customModel: .constant(""),
                                 allowsCustom: false)
                         }
@@ -956,6 +1127,9 @@ struct ComposerView: View {
         }
         if let openRouterID = app.openRouterModelID, !openRouterID.isEmpty {
             return "Message \(OpenRouterClient.label(for: openRouterID))…"
+        }
+        if let openAIID = app.openAIModelID, !openAIID.isEmpty {
+            return "Message \(OpenAIClient.label(for: openAIID))…"
         }
         if let claudeID = app.claudeModelID, !claudeID.isEmpty {
             return "Message \(AnthropicClient.label(for: claudeID))…"

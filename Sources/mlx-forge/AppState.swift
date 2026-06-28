@@ -24,7 +24,9 @@ final class AppState {
     }
     var settings = GenerationSettings() {
         didSet {
-            if oldValue.systemPrompt != settings.systemPrompt {
+            if oldValue.systemPrompt != settings.systemPrompt
+                || oldValue.localThinkingEnabled != settings.localThinkingEnabled
+            {
                 engine.invalidateChatSessions()
             }
             scheduleSave()
@@ -41,6 +43,8 @@ final class AppState {
     /// Stored with security-scoped bookmarks for sandbox persistence (like extra models).
     var promptDirectories: [URL] = []
     private var promptDirectoryBookmarks: [URL: Data] = [:]
+    /// Cached prompt index — refreshed off the hot path so SwiftUI body eval doesn't walk disks.
+    private var cachedPrompts: [(category: String, items: [(name: String, url: URL)])] = []
 
     /// User-granted folders exposed to the built-in Forge commander tools.
     var commanderDirectories: [URL] = [] {
@@ -81,52 +85,67 @@ final class AppState {
         }
         return []
     }() {
-        didSet {
-            let normalized = Self.uniqueModelIDs(openRouterModelIDs)
-            if normalized != openRouterModelIDs {
-                openRouterModelIDs = normalized
-                return
-            }
-            persistOpenRouterModelSelection()
-        }
+        didSet { persistOpenRouterModelSelection() }
     }
     var openRouterModelID: String? {
         get { openRouterModelIDs.first }
         set {
             if let newValue, !newValue.isEmpty {
-                openRouterModelIDs = [newValue]
+                assignOpenRouterModelIDs([newValue])
             } else {
-                openRouterModelIDs = []
+                assignOpenRouterModelIDs([])
             }
         }
     }
     private(set) var isOpenRouterGenerating = false
     private var openRouterTasks: [UUID: Task<Void, Never>] = [:]
 
-    var hasAnthropicKey: Bool { SecretsStore.anthropicAPIKey?.isEmpty == false }
+    /// When non-nil, chat is routed to the OpenAI Responses API.
+    var openAIModelID: String? = UserDefaults.standard.string(forKey: "openai.model") {
+        didSet {
+            if let openAIModelID {
+                UserDefaults.standard.set(openAIModelID, forKey: "openai.model")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "openai.model")
+            }
+        }
+    }
+    private(set) var isOpenAIGenerating = false
+    private var openAITask: Task<Void, Never>?
+
+    var hasAnthropicKey: Bool { SecretsStore.hasAnthropicKey }
     func setAnthropicKey(_ key: String?) {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
         SecretsStore.anthropicAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
-    var hasOpenRouterKey: Bool { SecretsStore.openRouterAPIKey?.isEmpty == false }
+    var hasOpenRouterKey: Bool { SecretsStore.hasOpenRouterKey }
     func setOpenRouterKey(_ key: String?) {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
         SecretsStore.openRouterAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
+    var hasOpenAIKey: Bool { SecretsStore.hasOpenAIKey }
+    func setOpenAIKey(_ key: String?) {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        SecretsStore.openAIAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+
     private var claudeSelected: Bool { (claudeModelID?.isEmpty == false) }
     private var openRouterSelected: Bool { !openRouterModelIDs.isEmpty }
+    private var openAISelected: Bool { (openAIModelID?.isEmpty == false) }
     private var braveSearchSelected: Bool { braveSearchEnabled }
     /// Anything currently producing tokens (local OR Claude).
     var isBusy: Bool {
         engine.isGenerating || engine.isLoadingAnything || engine.materializingModelID != nil
-            || isClaudeGenerating || isOpenRouterGenerating || !inFlightAgentLabels.isEmpty
+            || isClaudeGenerating || isOpenRouterGenerating || isOpenAIGenerating
+            || !inFlightAgentLabels.isEmpty
             || isMCPRunning || isCodingOrchestratorRunning || isBraveSearchGenerating
     }
     /// Whether a chat target is selected.
     var canChat: Bool {
-        engine.activeModel != nil || claudeSelected || openRouterSelected || braveSearchSelected
+        engine.activeModel != nil || claudeSelected || openRouterSelected || openAISelected
+            || braveSearchSelected
     }
 
     var openRouterSelectionSummary: String {
@@ -145,11 +164,19 @@ final class AppState {
     }
 
     func setOpenRouterModel(_ id: String, selected: Bool) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
         if selected {
-            openRouterModelIDs = openRouterModelIDs + [id]
+            assignOpenRouterModelIDs(openRouterModelIDs + [trimmed])
         } else {
-            openRouterModelIDs.removeAll { $0 == id }
+            assignOpenRouterModelIDs(openRouterModelIDs.filter { $0 != trimmed })
         }
+    }
+
+    private func assignOpenRouterModelIDs(_ ids: [String]) {
+        let normalized = Self.uniqueModelIDs(ids)
+        guard normalized != openRouterModelIDs else { return }
+        openRouterModelIDs = normalized
     }
 
     private func persistOpenRouterModelSelection() {
@@ -163,18 +190,27 @@ final class AppState {
     }
 
     func selectAllOpenRouterModels() {
-        openRouterModelIDs = OpenRouterClient.models.map(\.id)
+        assignOpenRouterModelIDs(OpenRouterClient.models.map(\.id))
     }
 
     func clearOpenRouterModels() {
-        openRouterModelIDs = []
+        assignOpenRouterModelIDs([])
     }
 
     /// Use a single OpenRouter model for chat (clears multi-select).
     func setPrimaryOpenRouterModel(_ id: String) {
         claudeModelID = nil
+        openAIModelID = nil
         engine.activeModelID = nil
-        openRouterModelIDs = [id.trimmingCharacters(in: .whitespacesAndNewlines)]
+        assignOpenRouterModelIDs([id])
+    }
+
+    /// Use a single OpenAI model for chat (clears other cloud/local selection).
+    func setPrimaryOpenAIModel(_ id: String) {
+        claudeModelID = nil
+        openRouterModelIDs = []
+        engine.activeModelID = nil
+        openAIModelID = id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var openRouterCatalog: [OpenRouterClient.ModelInfo] = []
@@ -283,7 +319,7 @@ final class AppState {
         codingOrchestratorTask?.cancel()
     }
 
-    var hasBraveSearchKey: Bool { SecretsStore.braveSearchAPIKey?.isEmpty == false }
+    var hasBraveSearchKey: Bool { SecretsStore.hasBraveSearchKey }
     func setBraveSearchKey(_ key: String?) {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
         SecretsStore.braveSearchAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
@@ -307,6 +343,12 @@ final class AppState {
         return BraveSearchConfig()
     }() {
         didSet {
+            if braveSearchConfig.enableResearch && braveSearchConfig.enableCitations {
+                var config = braveSearchConfig
+                config.enableCitations = false
+                braveSearchConfig = config
+                return
+            }
             if let data = try? JSONEncoder().encode(braveSearchConfig) {
                 UserDefaults.standard.set(data, forKey: "braveSearch.config")
             }
@@ -383,6 +425,7 @@ final class AppState {
     var showLauncher = false
     var showInspector = true
     var showHeadlessHelper = false
+    var showDesignPrompt = false
 
     var composerText = ""
 
@@ -401,6 +444,7 @@ final class AppState {
         case local(modelID: String, label: String)
         case claude(modelID: String)
         case openRouter(modelID: String)
+        case openAI(modelID: String)
 
         var modelName: String {
             switch self {
@@ -410,6 +454,8 @@ final class AppState {
                 return AnthropicClient.label(for: modelID)
             case .openRouter(let modelID):
                 return OpenRouterClient.label(for: modelID)
+            case .openAI(let modelID):
+                return OpenAIClient.label(for: modelID)
             }
         }
     }
@@ -434,6 +480,8 @@ final class AppState {
     }
 
     private init() {
+        SecretsStore.warmCache()
+
         let state = Persistence.loadState()
         let persistedSettings = Persistence.loadSettings()
         conversations = state.conversations
@@ -443,16 +491,12 @@ final class AppState {
         commanderDirectories = resolveCommanderDirectories(from: persistedSettings)
         mcp.commanderRoots = commanderDirectories
         lastPromptContent = persistedSettings.lastPromptContent
-        mcp.start()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(750))
-            self?.mcp.connectAvailableServers()
-        }
 
         server.engine = engine
         server.store = store
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
         engine.weightLoadPolicy = { [weak self] in self?.settings.weightLoadPolicy ?? .eager }
+        engine.generationSettings = { [weak self] in self?.settings ?? GenerationSettings() }
 
         // Models are NOT restored across launches: quitting Forge means the
         // models are gone, and a fresh launch starts at zero memory. Loading
@@ -474,6 +518,22 @@ final class AppState {
         serverEnabled = persistedSettings.serverEnabled
         if serverEnabled {
             server.start(port: UInt16(clamping: serverPort))
+        }
+
+        assignOpenRouterModelIDs(openRouterModelIDs)
+        refreshPrompts()
+    }
+
+    private var didBeginMCP = false
+
+    /// Deferred past first frame so AppState init never blocks the window or Dock flame.
+    func beginMCP() {
+        guard !didBeginMCP else { return }
+        didBeginMCP = true
+        mcp.start()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            self?.mcp.connectAvailableServers()
         }
     }
 
@@ -576,12 +636,14 @@ final class AppState {
         if !promptDirectories.contains(url) {
             promptDirectories.append(url)
         }
+        refreshPrompts()
         scheduleSave()
     }
 
     func removePromptDirectory(_ url: URL) {
         promptDirectories.removeAll { $0 == url }
         promptDirectoryBookmarks[url] = nil
+        refreshPrompts()
         scheduleSave()
     }
 
@@ -614,19 +676,36 @@ final class AppState {
     /// Categories are derived from immediate parent folder names (user organizes subfolders).
     /// Returns [(category, [(name, url)]) ] sorted.
     func availablePrompts() -> [(category: String, items: [(name: String, url: URL)])] {
+        cachedPrompts
+    }
+
+    func refreshPrompts() {
+        let directories = promptDirectories
+        Task.detached(priority: .utility) { [weak self] in
+            let indexed = Self.scanPromptDirectories(directories)
+            await MainActor.run { self?.cachedPrompts = indexed }
+        }
+    }
+
+    private nonisolated static func scanPromptDirectories(
+        _ directories: [URL]
+    ) -> [(category: String, items: [(name: String, url: URL)])] {
         var grouped: [String: [(String, URL)]] = [:]
-        for dir in promptDirectories {
+        for dir in directories {
             _ = dir.startAccessingSecurityScopedResource()
             defer { dir.stopAccessingSecurityScopedResource() }
-            guard let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey]) else { continue }
+            guard let enumerator = FileManager.default.enumerator(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey]
+            ) else { continue }
             for case let fileURL as URL in enumerator {
                 var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), !isDir.boolValue {
-                    // Treat as prompt file (any text file; user can name .md/.txt or whatever)
+                if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir),
+                    !isDir.boolValue
+                {
                     let category = fileURL.deletingLastPathComponent().lastPathComponent
                     let name = fileURL.deletingPathExtension().lastPathComponent
-                    if grouped[category] == nil { grouped[category] = [] }
-                    grouped[category]!.append((name, fileURL))
+                    grouped[category, default: []].append((name, fileURL))
                 }
             }
         }
@@ -698,6 +777,60 @@ final class AppState {
         return systemPromptWithMCPInstructions(base: base, tools: tools)
     }
 
+    /// Active system instructions for UI delineation and new turns.
+    func effectiveSystemPrompt(for conversation: Conversation) -> String {
+        baseSystemPrompt(for: conversation)
+    }
+
+    private var cloudReasoningEffort: CloudReasoningEffort {
+        CloudReasoningEffort(rawValue: settings.anthropicEffort) ?? .high
+    }
+
+    private var anthropicStreamConfig: AnthropicStreamConfig {
+        AnthropicStreamConfig(
+            reasoningEnabled: settings.reasoningEnabled,
+            effort: Self.anthropicEffort(from: cloudReasoningEffort),
+            thinkingSummarized: settings.anthropicThinkingSummarized,
+            maxTokens: settings.maxTokens > 0 ? settings.maxTokens : 8192)
+    }
+
+    private var openRouterStreamConfig: OpenRouterStreamConfig {
+        OpenRouterStreamConfig(
+            reasoningEnabled: settings.reasoningEnabled,
+            effort: Self.openRouterEffort(from: cloudReasoningEffort),
+            maxTokens: settings.maxTokens > 0 ? settings.maxTokens : 8192)
+    }
+
+    private var openAIStreamConfig: OpenAIStreamConfig {
+        OpenAIStreamConfig(
+            reasoningEnabled: settings.reasoningEnabled,
+            effort: Self.openAIEffort(from: cloudReasoningEffort),
+            reasoningSummary: settings.anthropicThinkingSummarized,
+            maxOutputTokens: settings.maxTokens > 0 ? settings.maxTokens : 16_384)
+    }
+
+    private static func anthropicEffort(from cloud: CloudReasoningEffort) -> AnthropicEffort {
+        switch cloud {
+        case .none, .minimal: return .low
+        case .low: return .low
+        case .medium: return .medium
+        case .high: return .high
+        case .xhigh: return .xhigh
+        case .max: return .max
+        }
+    }
+
+    private static func openRouterEffort(from cloud: CloudReasoningEffort) -> OpenRouterReasoningEffort {
+        OpenRouterReasoningEffort(rawValue: cloud.rawValue) ?? .high
+    }
+
+    private static func openAIEffort(from cloud: CloudReasoningEffort) -> OpenAIReasoningEffort {
+        switch cloud {
+        case .max: return .xhigh
+        default: return OpenAIReasoningEffort(rawValue: cloud.rawValue) ?? .medium
+        }
+    }
+
     /// Inspector `settings.systemPrompt` wins over per-conversation copies saved at creation.
     private func baseSystemPrompt(for conversation: Conversation) -> String {
         let global = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -749,10 +882,11 @@ final class AppState {
 
     var canSend: Bool {
         let hasText = !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if claudeSelected || openRouterSelected || braveSearchSelected {
+        if claudeSelected || openRouterSelected || openAISelected || braveSearchSelected {
             guard !isBusy && hasText else { return false }
             if claudeSelected && !hasAnthropicKey { return false }
             if openRouterSelected && !hasOpenRouterKey { return false }
+            if openAISelected && !hasOpenAIKey { return false }
             if braveSearchSelected && !hasBraveSearchKey { return false }
             return true
         }
@@ -772,10 +906,11 @@ final class AppState {
         userMessage.attachedImageData = images
         conversation.messages.append(userMessage)
 
-        if claudeSelected || openRouterSelected || braveSearchSelected {
+        if claudeSelected || openRouterSelected || openAISelected || braveSearchSelected {
             let selectedModels = openRouterModelIDs
             var openRouterTargets: [(modelID: String, messageID: UUID)] = []
             var claudeTarget: (modelID: String, messageID: UUID)?
+            var openAITarget: (modelID: String, messageID: UUID)?
             var braveTarget: UUID?
             if let claudeID = claudeModelID, !claudeID.isEmpty {
                 var assistant = ChatMessage(role: .assistant, content: "")
@@ -789,6 +924,12 @@ final class AppState {
                 conversation.messages.append(assistant)
                 openRouterTargets.append((modelID, assistant.id))
             }
+            if let openAIID = openAIModelID, !openAIID.isEmpty {
+                var assistant = ChatMessage(role: .assistant, content: "")
+                assistant.modelName = OpenAIClient.label(for: openAIID)
+                conversation.messages.append(assistant)
+                openAITarget = (openAIID, assistant.id)
+            }
             if braveSearchSelected {
                 var assistant = ChatMessage(role: .assistant, content: "")
                 assistant.modelName = braveSearchModeLabel
@@ -798,12 +939,14 @@ final class AppState {
             conversation.refreshTitle()
             conversation.updatedAt = Date()
             conversation.lastModelID =
-                claudeTarget?.modelID ?? selectedModels.first ?? (braveSearchSelected ? "brave" : nil)
+                claudeTarget?.modelID ?? selectedModels.first ?? openAITarget?.modelID
+                ?? (braveSearchSelected ? "brave" : nil)
             selectedConversation = conversation
 
             let conversationID = conversation.id
             streamingMessageID =
-                braveTarget ?? openRouterTargets.last?.messageID ?? claudeTarget?.messageID
+                braveTarget ?? openAITarget?.messageID ?? openRouterTargets.last?.messageID
+                ?? claudeTarget?.messageID
             if let claudeTarget {
                 streamClaude(
                     model: claudeTarget.modelID, history: historySnapshot, prompt: prompt,
@@ -813,6 +956,11 @@ final class AppState {
                 streamOpenRouter(
                     model: target.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: target.messageID)
+            }
+            if let openAITarget {
+                streamOpenAI(
+                    model: openAITarget.modelID, history: historySnapshot, prompt: prompt,
+                    conversationID: conversationID, messageID: openAITarget.messageID)
             }
             if let braveTarget {
                 streamBraveSearch(
@@ -1059,7 +1207,10 @@ final class AppState {
         let sys = await mcpEnrichedSystemPrompt(for: history)
         let client = AnthropicClient(apiKey: key)
         do {
-            try await client.stream(model: model, system: sys, messages: msgs) { [weak self] delta in
+            try await client.stream(
+                model: model, system: sys, messages: msgs,
+                config: anthropicStreamConfig
+            ) { [weak self] delta in
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             }
         } catch is CancellationError {
@@ -1110,6 +1261,7 @@ final class AppState {
                 model: model,
                 system: sys,
                 messages: msgs,
+                config: openRouterStreamConfig,
                 sessionID: conversationID.uuidString
             ) { [weak self] delta in
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
@@ -1169,7 +1321,10 @@ final class AppState {
                 system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
             }
             do {
-                try await client.stream(model: model, system: system, messages: messages) { delta in
+                try await client.stream(
+                    model: model, system: system, messages: messages,
+                    config: self?.anthropicStreamConfig ?? AnthropicStreamConfig()
+                ) { delta in
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
             } catch is CancellationError {
@@ -1247,6 +1402,7 @@ final class AppState {
                     model: model,
                     system: system,
                     messages: messages,
+                    config: self?.openRouterStreamConfig ?? OpenRouterStreamConfig(),
                     sessionID: conversationID.uuidString
                 ) { delta in
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
@@ -1273,6 +1429,85 @@ final class AppState {
             if allowMCPFollowup {
                 _ = await self?.handleMCPToolRequestIfNeeded(
                     backend: .openRouter(modelID: model),
+                    history: history,
+                    originalPrompt: prompt,
+                    images: [],
+                    conversationID: conversationID,
+                    messageID: messageID)
+            }
+            self?.scheduleSave()
+        }
+    }
+
+    /// Routes a chat turn to the OpenAI Responses API and streams deltas into the message.
+    private func streamOpenAI(
+        model: String, history: Conversation, prompt: String,
+        conversationID: UUID, messageID: UUID,
+        allowMCPFollowup: Bool = true
+    ) {
+        guard let key = SecretsStore.openAIAPIKey, !key.isEmpty else {
+            appendToMessage(conversationID: conversationID, messageID: messageID) {
+                $0.content = "⚠️ No OpenAI API key set — add one in Settings (⌘,)."
+                $0.isError = true
+            }
+            isOpenAIGenerating = false
+            streamingMessageID = nil
+            return
+        }
+
+        var turns: [OpenAIClient.Turn] = history.messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return .init(role: "user", text: message.content)
+            case .assistant:
+                return (message.content.isEmpty || message.isErrorMessage)
+                    ? nil : .init(role: "assistant", text: message.content)
+            case .system:
+                return nil
+            }
+        }
+        turns.append(.init(role: "user", text: prompt))
+        let client = OpenAIClient(apiKey: key)
+
+        isOpenAIGenerating = true
+        openAITask = Task { [weak self] in
+            let system: String
+            if allowMCPFollowup {
+                system = await self?.mcpEnrichedSystemPrompt(for: history)
+                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            } else {
+                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            }
+            do {
+                try await client.stream(
+                    model: model,
+                    system: system,
+                    turns: turns,
+                    config: self?.openAIStreamConfig ?? OpenAIStreamConfig()
+                ) { delta in
+                    self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
+                }
+            } catch is CancellationError {
+                // User pressed stop — leave whatever streamed in place.
+            } catch {
+                self?.finishStreamBuffer(messageID)
+                self?.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                    if $0.content.isEmpty {
+                        $0.content = "⚠️ \(error.localizedDescription)"
+                        $0.isError = true
+                    } else {
+                        $0.content += "\n\n⚠️ OpenAI stream interrupted: \(error.localizedDescription)"
+                    }
+                }
+            }
+            self?.finishStreamBuffer(messageID)
+            self?.isOpenAIGenerating = false
+            if self?.streamingMessageID == messageID {
+                self?.streamingMessageID = nil
+            }
+            if allowMCPFollowup {
+                _ = await self?.handleMCPToolRequestIfNeeded(
+                    backend: .openAI(modelID: model),
                     history: history,
                     originalPrompt: prompt,
                     images: [],
@@ -1539,6 +1774,14 @@ final class AppState {
                 conversationID: conversationID,
                 messageID: messageID,
                 allowMCPFollowup: false)
+        case .openAI(let modelID):
+            streamOpenAI(
+                model: modelID,
+                history: history,
+                prompt: prompt,
+                conversationID: conversationID,
+                messageID: messageID,
+                allowMCPFollowup: false)
         }
     }
 
@@ -1747,10 +1990,12 @@ final class AppState {
         claudeTask?.cancel()
         openRouterTasks.values.forEach { $0.cancel() }
         openRouterTasks.removeAll()
+        openAITask?.cancel()
         braveSearchTask?.cancel()
         braveSearchTask = nil
         isClaudeGenerating = false
         isOpenRouterGenerating = false
+        isOpenAIGenerating = false
         isBraveSearchGenerating = false
         streamingMessageID = nil
         stopCodingOrchestrator()

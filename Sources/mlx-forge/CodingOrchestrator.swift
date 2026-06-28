@@ -95,7 +95,8 @@ enum CodingOrchestrator {
                     model: config.modelID,
                     system: phase.systemPrompt,
                     messages: [.init(role: "user", text: user)],
-                    maxTokens: client.maxTokens)
+                    config: OpenRouterStreamConfig(
+                        reasoningEnabled: false, maxTokens: 8192))
 
                 if phase == .coder || phase == .fixer {
                     artifact = reply
@@ -130,7 +131,8 @@ enum CodingOrchestrator {
                             text:
                                 "Task:\n\(task)\n\nLatest code:\n\(artifact)\n\nTester said:\n\(lastTester)\n\nSteer the next round.")
                     ],
-                    maxTokens: 2048)
+                    config: OpenRouterStreamConfig(
+                        reasoningEnabled: false, maxTokens: 2048))
                 await onPhaseComplete(round, .orchestrator, steer)
                 await onAppend("\n\n## Round \(round) · Orchestrator\n\n\(steer)\n")
                 artifact = artifact + "\n\n[Orchestrator steering]\n" + steer

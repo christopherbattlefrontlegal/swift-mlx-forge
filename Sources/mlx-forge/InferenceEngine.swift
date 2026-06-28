@@ -32,12 +32,21 @@ final class InferenceEngine {
         let gguf: GGUFRuntime?
         /// Whether the tokenizer chat template accepts a `system` role.
         let supportsChatSystemRole: Bool
+        /// Sniffed at load: tokenizer ships a chat template.
+        let chatTemplateHasTemplate: Bool
+        /// Sniffed at load: template defines `enable_thinking`.
+        let chatTemplateSupportsThinkingToggle: Bool
+        /// Sniffed at load: template has no off-branch for `enable_thinking`.
+        let chatTemplateThinkingOnly: Bool
+        /// Sniffed at load: generation prompt always opens a `` block.
+        let chatTemplateThinkingBuiltIn: Bool
 
         init(
             model: LocalModel, container: ModelContainer?, loadedAt: Date,
             weightLoadPolicy: WeightLoadPolicy? = nil,
             gguf: GGUFRuntime? = nil,
-            supportsChatSystemRole: Bool = true
+            supportsChatSystemRole: Bool = true,
+            templateCaps: ChatTemplateSniffer.Capabilities = ChatTemplateSniffer.Capabilities()
         ) {
             self.model = model
             self.container = container
@@ -45,6 +54,19 @@ final class InferenceEngine {
             self.weightLoadPolicy = weightLoadPolicy
             self.gguf = gguf
             self.supportsChatSystemRole = supportsChatSystemRole
+            self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
+            self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
+            self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
+            self.chatTemplateThinkingBuiltIn = templateCaps.thinkingBuiltIntoTemplate
+        }
+
+        var expectsReasoningOutput: Bool {
+            ChatTemplateSniffer.expectsReasoningOutput(
+                ChatTemplateSniffer.Capabilities(
+                    hasChatTemplate: chatTemplateHasTemplate,
+                    supportsThinkingToggle: chatTemplateSupportsThinkingToggle,
+                    thinkingOnly: chatTemplateThinkingOnly,
+                    thinkingBuiltIntoTemplate: chatTemplateThinkingBuiltIn))
         }
 
         var id: String { model.id }
@@ -57,7 +79,12 @@ final class InferenceEngine {
     let gate = MLXGate()
 
     /// The model the chat UI talks to (a `LocalModel.id`, i.e. directory path).
-    var activeModelID: String?
+    var activeModelID: String? {
+        didSet {
+            guard let activeModelID, activeModelID != oldValue else { return }
+            refreshTemplateCaps(for: activeModelID)
+        }
+    }
 
     /// Per-model load progress, keyed by `LocalModel.id`. nil fraction = indeterminate.
     private(set) var loadingModels: [String: Double?] = [:]
@@ -123,6 +150,8 @@ final class InferenceEngine {
 
     /// Resolves the MLX safetensors load policy for UI and API loads.
     var weightLoadPolicy: () -> WeightLoadPolicy = { .eager }
+    /// Generation settings for GGUF context sizing and sampling.
+    var generationSettings: () -> GenerationSettings = { GenerationSettings() }
 
     /// Loads a model into memory (idempotent) without changing the active model.
     @discardableResult
@@ -229,9 +258,11 @@ final class InferenceEngine {
             }
             let recordedPolicy: WeightLoadPolicy? =
                 useFactoryLoader && policy != .eager ? .eager : policy
+            let templateCaps = Self.templateCaps(for: model)
             let entry = Loaded(
                 model: model, container: container, loadedAt: Date(),
-                weightLoadPolicy: recordedPolicy)
+                weightLoadPolicy: recordedPolicy,
+                templateCaps: templateCaps)
             loadedModels.append(entry)
             if activeModelID == nil { activeModelID = entry.id }
             refreshMemory()
@@ -253,17 +284,42 @@ final class InferenceEngine {
 
     /// Loads a GGUF model on the llama.cpp backend.
     private func loadGGUF(_ model: LocalModel) async throws -> Loaded {
+        var knownModels = loadedModels.map(\.model)
+        if !knownModels.contains(where: { $0.id == model.id }) {
+            knownModels.append(model)
+        }
+        let admission = ModelMemoryBudget.canLoad(
+            model,
+            slotAssignments: loadedModels.map(\.id),
+            allModels: knownModels)
+        if !admission.allowed {
+            let message = admission.message ?? "Not enough RAM to load \(model.shortName)."
+            lastError = message
+            throw ForgeError.loadFailed(message)
+        }
+
         lastError = nil
         loadingModels.updateValue(nil, forKey: model.id)
         defer { loadingModels.removeValue(forKey: model.id) }
 
+        let settings = generationSettings()
+        let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 8192
         let url = model.directory
-        let runtime = await Task.detached(priority: .userInitiated) {
-            GGUFRuntime(fileURL: url)
-        }.value
+        let runtime = await gate.withTurn {
+            await Task.detached(priority: .userInitiated) {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                return GGUFRuntime(
+                    fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)))
+            }.value
+        }
         guard let runtime else {
+            let readable = FileManager.default.isReadableFile(atPath: url.path)
             let message =
-                "llama.cpp could not load \(model.shortName) — unsupported quantization or corrupt file."
+                "llama.cpp could not load \(model.shortName) at \(url.path) — "
+                + (readable
+                    ? "check RAM is available and the quantization is supported."
+                    : "file is not readable (re-add the model folder in Settings if sandboxed).")
             lastError = message
             throw ForgeError.loadFailed(message)
         }
@@ -273,7 +329,8 @@ final class InferenceEngine {
         }
         let entry = Loaded(
             model: model, container: nil, loadedAt: Date(),
-            weightLoadPolicy: nil, gguf: runtime)
+            weightLoadPolicy: nil, gguf: runtime,
+            templateCaps: Self.templateCaps(for: model))
         loadedModels.append(entry)
         if activeModelID == nil { activeModelID = entry.id }
         refreshMemory()
@@ -368,6 +425,7 @@ final class InferenceEngine {
         var modelID: String
         var messageCount: Int
         var systemPrompt: String
+        var localThinkingEnabled: Bool
     }
 
     private var sessions: [UUID: SessionBox] = [:]
@@ -500,7 +558,8 @@ final class InferenceEngine {
                 switch message.role {
                 case .user: return (.user, message.content)
                 case .assistant:
-                    return message.isErrorMessage ? nil : (.assistant, message.content)
+                    if message.content.isEmpty || message.isErrorMessage { return nil }
+                    return (.assistant, message.content)
                 case .system: return nil  // carried via the template instead
                 }
             }
@@ -574,11 +633,15 @@ final class InferenceEngine {
         systemInstructions: String
     ) -> (ChatSession, String) {
         let systemPrompt = systemInstructions
-        if let box = sessions[conversation.id],
+        if var box = sessions[conversation.id],
             box.modelID == entry.id,
             box.systemPrompt == systemPrompt,
-            box.messageCount == conversation.messages.count
+            box.messageCount == conversation.messages.count,
+            box.localThinkingEnabled == settings.localThinkingEnabled
         {
+            box.session.additionalContext = Self.thinkingAdditionalContext(
+                for: entry, enabled: settings.localThinkingEnabled)
+            sessions[conversation.id] = box
             let userPrompt = Self.userPrompt(
                 prompt: conversation.messages.last?.content ?? "",
                 system: systemPrompt,
@@ -604,10 +667,13 @@ final class InferenceEngine {
             entry.container!,
             instructions: instructionsForSession,
             history: history,
-            generateParameters: Self.parameters(from: settings))
+            generateParameters: Self.parameters(from: settings),
+            additionalContext: Self.thinkingAdditionalContext(
+                for: entry, enabled: settings.localThinkingEnabled))
         sessions[conversation.id] = SessionBox(
             session: session, modelID: entry.id,
-            messageCount: conversation.messages.count, systemPrompt: systemPrompt)
+            messageCount: conversation.messages.count, systemPrompt: systemPrompt,
+            localThinkingEnabled: settings.localThinkingEnabled)
         let userPrompt = Self.userPrompt(
             prompt: conversation.messages.last?.content ?? "",
             system: systemPrompt,
@@ -688,6 +754,36 @@ final class InferenceEngine {
                     configuration: configuration)
             }
         }.value
+    }
+
+    /// Prefer catalog sniff at scan time; re-sniff on disk when loading.
+    static func templateCaps(for model: LocalModel) -> ChatTemplateSniffer.Capabilities {
+        if let cached = model.chatTemplateCaps { return cached }
+        return ChatTemplateSniffer.sniff(modelDirectory: model.directory)
+    }
+
+    /// Re-sniff template files for a loaded entry (e.g. after an app update).
+    func refreshTemplateCaps(for modelID: String) {
+        guard let index = loadedModels.firstIndex(where: { $0.id == modelID }) else { return }
+        let model = loadedModels[index].model
+        let caps = Self.templateCaps(for: model)
+        loadedModels[index] = Loaded(
+            model: model,
+            container: loadedModels[index].container,
+            loadedAt: loadedModels[index].loadedAt,
+            weightLoadPolicy: loadedModels[index].weightLoadPolicy,
+            gguf: loadedModels[index].gguf,
+            supportsChatSystemRole: loadedModels[index].supportsChatSystemRole,
+            templateCaps: caps)
+    }
+
+    /// Qwen/QwQ chat templates read `enable_thinking` from template kwargs.
+    /// Models without that variable in their Jinja template ignore it harmlessly.
+    static func thinkingAdditionalContext(
+        for entry: Loaded, enabled: Bool
+    ) -> [String: any Sendable]? {
+        guard entry.chatTemplateSupportsThinkingToggle else { return nil }
+        return ["enable_thinking": enabled]
     }
 
     static func parameters(from settings: GenerationSettings) -> GenerateParameters {
