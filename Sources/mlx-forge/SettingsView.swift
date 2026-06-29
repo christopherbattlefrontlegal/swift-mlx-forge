@@ -14,7 +14,8 @@ struct ForgeSettingsView: View {
             MCPSettings()
                 .tabItem { Label("MCP Servers (advanced)", systemImage: "server.rack") }
         }
-        .frame(width: 560, height: 420)
+        .frame(minWidth: 720, idealWidth: 720, maxWidth: 900,
+               minHeight: 520, idealHeight: 680, maxHeight: .infinity)
         .preferredColorScheme(.dark)
     }
 }
@@ -31,7 +32,8 @@ private struct ClaudeKeySettings: View {
 
     var body: some View {
         @Bindable var app = app
-        return VStack(alignment: .leading, spacing: Theme.s4) {
+        return ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: Theme.s4) {
             Label("Cloud API Providers", systemImage: "cloud")
                 .font(.headline)
 
@@ -277,10 +279,11 @@ private struct ClaudeKeySettings: View {
                     }
                 }
             }
-
-            Spacer()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Theme.s5)
         }
-        .padding(Theme.s5)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func providerCard<Content: View>(
@@ -344,7 +347,8 @@ private struct MCPSettings: View {
     @State private var configError = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s3) {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: Theme.s3) {
             Label("MCP Servers", systemImage: "server.rack")
                 .font(.headline)
             Text(
@@ -438,14 +442,13 @@ private struct MCPSettings: View {
                     Text("No servers configured yet.")
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Theme.s4)
             } else {
-                ScrollView {
-                    VStack(spacing: Theme.s2) {
-                        ForEach(app.mcp.entries) { entry in
-                            MCPServerRow(entry: entry) {
-                                app.mcp.removeServer(name: entry.id)
-                            }
+                VStack(spacing: Theme.s2) {
+                    ForEach(app.mcp.entries) { entry in
+                        MCPServerRow(entry: entry) {
+                            app.mcp.removeServer(name: entry.id)
                         }
                     }
                 }
@@ -475,8 +478,11 @@ private struct MCPSettings: View {
                     .truncationMode(.head)
                     .textSelection(.enabled)
             }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Theme.s5)
         }
-        .padding(Theme.s5)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func commanderRootRow(_ url: URL, removable: Bool) -> some View {
@@ -590,7 +596,8 @@ private struct PromptLibrarySettings: View {
     @Environment(AppState.self) private var app
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.s4) {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: Theme.s4) {
             Label("Prompt Library", systemImage: "book.closed")
                 .font(.headline)
 
@@ -664,9 +671,10 @@ private struct PromptLibrarySettings: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-
-            Spacer()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Theme.s5)
         }
-        .padding(Theme.s5)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

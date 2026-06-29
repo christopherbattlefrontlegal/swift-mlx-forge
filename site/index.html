@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MLX Forge | Native Mac Workbench for Local LLMs</title>
+    <meta
+      name="description"
+      content="MLX Forge is a native macOS workbench for Apple Silicon LLMs, combining local MLX models, in-process GGUF, prompt tuning, MCP configuration, and a loopback OpenAI-compatible API."
+    >
+    <meta property="og:title" content="MLX Forge">
+    <meta
+      property="og:description"
+      content="A native macOS workbench for running local language models on Apple Silicon with Swift, MLX, and in-process GGUF."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="./assets/forge-icon.png">
+    <meta name="theme-color" content="#0d0d12">
+    <link rel="icon" href="./assets/forge-icon.png">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="site-header" aria-label="Primary">
+      <a class="brand" href="#top" aria-label="MLX Forge home">
+        <img src="./assets/forge-icon.png" alt="" width="34" height="34">
+        <span>MLX Forge</span>
+      </a>
+      <nav>
+        <a href="#why">Why</a>
+        <a href="#workflow">Workflow</a>
+        <a href="#build">Build</a>
+      </nav>
+      <a class="header-cta" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">GitHub</a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <img class="hero-mark" src="./assets/forge-icon.png" alt="" aria-hidden="true">
+        <div class="hero-content">
+          <p class="eyebrow">Native Swift. Apple Silicon. Local models.</p>
+          <h1 id="hero-title">MLX Forge</h1>
+          <p class="hero-lede">
+            A native macOS workbench for running local language models with MLX,
+            in-process GGUF, prompt controls, MCP configuration, and a loopback
+            OpenAI-compatible API for local agent tools.
+          </p>
+          <div class="hero-actions" aria-label="Launch actions">
+            <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
+              View on GitHub
+            </a>
+            <a class="button secondary" href="#build">Build from source</a>
+          </div>
+          <dl class="proof-strip" aria-label="Product facts">
+            <div>
+              <dt>Runtime</dt>
+              <dd>MLX plus GGUF</dd>
+            </div>
+            <div>
+              <dt>Interface</dt>
+              <dd>Native SwiftUI</dd>
+            </div>
+            <div>
+              <dt>Agent bridge</dt>
+              <dd>Loopback OpenAI API</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="band intro-band" aria-labelledby="intro-title">
+        <div class="section-inner two-column">
+          <div>
+            <p class="eyebrow">The position</p>
+            <h2 id="intro-title">Not another wrapper around somebody else's runtime.</h2>
+          </div>
+          <p class="section-copy">
+            Forge is built for people who keep real models on disk and want a Mac
+            app that understands the workflow: scan local folders, load and unload
+            models deliberately, inspect the active prompt, tune sampling, and hand
+            a local endpoint to tools that already speak OpenAI's API shape.
+          </p>
+        </div>
+      </section>
+
+      <section id="why" class="band" aria-labelledby="why-title">
+        <div class="section-inner">
+          <div class="section-heading">
+            <p class="eyebrow">Why it matters</p>
+            <h2 id="why-title">A Mac-native control surface for local inference.</h2>
+          </div>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <span class="feature-index">01</span>
+              <h3>MLX and GGUF in one workbench</h3>
+              <p>
+                Run MLX model trees and GGUF weights from a single native app,
+                backed by Swift packages and an in-process LLM.swift backend.
+              </p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-index">02</span>
+              <h3>Bring your own models</h3>
+              <p>
+                Point Forge at local model folders or an MLX-community cache. It
+                discovers models recursively without shipping weights in the repo.
+              </p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-index">03</span>
+              <h3>Operator-grade prompt control</h3>
+              <p>
+                Inspect named system prompt presets, chat-template behavior,
+                thinking mode, sampling defaults, repetition penalty, and KV cache.
+              </p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-index">04</span>
+              <h3>Local agent bridge</h3>
+              <p>
+                Expose a loopback OpenAI-compatible server so local tools can call
+                your Mac model without wildcard CORS or a cloud relay.
+              </p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-index">05</span>
+              <h3>MCP-aware, App Store-safe</h3>
+              <p>
+                Use HTTP/SSE MCP configuration for safe app workflows, with local
+                stdio checks kept manual in developer builds.
+              </p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-index">06</span>
+              <h3>Cloud optional</h3>
+              <p>
+                Anthropic, OpenAI, and OpenRouter keys are optional and stored with
+                Keychain support. The core local path stays local.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="workflow" class="band workflow-band" aria-labelledby="workflow-title">
+        <div class="section-inner">
+          <div class="section-heading">
+            <p class="eyebrow">How it works</p>
+            <h2 id="workflow-title">A direct loop from disk to chat to tools.</h2>
+          </div>
+          <ol class="workflow-list">
+            <li>
+              <span>Point Forge at model folders.</span>
+              <p>Add local directories or an MLX-community cache from the model browser.</p>
+            </li>
+            <li>
+              <span>Load the model you actually want.</span>
+              <p>Use explicit load, unload, active model, and stop controls.</p>
+            </li>
+            <li>
+              <span>Tune the conversation surface.</span>
+              <p>Set system prompts, template behavior, sampling, and cache settings.</p>
+            </li>
+            <li>
+              <span>Talk to it from the app or a local tool.</span>
+              <p>Use the native chat UI or the loopback OpenAI-compatible API.</p>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="build" class="band build-band" aria-labelledby="build-title">
+        <div class="section-inner build-layout">
+          <div>
+            <p class="eyebrow">Build</p>
+            <h2 id="build-title">Public source. Native Mac build.</h2>
+            <p class="section-copy">
+              Forge is a SwiftPM package with executable products for the app and
+              runtime tooling. It targets modern macOS on Apple Silicon and resolves
+              dependencies from public git sources.
+            </p>
+            <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
+              Open the repository
+            </a>
+          </div>
+          <div class="terminal-panel" aria-label="Build commands">
+            <div class="terminal-title">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <pre><code>git clone git@github.com:christopherbattlefrontlegal/swift-mlx-forge.git
+cd swift-mlx-forge
+swift build
+swift run mlx-forge</code></pre>
+            <button class="copy-button" data-copy="git clone git@github.com:christopherbattlefrontlegal/swift-mlx-forge.git
+cd swift-mlx-forge
+swift build
+swift run mlx-forge">Copy build command</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="band cta-band" aria-labelledby="cta-title">
+        <div class="section-inner cta-inner">
+          <p class="eyebrow">Launch it</p>
+          <h2 id="cta-title">Forge is for Mac users who want local models to feel native.</h2>
+          <p>
+            Star the repo, build the app, point it at your models, and put your
+            Apple Silicon machine to work.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
+              Star on GitHub
+            </a>
+            <a class="button secondary" href="#top">Back to top</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>MLX Forge</span>
+      <a href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">GitHub</a>
+    </footer>
+
+    <script src="./script.js"></script>
+  </body>
+</html>

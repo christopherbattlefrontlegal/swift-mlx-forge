@@ -513,6 +513,7 @@ final class InferenceEngine {
 
         let (session, userPrompt) = preparedSession(
             for: conversation, entry: entry, settings: settings,
+            prompt: prompt,
             systemInstructions: resolvedSystem)
         session.generateParameters = Self.parameters(from: settings)
 
@@ -542,7 +543,6 @@ final class InferenceEngine {
                         conversation: conversation,
                         entry: entry,
                         settings: settings,
-                        systemInstructions: resolvedSystem,
                         start: start,
                         onChunk: onChunk)
                     self.sessions[conversation.id]?.messageCount += 2
@@ -649,12 +649,13 @@ final class InferenceEngine {
 
     private func preparedSession(
         for conversation: Conversation, entry: Loaded, settings: GenerationSettings,
+        prompt: String,
         systemInstructions: String
     ) -> (ChatSession, String) {
         let systemPrompt = systemInstructions
         let thinkingDirective = Self.thinkingBudgetFrontDirective(
             for: entry, settings: settings)
-        if var box = sessions[conversation.id],
+        if let box = sessions[conversation.id],
             box.modelID == entry.id,
             box.systemPrompt == systemPrompt,
             box.messageCount == conversation.messages.count,
@@ -665,9 +666,8 @@ final class InferenceEngine {
                 for: entry, enabled: settings.localThinkingEnabled)
             sessions[conversation.id] = box
             let userPrompt = Self.userPrompt(
-                prompt: conversation.messages.last?.content ?? "",
+                prompt: prompt,
                 system: systemPrompt,
-                supportsSystemRole: entry.supportsChatSystemRole,
                 thinkingDirective: thinkingDirective)
             return (box.session, userPrompt)
         }
@@ -684,11 +684,9 @@ final class InferenceEngine {
 
         // GGUF entries never reach here — generate() branches to generateGGUF
         // first, so every entry in this path has an MLX container.
-        let instructionsForSession =
-            (!systemPrompt.isEmpty && entry.supportsChatSystemRole) ? systemPrompt : nil
         let session = ChatSession(
             entry.container!,
-            instructions: instructionsForSession,
+            instructions: nil,
             history: history,
             generateParameters: Self.parameters(from: settings),
             additionalContext: Self.thinkingAdditionalContext(
@@ -699,9 +697,8 @@ final class InferenceEngine {
             localThinkingEnabled: settings.localThinkingEnabled,
             localThinkingEffort: settings.localThinkingEffort)
         let userPrompt = Self.userPrompt(
-            prompt: conversation.messages.last?.content ?? "",
+            prompt: prompt,
             system: systemPrompt,
-            supportsSystemRole: entry.supportsChatSystemRole,
             thinkingDirective: thinkingDirective)
         return (session, userPrompt)
     }
@@ -723,16 +720,16 @@ final class InferenceEngine {
     private static func userPrompt(
         prompt: String,
         system: String,
-        supportsSystemRole: Bool,
         thinkingDirective: String? = nil
     ) -> String {
-        let front = thinkingDirective.map { $0 + "\n\n" } ?? ""
-        guard !supportsSystemRole else { return front + prompt }
         let trimmedSystem = system.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSystem.isEmpty else { return front + prompt }
-        return front + """
+        guard !trimmedSystem.isEmpty else {
+            return thinkingDirective.map { $0 + "\n\n" + prompt } ?? prompt
+        }
+        let budgetBlock = thinkingDirective.map { "\n\n\($0)" } ?? ""
+        return """
             System instructions:
-            \(trimmedSystem)
+            \(trimmedSystem)\(budgetBlock)
 
             User:
             \(prompt)
@@ -844,7 +841,6 @@ final class InferenceEngine {
         conversation: Conversation,
         entry: Loaded,
         settings: GenerationSettings,
-        systemInstructions: String,
         start: Date,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws -> GenerateCompletionInfo? {
@@ -908,7 +904,7 @@ final class InferenceEngine {
         sessions.removeValue(forKey: conversation.id)
         let continuation = assistantContinuationSession(
             for: conversation, entry: entry, settings: settings,
-            systemInstructions: systemInstructions)
+            currentUserPrompt: userPrompt)
         for try await item in continuation.streamDetails(
             to: accumulated, role: .assistant, images: [], videos: [])
         {
@@ -934,10 +930,9 @@ final class InferenceEngine {
         for conversation: Conversation,
         entry: Loaded,
         settings: GenerationSettings,
-        systemInstructions: String
+        currentUserPrompt: String
     ) -> ChatSession {
-        let systemPrompt = systemInstructions
-        let history: [Chat.Message] = conversation.messages.compactMap { message in
+        var history: [Chat.Message] = conversation.messages.compactMap { message in
             switch message.role {
             case .user: return .user(message.content)
             case .assistant:
@@ -945,11 +940,10 @@ final class InferenceEngine {
             case .system: return .system(message.content)
             }
         }
-        let instructionsForSession =
-            (!systemPrompt.isEmpty && entry.supportsChatSystemRole) ? systemPrompt : nil
+        history.append(.user(currentUserPrompt))
         return ChatSession(
             entry.container!,
-            instructions: instructionsForSession,
+            instructions: nil,
             history: history,
             generateParameters: Self.parameters(from: settings),
             additionalContext: Self.thinkingAdditionalContext(
