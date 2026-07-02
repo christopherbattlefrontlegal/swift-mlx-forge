@@ -82,7 +82,13 @@ enum CodingOrchestrator {
         var artifact = ""
         var lastTester = ""
 
-        for round in 1...max(1, config.maxRounds) {
+        // maxRounds <= 0 means "disabled" — don't silently run one full round (5 LLM calls).
+        guard config.maxRounds > 0 else {
+            await onAppend("\n\n⚠️ **Code loop disabled** — max rounds is \(config.maxRounds).\n")
+            return artifact
+        }
+
+        for round in 1...config.maxRounds {
             try Task.checkCancellation()
 
             for phase in [Phase.planner, .coder, .auditor, .fixer, .tester] {

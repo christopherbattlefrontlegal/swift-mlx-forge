@@ -325,12 +325,17 @@ struct GenerationSettings: Codable, Equatable {
     var reasoningEnabled: Bool = true
     /// For Qwen/QwQ MLX models: pass `enable_thinking` into `applyChatTemplate`.
     var localThinkingEnabled: Bool = true
-    /// Local thinking token cap preset (`LocalThinkingEffort` raw value). `infinity` = no cap.
-    var localThinkingEffort: String = "infinity"
+    /// Max thinking tokens per local turn. 0 = unlimited. The budget is stated to the
+    /// model up front; Forge closes `</think>` and continues the answer if it overruns.
+    var localThinkingMaxTokens: Int = 0
     /// Cloud reasoning effort (Anthropic effort, OpenAI reasoning.effort, OpenRouter reasoning.effort).
     var anthropicEffort: String = "high"
     /// Request summarized thinking text from Anthropic (required on Opus 4.8+ to see reasoning).
     var anthropicThinkingSummarized: Bool = true
+    /// Max chained MCP tool calls per user turn (the agent loop bound). Tools stay available
+    /// across follow-up turns; this cap is the only backstop against an infinite tool loop.
+    /// Generous default so multi-step tools like sequential-thinking can run a full chain.
+    var mcpMaxIterations: Int = 16
 
     init() {}
 
@@ -371,67 +376,39 @@ struct GenerationSettings: Codable, Equatable {
         localThinkingEnabled =
             (try? c.decodeIfPresent(Bool.self, forKey: .localThinkingEnabled)).flatMap { $0 }
             ?? true
-        localThinkingEffort =
-            (try? c.decodeIfPresent(String.self, forKey: .localThinkingEffort)).flatMap { $0 }
-            ?? "infinity"
+        if let tokens = (try? c.decodeIfPresent(Int.self, forKey: .localThinkingMaxTokens))
+            .flatMap({ $0 })
+        {
+            localThinkingMaxTokens = max(0, tokens)
+        } else if let legacyContainer = try? decoder.container(keyedBy: LegacyCodingKeys.self),
+            let legacy = (try? legacyContainer.decodeIfPresent(
+                String.self, forKey: .localThinkingEffort)).flatMap({ $0 })
+        {
+            // Settings written by the old effort-preset UI.
+            let presets = ["low": 100, "medium": 250, "high": 350, "max": 750]
+            localThinkingMaxTokens = presets[legacy] ?? 0
+        } else {
+            localThinkingMaxTokens = 0
+        }
         anthropicEffort =
             (try? c.decodeIfPresent(String.self, forKey: .anthropicEffort)).flatMap { $0 } ?? "high"
         anthropicThinkingSummarized =
             (try? c.decodeIfPresent(Bool.self, forKey: .anthropicThinkingSummarized))
             .flatMap { $0 } ?? true
-    }
-}
-
-/// Caps how many tokens a local thinking model may spend reasoning before answering.
-enum LocalThinkingEffort: String, CaseIterable, Identifiable, Codable {
-    case low, medium, high, max, infinity
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .low: "Low"
-        case .medium: "Medium"
-        case .high: "High"
-        case .max: "Max"
-        case .infinity: "Infinity"
-        }
+        mcpMaxIterations =
+            (try? c.decodeIfPresent(Int.self, forKey: .mcpMaxIterations)).flatMap { $0 } ?? 16
     }
 
-    /// Menu label with approximate target cap (Forge allows ~10% grace after).
-    var menuLabel: String {
-        switch self {
-        case .infinity: "Infinity (no cap)"
-        default: "\(label) (~\(tokenLimit!) think)"
-        }
-    }
-
-    /// `nil` means unlimited reasoning.
-    var tokenLimit: Int? {
-        switch self {
-        case .low: 100
-        case .medium: 250
-        case .high: 350
-        case .max: 750
-        case .infinity: nil
-        }
-    }
-
-    var shortDetail: String {
-        switch self {
-        case .infinity: "∞"
-        default: "\(tokenLimit!)"
-        }
+    /// Keys that existed in older settings files but no longer have stored properties.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case localThinkingEffort
     }
 }
 
 extension GenerationSettings {
-    var resolvedLocalThinkingEffort: LocalThinkingEffort {
-        LocalThinkingEffort(rawValue: localThinkingEffort) ?? .infinity
-    }
-
+    /// `nil` means unlimited reasoning.
     var localThinkingTokenLimit: Int? {
-        resolvedLocalThinkingEffort.tokenLimit
+        localThinkingMaxTokens > 0 ? localThinkingMaxTokens : nil
     }
 }
 

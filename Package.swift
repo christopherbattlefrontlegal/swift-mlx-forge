@@ -18,8 +18,12 @@ import PackageDescription
 let package = Package(
     name: "forge_swift_open_source",
     platforms: [
+        // Deploy to macOS 26 so the app still runs on the prior OS; the Foundation Models
+        // LLM-provider API is macOS 27.0+, so that code is gated with `if #available`.
         .macOS(.v26)
     ],
+    // swift-tools-version 6.2 already selects Swift 6 language mode (data-race safety
+    // by default); confirmed building with -swift-version 6 on the Swift 6.4 toolchain.
     products: [
         .executable(name: "mlx-runtime", targets: ["mlx-runtime"]),
         .executable(name: "mlx-studio", targets: ["mlx-studio"]),
@@ -27,7 +31,8 @@ let package = Package(
     ],
     dependencies: [
         // MLX runtime + LLM stack (public source).
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", exact: "3.31.3"),
+        // 3.31.4 adds pure Mamba2 (SSM) models, Mixtral, and generation seeding.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", exact: "3.31.4"),
 
         // Tokenizer + downloader integration packages required by the
         // MLXHuggingFace macros used in the tool sources.
@@ -45,9 +50,11 @@ let package = Package(
 
         // llama.cpp (GGUF) backend for the Forge app — Metal-accelerated,
         // compiled in-process (sandbox-safe). Second engine next to MLX.
+        // 2.1.0: newer llama.cpp runtime, multi-turn fix, and ThinkingMode
+        // (separate reasoning stream + suppressed-thinking toggle).
         .package(
             url: "https://github.com/eastriverlee/LLM.swift",
-            exact: "1.7.1"),
+            exact: "2.1.0"),
     ],
     targets: [
         .executableTarget(

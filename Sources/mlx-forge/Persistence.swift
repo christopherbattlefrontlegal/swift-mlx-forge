@@ -71,6 +71,8 @@ struct PersistedSettings: Codable {
     var loadedModelPaths: [String] = []
     var serverEnabled = false
     var serverPort = 3737
+    /// Serve the API on all interfaces (LAN) instead of loopback only.
+    var serverExposeToNetwork = false
 
     init(
         generation: GenerationSettings = GenerationSettings(),
@@ -87,7 +89,8 @@ struct PersistedSettings: Codable {
         lastLoadedModelPath: String? = nil,
         loadedModelPaths: [String] = [],
         serverEnabled: Bool = false,
-        serverPort: Int = 3737
+        serverPort: Int = 3737,
+        serverExposeToNetwork: Bool = false
     ) {
         self.generation = generation
         self.promptPresets = promptPresets
@@ -104,6 +107,7 @@ struct PersistedSettings: Codable {
         self.loadedModelPaths = loadedModelPaths
         self.serverEnabled = serverEnabled
         self.serverPort = serverPort
+        self.serverExposeToNetwork = serverExposeToNetwork
     }
 
     // Tolerant decoding: a settings file written by an older (or newer) build
@@ -146,6 +150,9 @@ struct PersistedSettings: Codable {
             (try? c.decodeIfPresent(Bool.self, forKey: .serverEnabled)).flatMap { $0 } ?? false
         serverPort =
             (try? c.decodeIfPresent(Int.self, forKey: .serverPort)).flatMap { $0 } ?? 3737
+        serverExposeToNetwork =
+            (try? c.decodeIfPresent(Bool.self, forKey: .serverExposeToNetwork))
+            .flatMap { $0 } ?? false
     }
 }
 

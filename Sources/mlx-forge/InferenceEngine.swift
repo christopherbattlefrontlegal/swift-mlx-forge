@@ -462,7 +462,7 @@ final class InferenceEngine {
         var messageCount: Int
         var systemPrompt: String
         var localThinkingEnabled: Bool
-        var localThinkingEffort: String
+        var localThinkingMaxTokens: Int
     }
 
     private var sessions: [UUID: SessionBox] = [:]
@@ -508,6 +508,56 @@ final class InferenceEngine {
                 gguf, conversation: conversation, prompt: prompt, settings: settings,
                 systemInstructions: resolvedSystem,
                 onChunk: onChunk, onComplete: onComplete)
+            return
+        }
+
+        // A thinking cap or a prefill-closed think block requires the token-level
+        // decode — ChatSession cannot express a mid-turn continuation or a prompt
+        // suffix. No session/KV reuse on these runs; the next plain turn re-hydrates
+        // from stored history.
+        let budgetTarget =
+            Self.thinkingBudgetApplies(to: entry, settings: settings)
+            ? settings.localThinkingTokenLimit : nil
+        let noThinkPrefill = Self.noThinkPrefillApplies(to: entry, settings: settings)
+        if budgetTarget != nil || noThinkPrefill, entry.container != nil {
+            sessions.removeValue(forKey: conversation.id)
+            let userPrompt = Self.userPrompt(
+                prompt: prompt,
+                system: resolvedSystem,
+                thinkingDirective: Self.thinkingBudgetFrontDirective(
+                    for: entry, settings: settings))
+            let generationID = beginGeneration()
+            if entry.weightLoadPolicy == .deferred {
+                materializingModelID = entry.id
+                loadAdvisory = nil
+            }
+            generationTasks[generationID] = Task { [generationID] in
+                await self.gate.withTurn {
+                    defer {
+                        self.generationTasks.removeValue(forKey: generationID)
+                        if self.materializingModelID == entry.id {
+                            self.materializingModelID = nil
+                        }
+                    }
+                    let start = Date()
+                    do {
+                        let completionInfo = try await self.streamBudgetedMLXResponse(
+                            entry: entry,
+                            conversation: conversation,
+                            userPrompt: userPrompt,
+                            settings: settings,
+                            budgetTarget: budgetTarget,
+                            noThinkPrefill: noThinkPrefill,
+                            start: start,
+                            onChunk: onChunk)
+                        self.finishGeneration()
+                        onComplete(completionInfo, nil)
+                    } catch {
+                        self.finishGeneration()
+                        onComplete(nil, error.localizedDescription)
+                    }
+                }
+            }
             return
         }
 
@@ -592,7 +642,18 @@ final class InferenceEngine {
                     temperature: settings.temperature, topP: settings.topP,
                     topK: settings.topK, system: systemPrompt, history: history)
                 let start = Date()
-                _ = await gguf.respond(to: prompt) { delta in
+                // llama.cpp's wrapper has no mid-stream injection hook, so the thinking
+                // budget is prompt-told only on GGUF models.
+                let effectivePrompt: String
+                if let limit = settings.localThinkingTokenLimit {
+                    effectivePrompt =
+                        Self.thinkingBudgetDirectiveText(limit: limit) + "\n\n" + prompt
+                } else {
+                    effectivePrompt = prompt
+                }
+                _ = await gguf.respond(
+                    to: effectivePrompt, thinkingEnabled: settings.localThinkingEnabled
+                ) { delta in
                     await MainActor.run {
                         self.liveTokenCount += 1
                         let elapsed = Date().timeIntervalSince(start)
@@ -660,7 +721,7 @@ final class InferenceEngine {
             box.systemPrompt == systemPrompt,
             box.messageCount == conversation.messages.count,
             box.localThinkingEnabled == settings.localThinkingEnabled,
-            box.localThinkingEffort == settings.localThinkingEffort
+            box.localThinkingMaxTokens == settings.localThinkingMaxTokens
         {
             box.session.additionalContext = Self.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled)
@@ -695,7 +756,7 @@ final class InferenceEngine {
             session: session, modelID: entry.id,
             messageCount: conversation.messages.count, systemPrompt: systemPrompt,
             localThinkingEnabled: settings.localThinkingEnabled,
-            localThinkingEffort: settings.localThinkingEffort)
+            localThinkingMaxTokens: settings.localThinkingMaxTokens)
         let userPrompt = Self.userPrompt(
             prompt: prompt,
             system: systemPrompt,
@@ -806,12 +867,10 @@ final class InferenceEngine {
     /// Grace above the target thinking cap before Forge force-closes an open `</think>` block.
     static let thinkingBudgetGraceFraction = 0.10
 
-    /// Injected when the target budget is reached but the model has not closed thinking yet.
-    static let thinkingBudgetWrapUpSuffix =
-        "\n\nI've used the allotted reasoning time — wrapping up and answering now.\n</think>\n\n"
-
-    /// Last resort when grace is exhausted and thinking is still open.
-    static let thinkingBudgetForceCloseSuffix =
+    /// The canonical Qwen thinking-budget early-stop string (Qwen3 technical report /
+    /// qwen.readthedocs.io "thinking budget" recipe). Appended to the truncated reasoning
+    /// token-level, after which decoding CONTINUES into the final answer.
+    nonisolated static let thinkingBudgetForceCloseSuffix =
         "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 
     static func thinkingBudgetGraceTokens(for target: Int) -> Int {
@@ -829,6 +888,10 @@ final class InferenceEngine {
         guard thinkingBudgetApplies(to: entry, settings: settings),
               let limit = settings.localThinkingTokenLimit
         else { return nil }
+        return thinkingBudgetDirectiveText(limit: limit)
+    }
+
+    static func thinkingBudgetDirectiveText(limit: Int) -> String {
         let hardStop = thinkingBudgetHardLimit(for: limit)
         return """
         [Thinking budget] You have \(limit) thinking tokens — do not exceed \(hardStop). Open <think>, finish all reasoning inside it, close </think>, then answer. Wrap up before you hit the limit.
@@ -844,15 +907,10 @@ final class InferenceEngine {
         start: Date,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws -> GenerateCompletionInfo? {
-        let budgetTarget =
-            Self.thinkingBudgetApplies(to: entry, settings: settings)
-            ? settings.localThinkingTokenLimit : nil
-        let budgetHardLimit = budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) }
-        var accumulated = ""
-        var thinkingTokens = 0
         var completionInfo: GenerateCompletionInfo?
-        var hitThinkingBudget = false
-        var usedForceClose = false
+        // Templates that pre-open <think> inside the generation prompt stream reasoning
+        // with no opening tag — surface one so the UI can render a live reasoning block.
+        var emittedSyntheticThinkOpen = false
 
         for try await item in session.streamDetails(
             to: userPrompt, role: .user, images: [], videos: [])
@@ -863,54 +921,12 @@ final class InferenceEngine {
                 if materializingModelID == entry.id {
                     materializingModelID = nil
                 }
-                accumulated += text
-                if let budgetHardLimit,
-                    Self.isInThinkingPhase(accumulated, entry: entry, settings: settings)
-                {
-                    thinkingTokens += 1
-                    if thinkingTokens >= budgetHardLimit {
-                        hitThinkingBudget = true
-                        usedForceClose = true
-                        break
-                    }
-                    if let budgetTarget, thinkingTokens >= budgetTarget {
-                        hitThinkingBudget = true
-                        break
+                if !emittedSyntheticThinkOpen {
+                    emittedSyntheticThinkOpen = true
+                    if entry.chatTemplateThinkingBuiltIn, !text.hasPrefix("<think>") {
+                        onChunk("<think>")
                     }
                 }
-                liveTokenCount += 1
-                let elapsed = Date().timeIntervalSince(start)
-                if elapsed > 0.2 {
-                    liveTokensPerSecond = Double(liveTokenCount) / elapsed
-                }
-                onChunk(text)
-            case .info(let info):
-                completionInfo = info
-            case .toolCall:
-                break
-            }
-        }
-
-        guard hitThinkingBudget, !Task.isCancelled else { return completionInfo }
-
-        if !accumulated.contains("</think>") {
-            let suffix = usedForceClose
-                ? Self.thinkingBudgetForceCloseSuffix
-                : Self.thinkingBudgetWrapUpSuffix
-            onChunk(suffix)
-            accumulated += suffix
-        }
-
-        sessions.removeValue(forKey: conversation.id)
-        let continuation = assistantContinuationSession(
-            for: conversation, entry: entry, settings: settings,
-            currentUserPrompt: userPrompt)
-        for try await item in continuation.streamDetails(
-            to: accumulated, role: .assistant, images: [], videos: [])
-        {
-            if Task.isCancelled { break }
-            switch item {
-            case .chunk(let text):
                 liveTokenCount += 1
                 let elapsed = Date().timeIntervalSince(start)
                 if elapsed > 0.2 {
@@ -926,44 +942,229 @@ final class InferenceEngine {
         return completionInfo
     }
 
-    private func assistantContinuationSession(
-        for conversation: Conversation,
+    /// Thinking-budget generation: the official Qwen early-stop, done at the token level.
+    ///
+    /// Phase 1 decodes normally (the front directive already told the model its budget, so a
+    /// compliant model closes `</think>` on its own). If reasoning is still open past the
+    /// target + 10% grace, phase 2 appends the canonical wrap-up + `</think>` to the tokens
+    /// generated so far and CONTINUES decoding the final answer — the run never dies at the cap.
+    ///
+    /// This bypasses `ChatSession` deliberately: re-templating the partial reasoning as a
+    /// completed assistant turn (the old approach) let Qwen-family templates strip the think
+    /// block from history, so the model saw a finished turn and emitted EOS immediately.
+    private func streamBudgetedMLXResponse(
         entry: Loaded,
+        conversation: Conversation,
+        userPrompt: String,
         settings: GenerationSettings,
-        currentUserPrompt: String
-    ) -> ChatSession {
-        var history: [Chat.Message] = conversation.messages.compactMap { message in
+        budgetTarget: Int?,
+        noThinkPrefill: Bool,
+        start: Date,
+        onChunk: @escaping @MainActor (String) -> Void
+    ) async throws -> GenerateCompletionInfo? {
+        var turns: [(role: String, content: String)] = conversation.messages.compactMap {
+            message in
             switch message.role {
-            case .user: return .user(message.content)
+            case .user: return ("user", message.content)
             case .assistant:
-                return message.isErrorMessage ? nil : .assistant(message.content)
-            case .system: return .system(message.content)
+                return message.isErrorMessage ? nil : ("assistant", message.content)
+            case .system: return ("system", message.content)
             }
         }
-        history.append(.user(currentUserPrompt))
-        return ChatSession(
-            entry.container!,
-            instructions: nil,
-            history: history,
-            generateParameters: Self.parameters(from: settings),
+        turns.append(("user", userPrompt))
+
+        let thinkingFromStart =
+            !noThinkPrefill
+            && (entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn)
+        var completionInfo: GenerateCompletionInfo?
+        var emittedSyntheticThinkOpen = false
+
+        let stream = Self.budgetedGenerationStream(
+            container: entry.container!,
+            turns: turns,
             additionalContext: Self.thinkingAdditionalContext(
-                for: entry, enabled: settings.localThinkingEnabled))
+                for: entry, enabled: settings.localThinkingEnabled),
+            parameters: Self.parameters(from: settings),
+            hardLimit: budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) },
+            thinkingFromStart: thinkingFromStart,
+            prefillText: noThinkPrefill ? Self.noThinkPrefillText : nil)
+
+        for try await item in stream {
+            if Task.isCancelled { break }
+            switch item {
+            case .chunk(let text):
+                if materializingModelID == entry.id {
+                    materializingModelID = nil
+                }
+                if !emittedSyntheticThinkOpen {
+                    emittedSyntheticThinkOpen = true
+                    if entry.chatTemplateThinkingBuiltIn, !noThinkPrefill,
+                        !text.hasPrefix("<think>")
+                    {
+                        onChunk("<think>")
+                    }
+                }
+                liveTokenCount += 1
+                let elapsed = Date().timeIntervalSince(start)
+                if elapsed > 0.2 {
+                    liveTokensPerSecond = Double(liveTokenCount) / elapsed
+                }
+                onChunk(text)
+            case .info(let info):
+                completionInfo = info
+            case .toolCall:
+                break
+            }
+        }
+        return completionInfo
+    }
+
+    /// Off-main two-phase decode. Runs entirely inside the model container's isolation;
+    /// chunks stream back in order through the returned stream.
+    ///
+    /// `prefillText` is appended to the prompt tokens before decoding (used to close a
+    /// template's pre-opened `<think>` for thinking-off). `hardLimit` nil = no budget.
+    nonisolated private static func budgetedGenerationStream(
+        container: ModelContainer,
+        turns: [(role: String, content: String)],
+        additionalContext: [String: any Sendable]?,
+        parameters: GenerateParameters,
+        hardLimit: Int?,
+        thinkingFromStart: Bool,
+        prefillText: String? = nil
+    ) -> AsyncThrowingStream<Generation, Error> {
+        let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
+        let task = Task {
+            do {
+                try await container.perform { context in
+                    let messages: [Chat.Message] = turns.map { turn in
+                        switch turn.role {
+                        case "system": return .system(turn.content)
+                        case "assistant": return .assistant(turn.content)
+                        default: return .user(turn.content)
+                        }
+                    }
+                    let userInput = UserInput(
+                        chat: messages, additionalContext: additionalContext)
+                    let lmInput = try await context.processor.prepare(input: userInput)
+
+                    var promptTokens = lmInput.text.tokens
+                    if let prefillText {
+                        let prefillIDs = context.tokenizer.encode(
+                            text: prefillText, addSpecialTokens: false)
+                        promptTokens = concatenated([
+                            promptTokens, MLXArray(prefillIDs.map { Int32($0) }),
+                        ])
+                    }
+
+                    // Phase 1 — decode until </think> closes naturally or the cap hits.
+                    let iterator = try TokenIterator(
+                        input: LMInput(text: .init(tokens: promptTokens)),
+                        model: context.model, parameters: parameters)
+                    let (phase1, phase1Task) = MLXLMCommon.generateTask(
+                        promptTokenCount: promptTokens.size,
+                        modelConfiguration: context.configuration,
+                        tokenizer: context.tokenizer,
+                        iterator: iterator)
+
+                    var generated = ""
+                    var thinkingClosed = false
+                    var thinkingTokens = 0
+                    var hitBudget = false
+
+                    for await item in phase1 {
+                        if Task.isCancelled { break }
+                        switch item {
+                        case .chunk(let text):
+                            generated += text
+                            if !thinkingClosed, generated.contains("</think>") {
+                                thinkingClosed = true
+                            }
+                            if let hardLimit, !thinkingClosed,
+                                thinkingFromStart || generated.contains("<think>")
+                            {
+                                // Chunks from the naive detokenizer are one token each.
+                                thinkingTokens += 1
+                                if thinkingTokens >= hardLimit { hitBudget = true }
+                            }
+                            continuation.yield(item)
+                        case .info(let info):
+                            if !hitBudget { continuation.yield(.info(info)) }
+                        case .toolCall:
+                            continuation.yield(item)
+                        }
+                        if hitBudget { break }
+                    }
+                    // Stop the iterator before touching the GPU again — an abandoned
+                    // stream would otherwise keep decoding into a buffered stream.
+                    phase1Task.cancel()
+                    await phase1Task.value
+
+                    guard hitBudget, !Task.isCancelled else {
+                        continuation.finish()
+                        return
+                    }
+
+                    // Phase 2 — canonical early-stop injection, then continue the answer.
+                    let injection = thinkingBudgetForceCloseSuffix
+                    continuation.yield(.chunk(injection))
+                    let continuationIDs = context.tokenizer.encode(
+                        text: generated + injection, addSpecialTokens: false)
+                    var phase2Parameters = parameters
+                    if let maxTokens = parameters.maxTokens {
+                        phase2Parameters.maxTokens = max(64, maxTokens - continuationIDs.count)
+                    }
+                    let phase2Tokens = concatenated([
+                        promptTokens,
+                        MLXArray(continuationIDs.map { Int32($0) }),
+                    ])
+                    let iterator2 = try TokenIterator(
+                        input: LMInput(text: .init(tokens: phase2Tokens)),
+                        model: context.model,
+                        parameters: phase2Parameters)
+                    let (phase2, phase2Task) = MLXLMCommon.generateTask(
+                        promptTokenCount: phase2Tokens.size,
+                        modelConfiguration: context.configuration,
+                        tokenizer: context.tokenizer,
+                        iterator: iterator2)
+                    for await item in phase2 {
+                        if Task.isCancelled { break }
+                        continuation.yield(item)
+                    }
+                    phase2Task.cancel()
+                    await phase2Task.value
+                    continuation.finish()
+                }
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in task.cancel() }
+        return stream
     }
 
     static func thinkingBudgetApplies(to entry: Loaded, settings: GenerationSettings) -> Bool {
         guard settings.localThinkingTokenLimit != nil else { return false }
+        // Thinking switched off on a pre-opened template → Forge prefills </think>,
+        // so there is no reasoning left to cap.
+        if noThinkPrefillApplies(to: entry, settings: settings) { return false }
         if entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn { return true }
         return entry.chatTemplateSupportsThinkingToggle && settings.localThinkingEnabled
     }
 
-    static func isInThinkingPhase(
-        _ accumulated: String, entry: Loaded, settings: GenerationSettings
-    ) -> Bool {
-        if accumulated.contains("</think>") { return false }
-        if entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn { return true }
-        if accumulated.contains("<think>") { return true }
-        return entry.chatTemplateSupportsThinkingToggle && settings.localThinkingEnabled
+    /// Templates that unconditionally open `<think>` in the generation prompt (stock
+    /// Qwen3/3.6-Thinking and GLM conversions, which usually ship WITHOUT the
+    /// `enable_thinking` variable) can still have thinking turned off: the tag is in
+    /// the prompt, so prefilling `</think>` closes the block before the model reasons.
+    /// Same trick as Qwen's own empty-think prefill, done at the token level.
+    static func noThinkPrefillApplies(to entry: Loaded, settings: GenerationSettings) -> Bool {
+        entry.chatTemplateThinkingBuiltIn
+            && !entry.chatTemplateSupportsThinkingToggle
+            && !settings.localThinkingEnabled
     }
+
+    /// Closes the template's pre-opened think block before decoding starts.
+    nonisolated static let noThinkPrefillText = "</think>\n\n"
 
     /// Qwen/QwQ chat templates read `enable_thinking` from template kwargs.
     /// Models without that variable in their Jinja template ignore it harmlessly.

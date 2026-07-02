@@ -17,6 +17,7 @@ final class AppState {
     let store = ModelStore()
     let server = ForgeServer()
     let launcher = HeadlessLauncher()
+    let runtimeUpdates = RuntimeUpdateChecker()
 
     var conversations: [Conversation] = []
     var selectedConversationID: UUID? {
@@ -29,7 +30,7 @@ final class AppState {
             }
             if oldValue.systemPrompt != settings.systemPrompt
                 || oldValue.localThinkingEnabled != settings.localThinkingEnabled
-                || oldValue.localThinkingEffort != settings.localThinkingEffort
+                || oldValue.localThinkingMaxTokens != settings.localThinkingMaxTokens
             {
                 engine.invalidateChatSessions()
             }
@@ -419,7 +420,9 @@ final class AppState {
         didSet {
             guard oldValue != serverEnabled else { return }
             if serverEnabled {
-                server.start(port: UInt16(clamping: serverPort))
+                server.start(
+                    port: UInt16(clamping: serverPort),
+                    exposeToNetwork: serverExposeToNetwork)
             } else {
                 server.stop()
             }
@@ -429,7 +432,23 @@ final class AppState {
     var serverPort = 3737 {
         didSet {
             guard oldValue != serverPort else { return }
-            if serverEnabled { server.start(port: UInt16(clamping: serverPort)) }
+            if serverEnabled {
+                server.start(
+                    port: UInt16(clamping: serverPort),
+                    exposeToNetwork: serverExposeToNetwork)
+            }
+            scheduleSave()
+        }
+    }
+    /// LM Studio-style "serve on local network": bind all interfaces instead of loopback.
+    var serverExposeToNetwork = false {
+        didSet {
+            guard oldValue != serverExposeToNetwork else { return }
+            if serverEnabled {
+                server.start(
+                    port: UInt16(clamping: serverPort),
+                    exposeToNetwork: serverExposeToNetwork)
+            }
             scheduleSave()
         }
     }
@@ -539,9 +558,12 @@ final class AppState {
         }
 
         serverPort = persistedSettings.serverPort
+        serverExposeToNetwork = persistedSettings.serverExposeToNetwork
         serverEnabled = persistedSettings.serverEnabled
         if serverEnabled {
-            server.start(port: UInt16(clamping: serverPort))
+            server.start(
+                port: UInt16(clamping: serverPort),
+                exposeToNetwork: serverExposeToNetwork)
         }
 
         assignOpenRouterModelIDs(openRouterModelIDs)
@@ -556,6 +578,7 @@ final class AppState {
         didBeginMCP = true
         mcp.start()
         mcp.connectAvailableServers()
+        runtimeUpdates.checkDailyIfNeeded()
     }
 
     // MARK: - User model directories (sandbox-safe)
@@ -1149,7 +1172,6 @@ final class AppState {
                         Task { @MainActor in
                             await self.handleMCPToolRequestIfNeeded(
                                 backend: .local(modelID: activeModelID, label: activeModelLabel),
-                                history: historySnapshot,
                                 originalPrompt: prompt,
                                 images: images,
                                 conversationID: conversationID,
@@ -1392,7 +1414,8 @@ final class AppState {
     private func streamClaude(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
-        allowMCPFollowup: Bool = true
+        mcpDepth: Int = 0,
+        mcpOriginalPrompt: String? = nil
     ) {
         guard let key = SecretsStore.anthropicAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
@@ -1420,13 +1443,11 @@ final class AppState {
 
         isClaudeGenerating = true
         claudeTask = Task { [weak self] in
-            let system: String
-            if allowMCPFollowup {
-                system = await self?.mcpEnrichedSystemPrompt(for: history)
-                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            } else {
-                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            }
+            // Tools stay available on every turn (including MCP follow-ups) so the model can
+            // chain calls. The depth cap in handleMCPToolRequestIfNeeded ends the loop.
+            let system =
+                await self?.mcpEnrichedSystemPrompt(for: history)
+                ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
             do {
                 try await client.stream(
                     model: model, system: system, messages: messages,
@@ -1450,15 +1471,13 @@ final class AppState {
             self?.finishStreamBuffer(messageID)
             self?.isClaudeGenerating = false
             self?.endStreaming(messageID: messageID)
-            if allowMCPFollowup {
-                _ = await self?.handleMCPToolRequestIfNeeded(
-                    backend: .claude(modelID: model),
-                    history: history,
-                    originalPrompt: prompt,
-                    images: [],
-                    conversationID: conversationID,
-                    messageID: messageID)
-            }
+            _ = await self?.handleMCPToolRequestIfNeeded(
+                backend: .claude(modelID: model),
+                originalPrompt: mcpOriginalPrompt ?? prompt,
+                images: [],
+                conversationID: conversationID,
+                messageID: messageID,
+                mcpDepth: mcpDepth)
             self?.scheduleSave()
         }
     }
@@ -1467,7 +1486,8 @@ final class AppState {
     private func streamOpenRouter(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
-        allowMCPFollowup: Bool = true
+        mcpDepth: Int = 0,
+        mcpOriginalPrompt: String? = nil
     ) {
         guard let key = SecretsStore.openRouterAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
@@ -1495,13 +1515,9 @@ final class AppState {
 
         isOpenRouterGenerating = true
         openRouterTasks[messageID] = Task { [weak self] in
-            let system: String
-            if allowMCPFollowup {
-                system = await self?.mcpEnrichedSystemPrompt(for: history)
-                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            } else {
-                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            }
+            let system =
+                await self?.mcpEnrichedSystemPrompt(for: history)
+                ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
             do {
                 try await client.stream(
                     model: model,
@@ -1529,15 +1545,13 @@ final class AppState {
             self?.openRouterTasks.removeValue(forKey: messageID)
             self?.isOpenRouterGenerating = self?.openRouterTasks.isEmpty == false
             self?.endStreaming(messageID: messageID)
-            if allowMCPFollowup {
-                _ = await self?.handleMCPToolRequestIfNeeded(
-                    backend: .openRouter(modelID: model),
-                    history: history,
-                    originalPrompt: prompt,
-                    images: [],
-                    conversationID: conversationID,
-                    messageID: messageID)
-            }
+            _ = await self?.handleMCPToolRequestIfNeeded(
+                backend: .openRouter(modelID: model),
+                originalPrompt: mcpOriginalPrompt ?? prompt,
+                images: [],
+                conversationID: conversationID,
+                messageID: messageID,
+                mcpDepth: mcpDepth)
             self?.scheduleSave()
         }
     }
@@ -1546,7 +1560,8 @@ final class AppState {
     private func streamOpenAI(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
-        allowMCPFollowup: Bool = true
+        mcpDepth: Int = 0,
+        mcpOriginalPrompt: String? = nil
     ) {
         guard let key = SecretsStore.openAIAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
@@ -1574,13 +1589,9 @@ final class AppState {
 
         isOpenAIGenerating = true
         openAITask = Task { [weak self] in
-            let system: String
-            if allowMCPFollowup {
-                system = await self?.mcpEnrichedSystemPrompt(for: history)
-                    ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            } else {
-                system = self?.systemPrompt(for: history, includeMCP: false) ?? ""
-            }
+            let system =
+                await self?.mcpEnrichedSystemPrompt(for: history)
+                ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
             do {
                 try await client.stream(
                     model: model,
@@ -1606,15 +1617,13 @@ final class AppState {
             self?.finishStreamBuffer(messageID)
             self?.isOpenAIGenerating = false
             self?.endStreaming(messageID: messageID)
-            if allowMCPFollowup {
-                _ = await self?.handleMCPToolRequestIfNeeded(
-                    backend: .openAI(modelID: model),
-                    history: history,
-                    originalPrompt: prompt,
-                    images: [],
-                    conversationID: conversationID,
-                    messageID: messageID)
-            }
+            _ = await self?.handleMCPToolRequestIfNeeded(
+                backend: .openAI(modelID: model),
+                originalPrompt: mcpOriginalPrompt ?? prompt,
+                images: [],
+                conversationID: conversationID,
+                messageID: messageID,
+                mcpDepth: mcpDepth)
             self?.scheduleSave()
         }
     }
@@ -1699,12 +1708,24 @@ final class AppState {
     @discardableResult
     private func handleMCPToolRequestIfNeeded(
         backend: ResponseBackend,
-        history: Conversation,
         originalPrompt: String,
         images: [Data],
         conversationID: UUID,
-        messageID: UUID
+        messageID: UUID,
+        mcpDepth: Int = 0
     ) async -> Bool {
+        // Agent-loop bound. Tools stay available on every follow-up turn (so the model can
+        // chain calls — e.g. sequential-thinking's repeated nextThoughtNeeded), so this cap
+        // is the only backstop against a model that never stops calling tools. Reached only
+        // after `settings.mcpMaxIterations` tool calls in a single user turn.
+        let maxIterations = max(1, settings.mcpMaxIterations)
+        guard mcpDepth < maxIterations else {
+            appendSystemMessage(
+                conversationID: conversationID,
+                content: "MCP tool loop reached the \(maxIterations)-call limit — stopping. Raise the MCP iteration cap in Settings for longer chains (e.g. sequential-thinking)."
+            )
+            return false
+        }
         guard let content = messageContent(conversationID: conversationID, messageID: messageID),
               var request = Self.parseMCPCallRequest(from: content)
         else { return false }
@@ -1773,12 +1794,12 @@ final class AppState {
             )
             continueAfterMCPToolResult(
                 backend: backend,
-                history: history,
                 originalPrompt: originalPrompt,
                 images: images,
                 requestLabel: requestLabel,
                 resultText: resultText,
-                conversationID: conversationID)
+                conversationID: conversationID,
+                mcpDepth: mcpDepth + 1)
             return true
         } catch {
             appendSystemMessage(
@@ -1791,14 +1812,18 @@ final class AppState {
 
     private func continueAfterMCPToolResult(
         backend: ResponseBackend,
-        history: Conversation,
         originalPrompt: String,
         images: [Data],
         requestLabel: String,
         resultText: String,
-        conversationID: UUID
+        conversationID: UUID,
+        mcpDepth: Int
     ) {
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+        // Snapshot the live transcript BEFORE appending the new (empty) assistant bubble.
+        // This carries the full chain — prior tool calls, results, and follow-ups — so a
+        // multi-step tool like sequential-thinking sees its earlier thoughts on the next call.
+        let liveHistory = conversations[ci]
         var assistant = ChatMessage(role: .assistant, content: "")
         assistant.modelName = "\(backend.modelName) • MCP"
         var conversation = conversations[ci]
@@ -1813,7 +1838,8 @@ final class AppState {
 
             \(resultText)
 
-            Answer the user's original request using the MCP result. Original request:
+            Use this result to continue. If another MCP tool call is needed to fully answer, \
+            call it now; otherwise answer the user's original request. Original request:
             \(originalPrompt)
             """
 
@@ -1821,10 +1847,10 @@ final class AppState {
         case .local(let modelID, _):
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: history)
+                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: liveHistory)
                 self.engine.generate(
                     conversation: self.historyWithMCPInstructions(
-                        history, mcpSystemPrompt: systemInstructions),
+                        liveHistory, mcpSystemPrompt: systemInstructions),
                     prompt: prompt,
                     images: images,
                     settings: self.settings,
@@ -1855,32 +1881,46 @@ final class AppState {
                     }
                     self.endStreaming(messageID: messageID)
                     self.scheduleSave()
+                    // Close the loop: re-scan the follow-up for another tool call. The depth
+                    // cap in handleMCPToolRequestIfNeeded is the only thing that ends the chain.
+                    Task { @MainActor in
+                        await self.handleMCPToolRequestIfNeeded(
+                            backend: backend,
+                            originalPrompt: originalPrompt,
+                            images: images,
+                            conversationID: conversationID,
+                            messageID: messageID,
+                            mcpDepth: mcpDepth)
+                    }
                 })
             }
         case .claude(let modelID):
             streamClaude(
                 model: modelID,
-                history: history,
+                history: liveHistory,
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
-                allowMCPFollowup: false)
+                mcpDepth: mcpDepth,
+                mcpOriginalPrompt: originalPrompt)
         case .openRouter(let modelID):
             streamOpenRouter(
                 model: modelID,
-                history: history,
+                history: liveHistory,
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
-                allowMCPFollowup: false)
+                mcpDepth: mcpDepth,
+                mcpOriginalPrompt: originalPrompt)
         case .openAI(let modelID):
             streamOpenAI(
                 model: modelID,
-                history: history,
+                history: liveHistory,
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
-                allowMCPFollowup: false)
+                mcpDepth: mcpDepth,
+                mcpOriginalPrompt: originalPrompt)
         }
     }
 
@@ -2233,7 +2273,8 @@ final class AppState {
                 lastLoadedModelPath: nil,
                 loadedModelPaths: [],
                 serverEnabled: serverEnabled,
-                serverPort: serverPort))
+                serverPort: serverPort,
+                serverExposeToNetwork: serverExposeToNetwork))
     }
 
     /// Helper for photo review via MCP (strict list item).

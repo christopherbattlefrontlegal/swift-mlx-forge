@@ -13,6 +13,7 @@ struct TuningInspector: View {
     @AppStorage("inspector.promptExpanded") private var promptExpanded = true
     @AppStorage("inspector.modelsExpanded") private var modelsExpanded = true
     @AppStorage("inspector.mcpExpanded") private var mcpExpanded = true
+    @AppStorage("inspector.runtimesExpanded") private var runtimesExpanded = false
 
     var body: some View {
         @Bindable var app = app
@@ -231,9 +232,24 @@ struct TuningInspector: View {
                         label: "Port", value: $app.serverPort,
                         limit: 1024...65535)
 
+                    Toggle(isOn: $app.serverExposeToNetwork) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Serve on local network")
+                                .font(.callout)
+                            Text("Other machines on the LAN can attach")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .tint(Theme.ember)
+                    .help(
+                        "Binds the server to all interfaces so other devices on your network "
+                            + "can reach it at the addresses shown below. Off = loopback only.")
+
                     switch app.server.state {
                     case .running:
-                        if let url = app.server.baseURL {
+                        ForEach(app.server.reachableBaseURLs, id: \.self) { url in
                             HStack(spacing: Theme.s2) {
                                 Circle()
                                     .fill(Theme.okGreen)
@@ -253,6 +269,8 @@ struct TuningInspector: View {
                                 .buttonStyle(.plain)
                                 .help("Copy base URL")
                             }
+                        }
+                        if !app.server.reachableBaseURLs.isEmpty {
                             labeledValue("Requests served", "\(app.server.requestsServed)")
                             if app.server.activeRequests > 0 {
                                 labeledValue("In flight", "\(app.server.activeRequests)")
@@ -263,9 +281,61 @@ struct TuningInspector: View {
                             .font(.caption)
                             .foregroundStyle(.red)
                     case .stopped:
-                        Text("Loopback only (127.0.0.1) — nothing leaves this Mac.")
+                        Text(
+                            app.serverExposeToNetwork
+                                ? "Will serve on all interfaces when enabled."
+                                : "Loopback only (127.0.0.1) — nothing leaves this Mac.")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
+                    }
+                }
+
+                collapsibleSection(
+                    "Runtimes", icon: "arrow.triangle.2.circlepath", expanded: $runtimesExpanded,
+                    badge: app.runtimeUpdates.updatesAvailable,
+                    detail: app.runtimeUpdates.updatesAvailable ? "update available" : nil
+                ) {
+                    ForEach(app.runtimeUpdates.statuses) { status in
+                        HStack(spacing: Theme.s2) {
+                            Text(status.label)
+                                .font(.caption)
+                            Spacer()
+                            Text(
+                                status.updateAvailable
+                                    ? "\(status.current) → \(status.latest ?? "?")"
+                                    : status.current)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(
+                                    status.updateAvailable ? Theme.emberGlow : .secondary)
+                        }
+                    }
+                    HStack(spacing: Theme.s2) {
+                        Button(app.runtimeUpdates.isChecking ? "Checking…" : "Check for Updates") {
+                            app.runtimeUpdates.checkNow()
+                        }
+                        .font(.caption)
+                        .disabled(app.runtimeUpdates.isChecking)
+                        Spacer()
+                        if let checked = app.runtimeUpdates.lastChecked {
+                            Text(checked.formatted(.relative(presentation: .named)))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    if app.runtimeUpdates.updatesAvailable {
+                        Text(
+                            "Runtimes are compiled in — run scripts/update-runtimes.sh to bump the pins and rebuild Forge.app."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    }
+                    if let error = app.runtimeUpdates.lastError {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
@@ -276,6 +346,23 @@ struct TuningInspector: View {
                 ) {
                     MCPInspectorPanel()
                         .environment(app)
+                    Stepper(
+                        "Tool-call limit: \(app.settings.mcpMaxIterations)",
+                        value: Binding(
+                            get: { app.settings.mcpMaxIterations },
+                            set: { value in
+                                var next = app.settings
+                                next.mcpMaxIterations = max(1, value)
+                                app.settings = next
+                            }),
+                        in: 1...64
+                    )
+                    .font(.caption)
+                    .help(
+                        "Max chained MCP tool calls per turn — e.g. sequential-thinking's repeated "
+                        + "thoughts. Forge keeps tools available across follow-up turns and stops the "
+                        + "loop after this many calls so a runaway model can't loop forever."
+                    )
                 }
                 }
                 .padding(Theme.s3)
@@ -326,7 +413,15 @@ struct TuningInspector: View {
 
     @ViewBuilder
     private var localThinkingSection: some View {
-        if let active = app.engine.activeModel, !active.model.isGGUF {
+        if let active = app.engine.activeModel, active.model.isGGUF {
+            Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
+                .help(
+                    "On: reasoning streams into the chat as a live <think> block. "
+                        + "Off: llama.cpp injects an empty thinking block so the model skips reasoning.")
+            if app.settings.localThinkingEnabled {
+                localThinkingEffortPicker
+            }
+        } else if let active = app.engine.activeModel {
             if active.chatTemplateSupportsThinkingToggle {
                 Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
                     .disabled(active.chatTemplateThinkingOnly)
@@ -338,18 +433,15 @@ struct TuningInspector: View {
                     localThinkingEffortPicker
                 }
             } else if active.chatTemplateThinkingBuiltIn {
-                HStack {
-                    Text("Thinking mode")
-                        .font(.callout)
-                    Spacer()
-                    Text("Always on")
-                        .font(.callout)
-                        .foregroundStyle(Theme.emberGlow)
+                Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
+                    .help(
+                        "This checkpoint's chat template pre-opens a reasoning block on every turn. "
+                            + "On: reasoning runs as usual. Off: Forge closes the block immediately "
+                            + "(token-level </think> prefill) so the model answers directly — no chat "
+                            + "template files are touched.")
+                if app.settings.localThinkingEnabled {
+                    localThinkingEffortPicker
                 }
-                .help(
-                    "This checkpoint's chat template always opens a reasoning block at generation time "
-                        + "(typical stock Qwen3). Turn on \"Show reasoning in chat\" below to see it.")
-                localThinkingEffortPicker
             } else if active.chatTemplateHasTemplate {
                 Text(
                     "No enable_thinking toggle in this model's template — reasoning follows the checkpoint as-is.")
@@ -366,42 +458,56 @@ struct TuningInspector: View {
         }
     }
 
+    private static let thinkingTokenPresets = [100, 250, 500, 750, 1000, 2000, 4000]
+
+    private var localThinkingBudgetBinding: Binding<Int> {
+        Binding(
+            get: { app.settings.localThinkingMaxTokens },
+            set: { value in
+                var next = app.settings
+                next.localThinkingMaxTokens = max(0, value)
+                app.settings = next
+            })
+    }
+
     private var localThinkingEffortPicker: some View {
-        Picker(
-            "Thinking effort",
-            selection: Binding(
-                get: {
-                    LocalThinkingEffort(rawValue: app.settings.localThinkingEffort) ?? .infinity
-                },
-                set: { level in
-                    var next = app.settings
-                    next.localThinkingEffort = level.rawValue
-                    app.settings = next
-                })
-        ) {
-            ForEach(LocalThinkingEffort.allCases) { level in
-                Text(level.menuLabel).tag(level)
+        HStack(spacing: Theme.s2) {
+            Text("Max thinking tokens")
+                .font(.callout)
+            Spacer()
+            TextField("∞", value: localThinkingBudgetBinding, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 72)
+            Menu {
+                Button("Unlimited (∞)") { localThinkingBudgetBinding.wrappedValue = 0 }
+                ForEach(Self.thinkingTokenPresets, id: \.self) { value in
+                    Button("\(value)") { localThinkingBudgetBinding.wrappedValue = value }
+                }
+            } label: {
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.bold))
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
         }
-        .pickerStyle(.menu)
         .help(
-            "Prepends a thinking-budget line to each turn (before your message). "
-                + "Target Low ~100 · Medium ~250 · High ~350 · Max ~750, with ~10% grace "
-                + "before Forge force-closes </think>. Infinity = no cap.")
+            "Caps reasoning tokens per turn (0 or blank = unlimited). The budget is stated "
+                + "to the model at the start of the turn so it wraps up its own thinking; if it "
+                + "overruns by more than ~10%, Forge closes </think> and the answer continues — "
+                + "the run is never cut off.")
     }
 
     private var reasoningSectionDetail: String {
         var parts: [String] = []
         if let active = app.engine.activeModel, !active.model.isGGUF {
-            if active.chatTemplateSupportsThinkingToggle {
+            if active.chatTemplateSupportsThinkingToggle || active.chatTemplateThinkingBuiltIn {
                 parts.append(app.settings.localThinkingEnabled ? "think" : "no-think")
-            } else if active.chatTemplateThinkingBuiltIn {
-                parts.append("think·on")
             } else if !active.chatTemplateHasTemplate {
                 parts.append("n/a")
             }
             if InferenceEngine.thinkingBudgetApplies(to: active, settings: app.settings) {
-                parts.append("cap \(app.settings.resolvedLocalThinkingEffort.shortDetail)")
+                parts.append("cap \(app.settings.localThinkingMaxTokens)")
             }
         }
         parts.append(app.settings.reasoningEnabled ? "show · \(app.settings.anthropicEffort)" : "hidden")

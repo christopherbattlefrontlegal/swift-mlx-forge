@@ -260,7 +260,7 @@ struct MessageView: View {
                         .font(.callout)
                         .foregroundStyle(.tertiary)
                 } else {
-                    StreamingPlainTextView(text: liveAssistantText)
+                    StreamingSegmentsView(text: liveAssistantText)
                 }
             } else if !message.segments.isEmpty {
                 ForEach(message.segments) { segment in
@@ -314,9 +314,75 @@ struct MessageView: View {
 
 // MARK: - Streaming text (AppKit)
 
+/// Live-streaming assistant bubble: splits the in-flight text into thinking/answer
+/// segments so reasoning is visible AS IT STREAMS (expanded, collapsible), instead of
+/// a raw text wall that only turns into a Reasoning block after completion. Segment
+/// ids are positional, so SwiftUI updates each block in place on every flush.
+private struct StreamingSegmentsView: View {
+    let text: String
+
+    var body: some View {
+        let segments = ChatMessage(role: .assistant, content: text).segments
+        VStack(alignment: .leading, spacing: Theme.s3) {
+            ForEach(segments) { segment in
+                switch segment.kind {
+                case .thinking(let done):
+                    LiveThinkingBlock(text: segment.text, done: done)
+                case .answer:
+                    if !segment.text.isEmpty {
+                        StreamingPlainTextView(text: segment.text)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Expanded-by-default reasoning block for in-flight generations. Uses the appending
+/// NSTextView so token flushes don't relayout the whole transcript.
+private struct LiveThinkingBlock: View {
+    let text: String
+    let done: Bool
+    @State private var expanded = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: Theme.s2) {
+                    Image(systemName: "brain")
+                        .foregroundStyle(Theme.emberGlow)
+                    Text(done ? "Reasoning" : "Reasoning…")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if !done {
+                        ProgressView()
+                            .controlSize(.mini)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                StreamingPlainTextView(text: text, secondary: true)
+            }
+        }
+        .padding(Theme.s3)
+        .background(.white.opacity(0.03))
+        .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+    }
+}
+
 /// Non-scrollable NSTextView that appends deltas instead of relayouting SwiftUI `Text` every flush.
 private struct StreamingPlainTextView: NSViewRepresentable {
     let text: String
+    var secondary: Bool = false
 
     func makeNSView(context: Context) -> NSTextView {
         let textView = NSTextView()
@@ -329,8 +395,8 @@ private struct StreamingPlainTextView: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(
             width: 0, height: CGFloat.greatestFiniteMagnitude)
-        textView.font = NSFont.preferredFont(forTextStyle: .body)
-        textView.textColor = .labelColor
+        textView.font = NSFont.preferredFont(forTextStyle: secondary ? .callout : .body)
+        textView.textColor = secondary ? .secondaryLabelColor : .labelColor
         context.coordinator.textView = textView
         return textView
     }

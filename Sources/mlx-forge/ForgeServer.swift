@@ -42,10 +42,24 @@ final class ForgeServer {
     /// enforcement is keyed off the real socket, not the observable `state` (which
     /// can briefly lag a stale listener's lifecycle events).
     private var boundPort: UInt16?
+    /// Whether the bound listener accepts connections from the local network
+    /// (LM Studio-style "serve on network") instead of loopback only.
+    private(set) var exposedToNetwork = false
 
     var baseURL: String? {
         guard case .running(let port) = state else { return nil }
         return "http://127.0.0.1:\(port)/v1"
+    }
+
+    /// Every base URL the server is reachable at — loopback plus, when exposed to
+    /// the network, each active LAN address and the machine's .local hostname.
+    var reachableBaseURLs: [String] {
+        guard case .running(let port) = state else { return [] }
+        var urls = ["http://127.0.0.1:\(port)/v1"]
+        if exposedToNetwork {
+            urls += LocalNetwork.lanHosts().map { "http://\($0):\(port)/v1" }
+        }
+        return urls
     }
 
     // MARK: - Lifecycle
@@ -53,25 +67,33 @@ final class ForgeServer {
     /// Stops any existing listener, then binds after a short grace period so
     /// the cancelled socket is fully released (immediate rebind can hit
     /// EADDRINUSE even with address reuse enabled).
-    func start(port: UInt16) {
+    func start(port: UInt16, exposeToNetwork: Bool = false) {
         startGeneration += 1
         let generation = startGeneration
         stop()
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard generation == self.startGeneration else { return }
-            self.bind(port: port)
+            self.bind(port: port, exposeToNetwork: exposeToNetwork)
         }
     }
 
-    private func bind(port: UInt16) {
-        FileHandle.standardError.write(Data("[forge-server] bind(port: \(port))\n".utf8))
+    private func bind(port: UInt16, exposeToNetwork: Bool) {
+        FileHandle.standardError.write(
+            Data("[forge-server] bind(port: \(port), network: \(exposeToNetwork))\n".utf8))
         do {
             let parameters = NWParameters.tcp
             parameters.allowLocalEndpointReuse = true
-            // Loopback only — never expose the firm's models to the network.
-            parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
-                host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
+            if !exposeToNetwork {
+                // Loopback only (default) — the models never leave the machine.
+                parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+                    host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
+            } else {
+                // Serve on all interfaces so other machines on the LAN can attach.
+                parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+                    host: .ipv4(.any), port: NWEndpoint.Port(rawValue: port)!)
+            }
+            exposedToNetwork = exposeToNetwork
             let listener = try NWListener(using: parameters)
             listener.newConnectionHandler = { [weak self] connection in
                 Task { @MainActor [weak self] in
@@ -130,12 +152,16 @@ final class ForgeServer {
     /// The Host/Origin values that are legitimately us. Anything else is either a
     /// DNS-rebinding attempt (attacker domain resolved to 127.0.0.1 → forged Host)
     /// or a drive-by request from a website the user happens to be visiting.
+    /// When serving on the network, the machine's LAN addresses and hostnames are
+    /// also us — anything else still gets rejected.
     private func localIdentity() -> (hosts: Set<String>, origins: Set<String>)? {
         guard let port = boundPort else { return nil }
-        let hosts: Set<String> = ["127.0.0.1:\(port)", "localhost:\(port)", "[::1]:\(port)"]
-        let origins: Set<String> = [
-            "http://127.0.0.1:\(port)", "http://localhost:\(port)", "http://[::1]:\(port)",
-        ]
+        var hostNames = ["127.0.0.1", "localhost", "[::1]"]
+        if exposedToNetwork {
+            hostNames += LocalNetwork.lanHosts()
+        }
+        let hosts = Set(hostNames.map { "\($0):\(port)" })
+        let origins = Set(hostNames.map { "http://\($0):\(port)" })
         return (hosts, origins)
     }
 
@@ -266,19 +292,43 @@ final class ForgeServer {
             }
         }
 
-        // GGUF (llama.cpp) models aren't wired into the API server yet.
-        guard let container = entry.container else {
-            await HTTPResponse.sendError(
-                on: connection, status: "501 Not Implemented",
-                message: "GGUF models are not yet available via the API server — use the chat UI.",
-                allowOrigin: allowOrigin)
+        // Stateless API: fresh session per request. Split out system instructions and prior
+        // turns into the session history; the final user turn is the one we reply to. (An
+        // earlier version built a history-less session and streamed only `messages.last`,
+        // silently dropping the whole conversation and the system prompt.)
+        let systemText = messages
+            .filter { $0.role == .system }
+            .map(\.content)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let history = Array(messages.filter { $0.role != .system }.dropLast())
+        let settings = defaultSettings()
+
+        let responseIDForEntry = "chatcmpl-\(UUID().uuidString.prefix(12))"
+        let createdForEntry = Int(Date().timeIntervalSince1970)
+
+        // GGUF (llama.cpp) models serve through the same OpenAI surface as MLX.
+        if let gguf = entry.gguf {
+            await ggufChat(
+                gguf, messages: messages, systemText: systemText,
+                temperature: chat.temperature, topP: chat.top_p,
+                stream: chat.stream == true, model: chat.model,
+                responseID: responseIDForEntry, created: createdForEntry,
+                on: connection, allowOrigin: allowOrigin)
+            engine?.refreshMemory()
             return
         }
 
-        // Stateless API: fresh session per request, full history each time.
-        let settings = defaultSettings()
+        guard let container = entry.container else {
+            await HTTPResponse.sendError(
+                on: connection, status: "503 Service Unavailable",
+                message: "Model backend is not available.", allowOrigin: allowOrigin)
+            return
+        }
         let session = ChatSession(
             container,
+            instructions: systemText.isEmpty ? nil : systemText,
+            history: history,
             generateParameters: parameters,
             additionalContext: InferenceEngine.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled))
@@ -331,29 +381,50 @@ final class ForgeServer {
         await HTTPResponse.sendRaw(
             on: connection,
             "data: \(chunkJSON(delta: ["role": "assistant"], finish: nil))\n\n")
-        guard let gate = engine?.gate else { return }
+        guard let gate = engine?.gate else {
+            // Engine was torn down after we already sent the 200 head — terminate the SSE
+            // stream explicitly so the client doesn't wait on a socket that never closes.
+            await HTTPResponse.sendRaw(
+                on: connection,
+                "data: {\"error\":{\"message\":\"Model engine unavailable.\"}}\n\n")
+            await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
+            return
+        }
         // Generation holds an exclusive MLX turn — it can never overlap the
         // chat UI's stream or another API request (concurrent MLX evals on
         // one Metal device are a GPU-fault, not a slowdown).
         await gate.withTurn {
             do {
-                let prompt = messages.last?.content ?? ""
-                let role = messages.last?.role ?? .user
-                let images = messages.last?.images ?? []
-                let videos = messages.last?.videos ?? []
-                for try await chunk in session.streamResponse(
+                // The session already carries the prior turns as history; the final user
+                // message is the turn we are replying to.
+                let replyTarget = messages.last(where: { $0.role != .system })
+                let prompt = replyTarget?.content ?? ""
+                let role = replyTarget?.role ?? .user
+                let images = replyTarget?.images ?? []
+                let videos = replyTarget?.videos ?? []
+                var finishReason = "stop"
+                for try await item in session.streamDetails(
                     to: prompt, role: role, images: images, videos: videos)
                 {
-                    let delivered = await HTTPResponse.sendRaw(
-                        on: connection,
-                        "data: \(chunkJSON(delta: ["content": chunk], finish: nil))\n\n")
-                    // Client hung up — stop generating instead of burning GPU
-                    // to completion into a dead socket (ending iteration
-                    // cancels the underlying generation).
-                    guard delivered else { return }
+                    if Task.isCancelled { break }
+                    switch item {
+                    case .chunk(let chunk):
+                        let delivered = await HTTPResponse.sendRaw(
+                            on: connection,
+                            "data: \(chunkJSON(delta: ["content": chunk], finish: nil))\n\n")
+                        // Client hung up — stop generating instead of burning GPU to
+                        // completion into a dead socket (ending iteration cancels the
+                        // underlying generation).
+                        guard delivered else { return }
+                    case .info(let info):
+                        // Report length-truncation honestly so clients can retry/extend.
+                        if info.stopReason == .length { finishReason = "length" }
+                    case .toolCall:
+                        break
+                    }
                 }
                 await HTTPResponse.sendRaw(
-                    on: connection, "data: \(chunkJSON(delta: [:], finish: "stop"))\n\n")
+                    on: connection, "data: \(chunkJSON(delta: [:], finish: finishReason))\n\n")
                 await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
             } catch {
                 FileHandle.standardError.write(
@@ -362,6 +433,9 @@ final class ForgeServer {
                 let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
                 await HTTPResponse.sendRaw(
                     on: connection, "data: \(String(decoding: data, as: UTF8.self))\n\n")
+                // The SSE protocol requires [DONE] to terminate the stream — some SDKs
+                // only finalize their iterator when they see it.
+                await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
             }
         }
     }
@@ -381,10 +455,11 @@ final class ForgeServer {
             var info: GenerateCompletionInfo?
             // Exclusive MLX turn — see streamChat for why.
             try await gate.withTurn {
-                let prompt = messages.last?.content ?? ""
-                let role = messages.last?.role ?? .user
-                let images = messages.last?.images ?? []
-                let videos = messages.last?.videos ?? []
+                let replyTarget = messages.last(where: { $0.role != .system })
+                let prompt = replyTarget?.content ?? ""
+                let role = replyTarget?.role ?? .user
+                let images = replyTarget?.images ?? []
+                let videos = replyTarget?.videos ?? []
                 for try await item in session.streamDetails(
                     to: prompt, role: role, images: images, videos: videos
                 ) {
@@ -395,6 +470,7 @@ final class ForgeServer {
                     }
                 }
             }
+            let finishReason = info?.stopReason == .length ? "length" : "stop"
             let body: [String: Any] = [
                 "id": responseID, "object": "chat.completion",
                 "created": created, "model": model,
@@ -402,7 +478,7 @@ final class ForgeServer {
                     [
                         "index": 0,
                         "message": ["role": "assistant", "content": output],
-                        "finish_reason": "stop",
+                        "finish_reason": finishReason,
                     ]
                 ],
                 "usage": [
@@ -420,6 +496,136 @@ final class ForgeServer {
                 on: connection, status: "500 Internal Server Error",
                 message: "Inference failed.", allowOrigin: allowOrigin)
         }
+    }
+
+    /// Serves a GGUF (llama.cpp) model over the OpenAI surface. Same gate discipline
+    /// as MLX — llama.cpp competes for the same GPU.
+    private func ggufChat(
+        _ gguf: GGUFRuntime,
+        messages: [Chat.Message],
+        systemText: String,
+        temperature: Double?, topP: Double?,
+        stream: Bool,
+        model: String, responseID: String, created: Int,
+        on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard let gate = engine?.gate else {
+            await HTTPResponse.sendError(
+                on: connection, status: "503 Service Unavailable",
+                message: "Engine not available.", allowOrigin: allowOrigin)
+            return
+        }
+        let settings = defaultSettings()
+        let priorTurns = Array(messages.filter { $0.role != .system }.dropLast())
+        let history: [(role: GGUFRuntime.HistoryRole, content: String)] = priorTurns.compactMap {
+            message in
+            switch message.role {
+            case .user: return (.user, message.content)
+            case .assistant: return (.assistant, message.content)
+            default: return nil
+            }
+        }
+        let prompt = messages.last(where: { $0.role != .system })?.content ?? ""
+
+        @Sendable func chunkJSON(delta: [String: Any], finish: String?) -> String {
+            let object: [String: Any] = [
+                "id": responseID, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [
+                    ["index": 0, "delta": delta, "finish_reason": finish as Any]
+                ],
+            ]
+            let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+            return String(decoding: data, as: UTF8.self)
+        }
+
+        if stream {
+            await HTTPResponse.sendHead(
+                on: connection, status: "200 OK", contentType: "text/event-stream",
+                allowOrigin: allowOrigin)
+            await HTTPResponse.sendRaw(
+                on: connection,
+                "data: \(chunkJSON(delta: ["role": "assistant"], finish: nil))\n\n")
+            await gate.withTurn {
+                gguf.configure(
+                    temperature: temperature ?? settings.temperature,
+                    topP: topP ?? settings.topP,
+                    topK: settings.topK,
+                    system: systemText.isEmpty ? nil : systemText,
+                    history: history)
+                _ = await gguf.respond(to: prompt) { delta in
+                    let delivered = await HTTPResponse.sendRaw(
+                        on: connection,
+                        "data: \(chunkJSON(delta: ["content": delta], finish: nil))\n\n")
+                    // Client hung up — stop llama.cpp instead of generating into a dead socket.
+                    if !delivered { gguf.stop() }
+                }
+                await HTTPResponse.sendRaw(
+                    on: connection, "data: \(chunkJSON(delta: [:], finish: "stop"))\n\n")
+                await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
+            }
+        } else {
+            let output = await gate.withTurn {
+                gguf.configure(
+                    temperature: temperature ?? settings.temperature,
+                    topP: topP ?? settings.topP,
+                    topK: settings.topK,
+                    system: systemText.isEmpty ? nil : systemText,
+                    history: history)
+                return await gguf.respond(to: prompt) { _ in }
+            }
+            // llama.cpp's wrapper doesn't expose token counts — report zeros rather than guesses.
+            let body: [String: Any] = [
+                "id": responseID, "object": "chat.completion",
+                "created": created, "model": model,
+                "choices": [
+                    [
+                        "index": 0,
+                        "message": ["role": "assistant", "content": output],
+                        "finish_reason": "stop",
+                    ]
+                ],
+                "usage": ["prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0],
+            ]
+            await HTTPResponse.sendJSON(on: connection, object: body, allowOrigin: allowOrigin)
+        }
+    }
+}
+
+// MARK: - Local network identity
+
+/// Enumerates the machine's LAN identities (IPv4 addresses of active non-loopback
+/// interfaces + the .local hostname) for display and Host-header validation when
+/// the server is exposed to the network.
+enum LocalNetwork {
+    static func lanHosts() -> [String] {
+        var hosts: [String] = []
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&addresses) == 0 {
+            var cursor = addresses
+            while let current = cursor {
+                defer { cursor = current.pointee.ifa_next }
+                let flags = Int32(current.pointee.ifa_flags)
+                guard (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) == 0,
+                    let addr = current.pointee.ifa_addr,
+                    addr.pointee.sa_family == sa_family_t(AF_INET)
+                else { continue }
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(
+                    addr, socklen_t(addr.pointee.sa_len), &buffer, socklen_t(buffer.count),
+                    nil, 0, NI_NUMERICHOST) == 0
+                {
+                    let host = String(cString: buffer)
+                    if !host.isEmpty, !hosts.contains(host) { hosts.append(host) }
+                }
+            }
+            freeifaddrs(addresses)
+        }
+        let localHostName = Host.current().names.first { $0.hasSuffix(".local") }
+        if let localHostName, !hosts.contains(localHostName) {
+            hosts.append(localHostName)
+        }
+        return hosts
     }
 }
 

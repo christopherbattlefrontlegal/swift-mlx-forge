@@ -23,11 +23,16 @@ enum ChatTemplateSniffer {
         let lower = template.lowercased()
         if template.contains("enable_thinking") {
             caps.supportsThinkingToggle = true
+            // Stock Qwen3 writes `enable_thinking is false`; GLM writes
+            // `not enable_thinking`. Any of these means the template has a
+            // real off-branch and the toggle works both ways.
             let hasOffBranch =
                 lower.contains("not enable_thinking")
                 || lower.contains("enable_thinking=false")
                 || lower.contains("enable_thinking = false")
                 || lower.contains("enable_thinking==false")
+                || lower.contains("enable_thinking == false")
+                || lower.contains("enable_thinking is false")
             caps.thinkingOnly = !hasOffBranch
         }
         if detectsBuiltInThinkingPrompt(in: template) {
@@ -77,15 +82,22 @@ enum ChatTemplateSniffer {
     }
 
     /// Qwen3 stock templates end generation with `<|im_start|>assistant` + an opening think tag.
+    ///
+    /// An open tag immediately followed by `</think>` is the OPPOSITE signal: that's the
+    /// empty-block *no-think prefill* (`<think>\n\n</think>`) hybrid templates emit when
+    /// `enable_thinking=false`. Counting it as always-on reasoning made Forge treat plain
+    /// answers as thinking — mislabeling the UI and burning the thinking budget on them.
     nonisolated private static func detectsBuiltInThinkingPrompt(in template: String) -> Bool {
         guard template.contains("add_generation_prompt") else { return false }
-        let markers = [
-            "<think>\\n",
-            "<think>\\n\\n",
-            "'<think>'",
-            "\"<think>\"",
-        ]
-        return markers.contains { template.contains($0) }
+        var searchRange = template.startIndex..<template.endIndex
+        while let open = template.range(of: "<think>", range: searchRange) {
+            // The empty prefill is at most `\n\n</think>` away (escaped `\n` in the
+            // template source is two characters, so a short window covers both forms).
+            let window = template[open.upperBound...].prefix(12)
+            if !window.contains("</think>") { return true }
+            searchRange = open.upperBound..<template.endIndex
+        }
+        return false
     }
 
     nonisolated private static func readTokenizerConfig(at url: URL) -> String? {

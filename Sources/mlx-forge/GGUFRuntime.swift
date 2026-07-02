@@ -46,8 +46,6 @@ final class GGUFRuntime: @unchecked Sendable {
         }
         if name.contains("llama") || name.contains("bonsai") { return .llama(system) }
         if name.contains("alpaca") { return .alpaca(system) }
-        if name.contains("mistral") { return .mistral }
-        if name.contains("gemma") { return .gemma }
         return .chatML(system)
     }
 
@@ -67,10 +65,16 @@ final class GGUFRuntime: @unchecked Sendable {
 
     /// Streams a reply, calling `onDelta` per chunk; returns the full text.
     /// Cancel by calling `stop()` (or cancelling the surrounding Task).
+    ///
+    /// `thinkingEnabled: true` streams reasoning inline (raw `<think>` text the chat UI
+    /// renders as a live reasoning block); `false` uses llama.cpp's suppressed mode,
+    /// which injects an empty thinking block so the model skips reasoning entirely.
     func respond(
-        to prompt: String, onDelta: @escaping @Sendable (String) async -> Void
+        to prompt: String, thinkingEnabled: Bool = true,
+        onDelta: @escaping @Sendable (String) async -> Void
     ) async -> String {
-        await llm.respond(to: prompt) { stream in
+        await llm.respond(to: prompt, thinking: thinkingEnabled ? .none : .suppressed) {
+            stream in
             var text = ""
             for await delta in stream {
                 if Task.isCancelled { break }
