@@ -18,7 +18,13 @@ final class GGUFRuntime: @unchecked Sendable {
     private let llm: LLM
     private let fileURL: URL
 
-    init?(fileURL: URL, maxTokens: Int32 = 8192) {
+    /// `onLoadProgress` fires on llama.cpp's loader thread with 0…1 as tensors
+    /// are read into memory (a 100GB+ file takes minutes — this is the only
+    /// signal that anything is happening).
+    init?(
+        fileURL: URL, maxTokens: Int32 = 8192,
+        onLoadProgress: (@Sendable (Double) -> Void)? = nil
+    ) {
         guard fileURL.isFileURL else { return nil }
         let fm = FileManager.default
         guard fm.fileExists(atPath: fileURL.path) else { return nil }
@@ -26,7 +32,14 @@ final class GGUFRuntime: @unchecked Sendable {
             || FileHandle(forReadingAtPath: fileURL.path) != nil
         else { return nil }
         let ctx = max(2048, min(maxTokens, 131_072))
-        guard let llm = LLM(from: fileURL, maxTokenCount: ctx) else { return nil }
+        let progress: ((Float) -> Bool)? = onLoadProgress.map { report in
+            { fraction in
+                report(Double(fraction))
+                return true
+            }
+        }
+        guard let llm = LLM(from: fileURL, maxTokenCount: ctx, loadProgress: progress)
+        else { return nil }
         self.fileURL = fileURL
         self.llm = llm
     }

@@ -305,12 +305,25 @@ final class InferenceEngine {
         let settings = generationSettings()
         let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 8192
         let url = model.directory
+        let modelID = model.id
+        // llama.cpp reports load progress per tensor from its loader thread —
+        // throttle to whole-percent steps before hopping to the main actor.
+        let lastPercent = GGUFLoadProgressThrottle()
         let runtime = await gate.withTurn {
             await Task.detached(priority: .userInitiated) {
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 return GGUFRuntime(
-                    fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)))
+                    fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)),
+                    onLoadProgress: { [weak self] fraction in
+                        guard lastPercent.advance(to: fraction) else { return }
+                        Task { @MainActor in
+                            guard let self,
+                                self.loadingModels.keys.contains(modelID)
+                            else { return }
+                            self.loadingModels[modelID] = fraction
+                        }
+                    })
             }.value
         }
         guard let runtime else {
@@ -1238,6 +1251,24 @@ final class InferenceEngine {
         activeMemory = Memory.activeMemory
         cacheMemory = Memory.cacheMemory
         peakMemory = Memory.peakMemory
+    }
+}
+
+/// Rate-limits llama.cpp's per-tensor load-progress callback to whole-percent
+/// steps. Called from a single loader thread; the lock guards the cross-thread
+/// read from the main actor's perspective.
+final class GGUFLoadProgressThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastPercent = -1
+
+    /// Returns true when `fraction` crosses into a new whole percent.
+    func advance(to fraction: Double) -> Bool {
+        let percent = Int((fraction * 100).rounded(.down))
+        lock.lock()
+        defer { lock.unlock() }
+        guard percent > lastPercent else { return false }
+        lastPercent = percent
+        return true
     }
 }
 

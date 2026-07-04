@@ -57,11 +57,10 @@ let package = Package(
 
         // llama.cpp (GGUF) backend for the Forge app — Metal-accelerated,
         // compiled in-process (sandbox-safe). Second engine next to MLX.
-        // 2.1.0: newer llama.cpp runtime, multi-turn fix, and ThinkingMode
-        // (separate reasoning stream + suppressed-thinking toggle).
-        .package(
-            url: "https://github.com/eastriverlee/LLM.swift",
-            exact: "2.1.0"),
+        // Vendored fork of eastriverlee/LLM.swift 2.1.0 with the bundled
+        // llama.xcframework upgraded to llama.cpp b9870 — required for the
+        // nemotron_h_moe architecture (Nemotron 3 Super/Nano MoE GGUFs).
+        .package(path: "Vendor/LLM.swift"),
     ],
     targets: [
         .executableTarget(

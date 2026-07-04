@@ -373,45 +373,22 @@ private struct LiveThinkingBlock: View {
     }
 }
 
-/// Non-scrollable NSTextView that appends deltas instead of relayouting SwiftUI `Text` every flush.
-private struct StreamingPlainTextView: NSViewRepresentable {
+/// Live streaming text as plain SwiftUI `Text`. SwiftUI owns the layout, so the
+/// row grows cleanly per flush — no AppKit text view whose measurement mutates
+/// layout state and re-layouts (flashes) the whole window on every token flush.
+/// Markdown is deliberately NOT parsed while streaming; the finished message
+/// re-renders once through MarkdownText.
+private struct StreamingPlainTextView: View {
     let text: String
     var secondary: Bool = false
 
-    func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.textContainerInset = .zero
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(
-            width: 0, height: CGFloat.greatestFiniteMagnitude)
-        textView.font = NSFont.preferredFont(forTextStyle: secondary ? .callout : .body)
-        textView.textColor = secondary ? .secondaryLabelColor : .labelColor
-        context.coordinator.textView = textView
-        return textView
-    }
-
-    func updateNSView(_ textView: NSTextView, context: Context) {
-        let current = textView.string
-        if text.count > current.count, text.hasPrefix(current) {
-            let delta = String(text.dropFirst(current.count))
-            textView.textStorage?.append(
-                NSAttributedString(
-                    string: delta,
-                    attributes: [.font: textView.font as Any, .foregroundColor: textView.textColor as Any]))
-        } else if text != current {
-            textView.string = text
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator {
-        var textView: NSTextView?
+    var body: some View {
+        Text(verbatim: text)
+            .font(secondary ? .callout : .body)
+            .foregroundStyle(secondary ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
