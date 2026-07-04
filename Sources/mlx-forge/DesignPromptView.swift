@@ -99,7 +99,13 @@ struct DesignPromptView: View {
             return
         }
         let index = root.appendingPathComponent("index.html")
-        webView.loadFileURL(index, allowingReadAccessTo: root)
+        // WKWebView silently refuses ES-module scripts loaded from file:// when
+        // they carry `crossorigin` (null-origin CORS fails → blank white page).
+        // Strip the attribute and load via loadHTMLString with the resource dir
+        // as baseURL, so relative `./assets/...` imports still resolve.
+        let html = (try? String(contentsOf: index, encoding: .utf8)) ?? ""
+        let cleaned = html.replacingOccurrences(of: " crossorigin", with: "")
+        webView.loadHTMLString(cleaned, baseURL: root)
     }
 
     private func openInBrowser() {
