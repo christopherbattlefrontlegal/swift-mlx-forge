@@ -113,6 +113,15 @@ struct TranscriptView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.s4) {
+                // Unmissable load state: a 100GB GGUF takes minutes to come up,
+                // and the thin composer caption was the only signal before.
+                if let loading = app.engine.loadingModels.first {
+                    ModelLoadingBanner(
+                        name: app.store.localModels.first(where: { $0.id == loading.key })?
+                            .shortName
+                            ?? URL(filePath: loading.key).lastPathComponent,
+                        fraction: loading.value)
+                }
                 if !anyMessageStreaming, !conversation.copyableTranscript.isEmpty {
                     HStack {
                         Spacer()
@@ -138,6 +147,50 @@ struct TranscriptView: View {
             .frame(maxWidth: 860)
             .frame(maxWidth: .infinity)
         }
+    }
+}
+
+/// Prominent in-transcript banner while a model loads into memory. Determinate
+/// once the backend reports a fraction (GGUF: llama.cpp per-tensor progress;
+/// MLX: shard progress), indeterminate spinner until the first callback.
+private struct ModelLoadingBanner: View {
+    let name: String
+    let fraction: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            HStack(spacing: Theme.s2) {
+                Image(systemName: "arrow.down.circle.dotted")
+                    .font(.title3)
+                    .foregroundStyle(Theme.ember)
+                Text("Loading \(name)")
+                    .font(.headline)
+                Spacer(minLength: 0)
+                if let fraction {
+                    Text("\(Int((fraction * 100).rounded()))%")
+                        .font(.title3.weight(.bold).monospacedDigit())
+                        .foregroundStyle(Theme.ember)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            if let fraction {
+                ProgressView(value: fraction)
+                    .tint(Theme.ember)
+            }
+            Text("Reading weights into memory — large models take several minutes. The percent is live; the app is not stuck.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(Theme.s4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.assistantBubble)
+        .clipShape(.rect(cornerRadius: Theme.radiusLarge))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusLarge)
+                .strokeBorder(Theme.ember.opacity(0.35), lineWidth: 1)
+        )
     }
 }
 
