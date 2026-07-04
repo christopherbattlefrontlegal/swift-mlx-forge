@@ -467,6 +467,10 @@ final class AppState {
     private(set) var streamingMessageIDs: Set<UUID> = []
     /// Live token buffer shown in the transcript without rewriting `conversations` each flush.
     private(set) var streamingTextByMessageID: [UUID: String] = [:]
+    /// Live reasoning (inside <think>) split out by ``ThinkTagParser`` so a
+    /// reasoning block renders the instant the first thinking token lands,
+    /// instead of waiting for the closing </think> before anything classifies.
+    private(set) var streamingReasoningByMessageID: [UUID: String] = [:]
 
     func isMessageStreaming(_ messageID: UUID) -> Bool {
         streamingMessageIDs.contains(messageID)
@@ -474,6 +478,8 @@ final class AppState {
 
     private var saveTask: Task<Void, Never>?
     private var streamBuffers: [UUID: String] = [:]
+    private var streamReasoningBuffers: [UUID: String] = [:]
+    private var streamReasoningParsers: [UUID: ThinkTagParser] = [:]
     private var streamBufferConversationIDs: [UUID: UUID] = [:]
     private var streamFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var activeMCPCallCount = 0
@@ -900,6 +906,26 @@ final class AppState {
         return systemPromptWithMCPInstructions(base: base, tools: tools)
     }
 
+    /// System prompt plus the live tool bindings, for backends with native tool
+    /// calling (Anthropic/OpenRouter) that pass tools in the request body.
+    /// These models get NO sentinel-JSON instructions — teaching the wire syntax
+    /// made them narrate JSON in prose answers; native tool_use needs no coaching.
+    private func mcpPromptContext(
+        for conversation: Conversation
+    ) async -> (system: String, tools: [MCPToolBinding]) {
+        let base = baseSystemPrompt(for: conversation)
+        let tools = await mcp.prepareToolCatalogForPrompt()
+        guard !tools.isEmpty else { return (base, tools) }
+        let note = """
+            You have tools available (MCP servers, e.g. legal research via CourtListener). \
+            Use them when they help answer the user; after a tool result arrives, answer \
+            the user's question in normal prose — do not echo raw JSON unless asked.
+            """
+        let system = base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? note : base + "\n\n" + note
+        return (system, tools)
+    }
+
     /// Active system instructions for UI delineation and new turns.
     func effectiveSystemPrompt(for conversation: Conversation) -> String {
         baseSystemPrompt(for: conversation)
@@ -910,11 +936,16 @@ final class AppState {
     }
 
     private var anthropicStreamConfig: AnthropicStreamConfig {
-        AnthropicStreamConfig(
+        // With adaptive thinking on, a small shared maxTokens (tuned for local
+        // models) gets consumed by reasoning before any answer streams — the
+        // turn "stops mid-thinking". Floor it so thinking + answer both fit.
+        let configured = settings.maxTokens > 0 ? settings.maxTokens : 8192
+        let floored = settings.reasoningEnabled ? max(configured, 16_384) : configured
+        return AnthropicStreamConfig(
             reasoningEnabled: settings.reasoningEnabled,
             effort: Self.anthropicEffort(from: cloudReasoningEffort),
             thinkingSummarized: settings.anthropicThinkingSummarized,
-            maxTokens: settings.maxTokens > 0 ? settings.maxTokens : 8192)
+            maxTokens: floored)
     }
 
     private var openRouterStreamConfig: OpenRouterStreamConfig {
@@ -1079,17 +1110,20 @@ final class AppState {
             if let claudeTarget {
                 streamClaude(
                     model: claudeTarget.modelID, history: historySnapshot, prompt: prompt,
-                    conversationID: conversationID, messageID: claudeTarget.messageID)
+                    conversationID: conversationID, messageID: claudeTarget.messageID,
+                    images: images)
             }
             for target in openRouterTargets {
                 streamOpenRouter(
                     model: target.modelID, history: historySnapshot, prompt: prompt,
-                    conversationID: conversationID, messageID: target.messageID)
+                    conversationID: conversationID, messageID: target.messageID,
+                    images: images)
             }
             if let openAITarget {
                 streamOpenAI(
                     model: openAITarget.modelID, history: historySnapshot, prompt: prompt,
-                    conversationID: conversationID, messageID: openAITarget.messageID)
+                    conversationID: conversationID, messageID: openAITarget.messageID,
+                    images: images)
             }
             if let braveTarget {
                 streamBraveSearch(
@@ -1119,12 +1153,10 @@ final class AppState {
         beginStreaming(messageID: messageID)
 
         if let claudeID = claudeModelID, !claudeID.isEmpty {
-            // Images for Claude vision require richer Message content (array of text+image blocks).
-            // For now we send the text prompt (the token in composer makes it visible).
-            // Full support + MCP photo tool call with base64 can be layered next.
             streamClaude(
                 model: claudeID, history: historySnapshot, prompt: prompt,
-                conversationID: conversationID, messageID: messageID)
+                conversationID: conversationID, messageID: messageID,
+                images: images)
             scheduleSave()
             return
         }
@@ -1333,12 +1365,13 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = await mcpEnrichedSystemPrompt(for: history)
+        let context = await mcpPromptContext(for: history)
         let client = AnthropicClient(apiKey: key)
         do {
             try await client.stream(
-                model: model, system: sys, messages: msgs,
-                config: anthropicStreamConfig
+                model: model, system: context.system, messages: msgs,
+                config: anthropicStreamConfig,
+                tools: context.tools
             ) { [weak self] delta in
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             }
@@ -1355,6 +1388,14 @@ final class AppState {
                 }
             }
         }
+        finishStreamBuffer(messageID)
+        _ = await handleMCPToolRequestIfNeeded(
+            backend: .claude(modelID: model),
+            originalPrompt: prompt,
+            images: [],
+            conversationID: conversationID,
+            messageID: messageID,
+            mcpDepth: 0)
     }
 
     private func runOpenRouterAgentStream(
@@ -1383,15 +1424,16 @@ final class AppState {
             }
         }
         msgs.append(.init(role: "user", text: prompt))
-        let sys = await mcpEnrichedSystemPrompt(for: history)
+        let context = await mcpPromptContext(for: history)
         let client = OpenRouterClient(apiKey: key)
         do {
             try await client.stream(
                 model: model,
-                system: sys,
+                system: context.system,
                 messages: msgs,
                 config: openRouterStreamConfig,
-                sessionID: conversationID.uuidString
+                sessionID: conversationID.uuidString,
+                tools: context.tools
             ) { [weak self] delta in
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             }
@@ -1408,12 +1450,21 @@ final class AppState {
                 }
             }
         }
+        finishStreamBuffer(messageID)
+        _ = await handleMCPToolRequestIfNeeded(
+            backend: .openRouter(modelID: model),
+            originalPrompt: prompt,
+            images: [],
+            conversationID: conversationID,
+            messageID: messageID,
+            mcpDepth: 0)
     }
 
     /// Routes a chat turn to the Anthropic API and streams deltas into the message.
     private func streamClaude(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
+        images: [Data] = [],
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
@@ -1438,20 +1489,22 @@ final class AppState {
             case .system: return nil
             }
         }
-        messages.append(.init(role: "user", text: prompt))
+        messages.append(.init(role: "user", text: prompt, images: images))
         let client = AnthropicClient(apiKey: key)
 
         isClaudeGenerating = true
         claudeTask = Task { [weak self] in
             // Tools stay available on every turn (including MCP follow-ups) so the model can
             // chain calls. The depth cap in handleMCPToolRequestIfNeeded ends the loop.
+            let context = await self?.mcpPromptContext(for: history)
             let system =
-                await self?.mcpEnrichedSystemPrompt(for: history)
+                context?.system
                 ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
             do {
                 try await client.stream(
                     model: model, system: system, messages: messages,
-                    config: self?.anthropicStreamConfig ?? AnthropicStreamConfig()
+                    config: self?.anthropicStreamConfig ?? AnthropicStreamConfig(),
+                    tools: context?.tools ?? []
                 ) { delta in
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
@@ -1486,6 +1539,7 @@ final class AppState {
     private func streamOpenRouter(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
+        images: [Data] = [],
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
@@ -1510,13 +1564,14 @@ final class AppState {
                 return nil
             }
         }
-        messages.append(.init(role: "user", text: prompt))
+        messages.append(.init(role: "user", text: prompt, images: images))
         let client = OpenRouterClient(apiKey: key)
 
         isOpenRouterGenerating = true
         openRouterTasks[messageID] = Task { [weak self] in
+            let context = await self?.mcpPromptContext(for: history)
             let system =
-                await self?.mcpEnrichedSystemPrompt(for: history)
+                context?.system
                 ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
             do {
                 try await client.stream(
@@ -1524,7 +1579,8 @@ final class AppState {
                     system: system,
                     messages: messages,
                     config: self?.openRouterStreamConfig ?? OpenRouterStreamConfig(),
-                    sessionID: conversationID.uuidString
+                    sessionID: conversationID.uuidString,
+                    tools: context?.tools ?? []
                 ) { delta in
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
@@ -1560,6 +1616,7 @@ final class AppState {
     private func streamOpenAI(
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
+        images: [Data] = [],
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
@@ -1584,7 +1641,7 @@ final class AppState {
                 return nil
             }
         }
-        turns.append(.init(role: "user", text: prompt))
+        turns.append(.init(role: "user", text: prompt, images: images))
         let client = OpenAIClient(apiKey: key)
 
         isOpenAIGenerating = true
@@ -1901,6 +1958,7 @@ final class AppState {
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
+                images: images,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
         case .openRouter(let modelID):
@@ -1910,6 +1968,7 @@ final class AppState {
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
+                images: images,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
         case .openAI(let modelID):
@@ -1949,6 +2008,8 @@ final class AppState {
         streamingMessageIDs.insert(messageID)
         streamingMessageID = messageID
         streamingTextByMessageID[messageID] = ""
+        streamingReasoningByMessageID[messageID] = ""
+        streamReasoningParsers[messageID] = ThinkTagParser()
     }
 
     private func endStreaming(messageID: UUID) {
@@ -1957,6 +2018,181 @@ final class AppState {
             streamingMessageID = streamingMessageIDs.first
         }
         streamingTextByMessageID.removeValue(forKey: messageID)
+        streamingReasoningByMessageID.removeValue(forKey: messageID)
+        streamReasoningParsers.removeValue(forKey: messageID)
+        if smartPromptSelectionActive {
+            applySmartSelectedPromptIfPresent(messageID: messageID)
+        }
+    }
+
+    // MARK: - Prompt enhancement (wand button)
+
+    private(set) var isEnhancingPrompt = false
+
+    /// Rewrites the current composer draft into a clearer, more effective prompt
+    /// using an available cloud model, replacing the composer text in place.
+    func enhanceComposerPrompt() {
+        let draft = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !draft.isEmpty, !isEnhancingPrompt else { return }
+        let system = """
+            You are a prompt engineer. Rewrite the user's draft into a clearer, more \
+            specific, more effective prompt for an AI assistant. Preserve the intent, \
+            facts, and any file paths or names exactly. Return ONLY the rewritten \
+            prompt — no preamble, no commentary, no markdown fences.
+            """
+        isEnhancingPrompt = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isEnhancingPrompt = false }
+            do {
+                var enhanced = ""
+                if let key = SecretsStore.anthropicAPIKey, !key.isEmpty {
+                    try await AnthropicClient(apiKey: key).stream(
+                        model: claudeModelID ?? AnthropicClient.models[0].id,
+                        system: system,
+                        messages: [.init(role: "user", text: draft)],
+                        config: AnthropicStreamConfig(reasoningEnabled: false, maxTokens: 4096)
+                    ) { enhanced += $0 }
+                } else if let key = SecretsStore.openRouterAPIKey, !key.isEmpty {
+                    enhanced = try await OpenRouterClient(apiKey: key).complete(
+                        model: openRouterModelIDs.first ?? OpenRouterClient.defaultModelID,
+                        system: system,
+                        messages: [.init(role: "user", text: draft)],
+                        config: OpenRouterStreamConfig(reasoningEnabled: false, maxTokens: 4096))
+                } else {
+                    if let id = selectedConversation?.id {
+                        appendSystemMessage(
+                            conversationID: id,
+                            content: "Prompt enhancer needs an Anthropic or OpenRouter API key (Settings ⌘,)."
+                        )
+                    }
+                    return
+                }
+                let cleaned = enhanced
+                    .replacingOccurrences(of: "``", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    self.composerText = cleaned
+                }
+            } catch {
+                if let id = selectedConversation?.id {
+                    appendSystemMessage(
+                        conversationID: id,
+                        content: "Prompt enhancer failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Smart prompt selection
+
+    /// True while a Smart Select turn is in flight — completed replies are
+    /// scanned for a FORGE_PROMPT_BEGIN/END block to install.
+    private(set) var smartPromptSelectionActive = false
+
+    /// Searches the prompt_database index and sends the candidates to the
+    /// active model, which picks or combines/redrafts and returns the final
+    /// system prompt between FORGE_PROMPT_BEGIN/END markers.
+    func startSmartPromptSelection(task: String, goals: String, notes: String) {
+        guard let database = SmartPromptDB.databaseDirectory(promptDirectories: promptDirectories)
+        else {
+            if let id = selectedConversation?.id {
+                appendSystemMessage(
+                    conversationID: id,
+                    content:
+                        "Smart Select: no prompt_database folder found next to a registered prompt directory (expected <root>/prompt_database/search.py)."
+                )
+            }
+            return
+        }
+        let query = [task, goals, notes]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: " ")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let candidates = await SmartPromptDB.search(query: query, database: database)
+            let instruction = Self.smartPromptInstruction(
+                task: task, goals: goals, notes: notes, candidates: candidates)
+            self.smartPromptSelectionActive = true
+            self.composerText = instruction
+            if self.canSend {
+                self.send()
+            }
+        }
+    }
+
+    private static func smartPromptInstruction(
+        task: String, goals: String, notes: String, candidates: [SmartPromptCandidate]
+    ) -> String {
+        let brief = """
+            Choose the best system prompt for the work below from the user's prompt library.
+
+            Task: \(task)
+            Goals: \(goals.isEmpty ? "—" : goals)
+            Notes: \(notes.isEmpty ? "—" : notes)
+            """
+        let listing: String
+        if candidates.isEmpty {
+            listing = "No library candidates matched the keyword search — draft one from scratch."
+        } else {
+            listing = candidates.enumerated().map { index, candidate in
+                """
+                [\(index + 1)] \(candidate.title) — \(candidate.description)
+                ---
+                \(candidate.body)
+                ---
+                """
+            }.joined(separator: "\n")
+        }
+        return """
+            \(brief)
+
+            Candidate prompts (ranked by keyword search over the library):
+            \(listing)
+
+            Instructions:
+            - Pick the single best candidate, or combine and redraft several into one \
+            prompt (the library includes prompt-engineering prompts — apply their \
+            techniques when redrafting).
+            - If none fit well, say so and ask whether to draft a combined/custom one.
+            - If you need more information to choose well, ask concise questions and \
+            STOP — do not output the markers yet.
+            - When ready, output the final system prompt between these exact markers:
+            FORGE_PROMPT_BEGIN
+            <final system prompt>
+            FORGE_PROMPT_END
+            - After the markers, add one short line explaining the choice.
+            Forge installs the text between the markers as the active system prompt \
+            automatically.
+            """
+    }
+
+    /// Installs a FORGE_PROMPT_BEGIN/END block from a finished reply as the
+    /// active system prompt (Smart Select flow).
+    private func applySmartSelectedPromptIfPresent(messageID: UUID) {
+        guard let ci = conversations.firstIndex(where: { conversation in
+            conversation.messages.contains { $0.id == messageID }
+        }) else { return }
+        let conversationID = conversations[ci].id
+        guard let content = messageContent(conversationID: conversationID, messageID: messageID),
+            let begin = content.range(of: "FORGE_PROMPT_BEGIN"),
+            let end = content.range(of: "FORGE_PROMPT_END", range: begin.upperBound..<content.endIndex)
+        else { return }
+        let prompt = String(content[begin.upperBound..<end.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        smartPromptSelectionActive = false
+        lastPromptContent = prompt
+        applySystemPrompt(prompt, externalLabel: "Smart Select")
+        if var conversation = selectedConversation, conversation.id == conversationID {
+            conversation.systemPrompt = prompt
+            selectedConversation = conversation
+        }
+        appendSystemMessage(
+            conversationID: conversationID,
+            content: "Smart Select: installed the drafted system prompt (\(prompt.count) chars) as the active system prompt."
+        )
+        scheduleSave()
     }
 
     private func appendSystemMessage(conversationID: UUID, content: String) {
@@ -2164,6 +2400,9 @@ final class AppState {
         streamingMessageID = nil
         streamingMessageIDs.removeAll()
         streamingTextByMessageID.removeAll()
+        streamingReasoningByMessageID.removeAll()
+        streamReasoningBuffers.removeAll()
+        streamReasoningParsers.removeAll()
         stopCodingOrchestrator()
         // Cancel any parallel agent dispatches (locals are also covered by engine.stop via gate).
         for t in agentTasks.values { t.cancel() }
@@ -2188,11 +2427,22 @@ final class AppState {
     ) {
         guard !delta.isEmpty else { return }
         streamBufferConversationIDs[messageID] = conversationID
-        streamBuffers[messageID, default: ""] += delta
+        // Split each delta through the incremental parser so reasoning lands in
+        // its own live channel — rendering a reasoning block the moment the
+        // first thinking token arrives, not after </think> closes.
+        var parser = streamReasoningParsers[messageID] ?? ThinkTagParser()
+        let split = parser.addContent(delta)
+        streamReasoningParsers[messageID] = parser
+        if !split.reasoning.isEmpty {
+            streamReasoningBuffers[messageID, default: ""] += split.reasoning
+        }
+        if !split.content.isEmpty {
+            streamBuffers[messageID, default: ""] += split.content
+        }
         guard streamFlushTasks[messageID] == nil else { return }
         streamFlushTasks[messageID] = Task { [weak self] in
             // Batch UI updates — rewriting conversations every flush blocked scroll input.
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled else { return }
             self?.flushStreamBuffer(messageID)
         }
@@ -2201,6 +2451,11 @@ final class AppState {
     private func flushStreamBuffer(_ messageID: UUID) {
         streamFlushTasks[messageID]?.cancel()
         streamFlushTasks[messageID] = nil
+        if let reasoning = streamReasoningBuffers.removeValue(forKey: messageID),
+            !reasoning.isEmpty
+        {
+            streamingReasoningByMessageID[messageID, default: ""] += reasoning
+        }
         guard let delta = streamBuffers.removeValue(forKey: messageID), !delta.isEmpty else {
             return
         }
@@ -2210,17 +2465,35 @@ final class AppState {
     private func finishStreamBuffer(_ messageID: UUID) {
         streamFlushTasks[messageID]?.cancel()
         streamFlushTasks[messageID] = nil
+        if var parser = streamReasoningParsers.removeValue(forKey: messageID) {
+            let tail = parser.finalize()
+            if !tail.reasoning.isEmpty {
+                streamReasoningBuffers[messageID, default: ""] += tail.reasoning
+            }
+            if !tail.content.isEmpty {
+                streamBuffers[messageID, default: ""] += tail.content
+            }
+        }
+        if let reasoning = streamReasoningBuffers.removeValue(forKey: messageID),
+            !reasoning.isEmpty
+        {
+            streamingReasoningByMessageID[messageID, default: ""] += reasoning
+        }
         if let delta = streamBuffers.removeValue(forKey: messageID), !delta.isEmpty {
             streamingTextByMessageID[messageID, default: ""] += delta
         }
         guard let conversationID = streamBufferConversationIDs[messageID] else {
             streamingTextByMessageID.removeValue(forKey: messageID)
+            streamingReasoningByMessageID.removeValue(forKey: messageID)
             return
         }
-        if let text = streamingTextByMessageID[messageID] {
-            appendToMessage(conversationID: conversationID, messageID: messageID) {
-                $0.content = text
-            }
+        let reasoning = streamingReasoningByMessageID[messageID] ?? ""
+        let content = streamingTextByMessageID[messageID] ?? ""
+        appendToMessage(conversationID: conversationID, messageID: messageID) {
+            // Re-wrap reasoning in <think> so the finished ThinkingBlock
+            // (which parses message.content) still renders the block.
+            $0.content = reasoning.isEmpty
+                ? content : "<think>\(reasoning)</think>\n\n\(content)"
         }
         streamBufferConversationIDs[messageID] = nil
     }
@@ -2291,43 +2564,46 @@ final class AppState {
     /// where the server implements tool "review_photo" expecting "image_base64".
     func reviewAttachedPhotoWithMCP(using imageData: [Data]) async {
         guard let firstImage = imageData.first else {
-            composerText = "No image data to review."
-            return
-        }
-        let base64 = firstImage.base64EncodedString()
-
-        // Find suitable connected entry per the spec.
-        let connected = mcp.entries.filter { if case .connected = $0.status { return true }; return false }
-        guard let suitable = connected.first(where: { entry in
-            let idLower = entry.id.lowercased()
-            return idLower.contains("photo") || idLower.contains("vision") || idLower.contains("review") || idLower.contains("image")
-        }) ?? connected.first else {
-            composerText = "No connected MCP server found. Add one in Settings > MCP Servers (HTTP/SSE only)."
+            composerText = "Attach a photo first (photo button), then press review."
             return
         }
 
-        do {
-            let resultData = try await mcp.callTool(
-                entryID: suitable.id,
-                name: "review_photo",
-                arguments: [
-                    "image_base64": base64,
-                    "query": "Provide a detailed review and description of this photo."
-                ]
-            )
-            let resultString = String(data: resultData, encoding: .utf8) ?? "<binary result>"
-
-            // Append as system message so it shows in the chat transcript.
-            guard var current = selectedConversation else { return }
-            let resultMsg = ChatMessage(
-                role: .system,
-                content: "MCP Photo Review via \(suitable.id):\n\(resultString)"
-            )
-            current.messages.append(resultMsg)
-            selectedConversation = current
-            scheduleSave()
-        } catch {
-            composerText = "MCP photo review call failed: \(error.localizedDescription)"
+        // Prefer a connected MCP tool that actually reviews images — match on
+        // TOOL names, not server ids (no configured server ships `review_photo`).
+        let visionTool = mcp.selectedConnectedTools().first { binding in
+            let name = binding.tool.name.lowercased()
+            return name.contains("photo") || name.contains("vision")
+                || (name.contains("image") && (name.contains("review") || name.contains("describe")))
         }
+
+        if let visionTool {
+            do {
+                let resultData = try await mcp.callTool(
+                    entryID: visionTool.serverID,
+                    name: visionTool.tool.name,
+                    arguments: [
+                        "image_base64": firstImage.base64EncodedString(),
+                        "query": "Provide a detailed review and description of this photo."
+                    ]
+                )
+                let resultString = String(data: resultData, encoding: .utf8) ?? "<binary result>"
+                guard var current = selectedConversation else { return }
+                current.messages.append(ChatMessage(
+                    role: .system,
+                    content: "MCP Photo Review via \(visionTool.id):\n\(resultString)"
+                ))
+                selectedConversation = current
+                scheduleSave()
+                return
+            } catch {
+                // Fall through to the model-based review below.
+            }
+        }
+
+        // No vision MCP tool — review with whatever model is selected (cloud
+        // clients and local VLMs all accept attached image data now).
+        composerText =
+            "Review the attached photo in detail: describe the contents, notable details, and transcribe any visible text."
+        send(images: imageData)
     }
 }

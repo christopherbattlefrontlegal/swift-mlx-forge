@@ -34,6 +34,13 @@ let package = Package(
         // 3.31.4 adds pure Mamba2 (SSM) models, Mixtral, and generation seeding.
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", exact: "3.31.4"),
 
+        // PrismML fork of mlx-swift: upstream main (>= 0.31.4) plus 1-bit affine
+        // quantization Metal kernels (Bonsai models). Root-package declaration
+        // overrides mlx-swift-lm's transitive ml-explore/mlx-swift dependency.
+        .package(
+            url: "https://github.com/PrismML-Eng/mlx-swift.git",
+            revision: "e40e0a57a6f7ad08dc3fd87ad598a7aa6407d230"),
+
         // Tokenizer + downloader integration packages required by the
         // MLXHuggingFace macros used in the tool sources.
         .package(

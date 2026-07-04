@@ -1,6 +1,7 @@
 // Forge — chat surface: transcript, streaming bubbles, composer, tuning inspector.
 
 import AppKit
+import PDFKit
 import SwiftUI
 
 struct ChatView: View {
@@ -126,6 +127,7 @@ struct TranscriptView: View {
                         message: message,
                         isStreaming: app.isMessageStreaming(message.id),
                         streamingText: app.streamingTextByMessageID[message.id],
+                        streamingReasoning: app.streamingReasoningByMessageID[message.id],
                         onShowLargeText: onShowLargeText
                     )
                     .equatable()
@@ -144,12 +146,14 @@ private struct MessageRow: View, Equatable {
     let message: ChatMessage
     let isStreaming: Bool
     let streamingText: String?
+    let streamingReasoning: String?
     var onShowLargeText: (String) -> Void
 
     nonisolated static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         guard lhs.message == rhs.message, lhs.isStreaming == rhs.isStreaming else { return false }
         if lhs.isStreaming || rhs.isStreaming {
             return lhs.streamingText == rhs.streamingText
+                && lhs.streamingReasoning == rhs.streamingReasoning
         }
         return true
     }
@@ -159,6 +163,7 @@ private struct MessageRow: View, Equatable {
             message: message,
             isStreaming: isStreaming,
             streamingText: streamingText,
+            streamingReasoning: streamingReasoning,
             onShowLargeText: onShowLargeText)
     }
 }
@@ -169,11 +174,17 @@ struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
     var streamingText: String? = nil
+    var streamingReasoning: String? = nil
     var onShowLargeText: (String) -> Void = { _ in }
 
     private var liveAssistantText: String {
         if isStreaming, let streamingText { return streamingText }
         return message.content
+    }
+
+    private var liveReasoning: String {
+        if isStreaming, let streamingReasoning { return streamingReasoning }
+        return ""
     }
 
     var body: some View {
@@ -255,12 +266,19 @@ struct MessageView: View {
     private var bubble: some View {
         VStack(alignment: .leading, spacing: Theme.s3) {
             if isStreaming {
-                if liveAssistantText.isEmpty {
+                // Reasoning streams on its own channel (ThinkTagParser split),
+                // so the reasoning block renders the instant the first thinking
+                // token lands — not after </think> closes.
+                if !liveReasoning.isEmpty {
+                    LiveThinkingBlock(text: liveReasoning, done: false)
+                }
+                if !liveAssistantText.isEmpty {
+                    StreamingPlainTextView(text: liveAssistantText)
+                }
+                if liveReasoning.isEmpty && liveAssistantText.isEmpty {
                     Text("Reasoning…")
                         .font(.callout)
                         .foregroundStyle(.tertiary)
-                } else {
-                    StreamingSegmentsView(text: liveAssistantText)
                 }
             } else if !message.segments.isEmpty {
                 ForEach(message.segments) { segment in
@@ -313,30 +331,6 @@ struct MessageView: View {
 }
 
 // MARK: - Streaming text (AppKit)
-
-/// Live-streaming assistant bubble: splits the in-flight text into thinking/answer
-/// segments so reasoning is visible AS IT STREAMS (expanded, collapsible), instead of
-/// a raw text wall that only turns into a Reasoning block after completion. Segment
-/// ids are positional, so SwiftUI updates each block in place on every flush.
-private struct StreamingSegmentsView: View {
-    let text: String
-
-    var body: some View {
-        let segments = ChatMessage(role: .assistant, content: text).segments
-        VStack(alignment: .leading, spacing: Theme.s3) {
-            ForEach(segments) { segment in
-                switch segment.kind {
-                case .thinking(let done):
-                    LiveThinkingBlock(text: segment.text, done: done)
-                case .answer:
-                    if !segment.text.isEmpty {
-                        StreamingPlainTextView(text: segment.text)
-                    }
-                }
-            }
-        }
-    }
-}
 
 /// Expanded-by-default reasoning block for in-flight generations. Uses the appending
 /// NSTextView so token flushes don't relayout the whole transcript.
@@ -534,6 +528,7 @@ struct ComposerView: View {
     @State private var styleMode = "Standard"
     @State private var deliverableMode = "Text"
     @State private var showAgentDispatch = false
+    @State private var showSmartPromptSheet = false
     @State private var showAPIModelPicker = false
     @State private var showOpenRouterModelPicker = false
     @State private var showAnthropicModelPicker = false
@@ -609,7 +604,7 @@ struct ComposerView: View {
                         .font(.body)
                         .scrollContentBackground(.hidden)
                         .background(Color.clear)
-                        .frame(minHeight: 44, idealHeight: 96, maxHeight: 180)
+                        .frame(minHeight: 44, idealHeight: 64, maxHeight: 180)
                         .focused($focused)
                 }
                 .padding(.horizontal, Theme.s3)
@@ -639,18 +634,24 @@ struct ComposerView: View {
                         .help("Review attached photo(s) using a connected MCP photo/vision tool")
 
                         Button {
-                            pickPhoto() // placeholder for general attach
+                            pickFiles()
                         } label: {
                             ToolbarIcon("doc.badge.plus")
                         }
                         .buttonStyle(.plain)
-                        .help("Attach file")
+                        .help("Attach files — text/code/JSON/Markdown are inlined as context, PDFs are text-extracted, images attach like photos")
                     }
 
                     Spacer(minLength: Theme.s6)
 
                     HStack(spacing: Theme.s3) {
                         Menu {
+                            Button {
+                                showSmartPromptSheet = true
+                            } label: {
+                                Label("Smart Select…", systemImage: "wand.and.stars")
+                            }
+                            Divider()
                             Button("Add Prompt Folder...") {
                                 let panel = NSOpenPanel()
                                 panel.canChooseDirectories = true
@@ -715,12 +716,40 @@ struct ComposerView: View {
                                 : "Brave Search — add API key in Settings (⌘,)")
 
                         Button {
-                            app.composerText += (app.composerText.isEmpty ? "" : " ") + "[enhance / council review]"
+                            var next = app.settings
+                            let enabled = !(next.reasoningEnabled && next.localThinkingEnabled)
+                            next.reasoningEnabled = enabled
+                            next.localThinkingEnabled = enabled
+                            app.settings = next
                         } label: {
-                            ToolbarIcon("wand.and.stars")
+                            ToolbarIcon("brain")
+                                .foregroundStyle(
+                                    app.settings.reasoningEnabled && app.settings.localThinkingEnabled
+                                        ? AnyShapeStyle(Theme.emberGradient)
+                                        : AnyShapeStyle(.secondary))
                         }
                         .buttonStyle(.plain)
-                        .help("Enhance or multi-agent council review via MCP/tools")
+                        .help(
+                            app.settings.reasoningEnabled && app.settings.localThinkingEnabled
+                                ? "Thinking ON — click to turn reasoning off (cloud + local models)"
+                                : "Thinking OFF — click to turn reasoning on (cloud + local models)")
+
+                        Button {
+                            app.enhanceComposerPrompt()
+                        } label: {
+                            if app.isEnhancingPrompt {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .frame(width: 38, height: 38)
+                            } else {
+                                ToolbarIcon("wand.and.stars")
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(
+                            app.isEnhancingPrompt
+                                || app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .help("Enhance prompt — rewrites your draft into a clearer, more effective prompt (needs Anthropic or OpenRouter key)")
                     }
 
                     Spacer(minLength: Theme.s6)
@@ -766,16 +795,21 @@ struct ComposerView: View {
 
                     HStack(spacing: Theme.s3) {
                         // Right side as requested: loaded model name, API server switch, cloud provider switches
-                        Toggle("API", isOn: Binding(
-                            get: { app.serverEnabled },
-                            set: { enabled in
-                                app.serverEnabled = enabled
-                                if enabled { showAPIModelPicker = true }
-                            }
-                        ))
-                            .font(.callout.weight(.semibold))
-                            .controlSize(.regular)
-                            .toggleStyle(.switch)
+                        HStack(spacing: Theme.s1) {
+                            Text("API")
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Toggle("API", isOn: Binding(
+                                get: { app.serverEnabled },
+                                set: { enabled in
+                                    app.serverEnabled = enabled
+                                    if enabled { showAPIModelPicker = true }
+                                }
+                            ))
+                                .labelsHidden()
+                                .controlSize(.regular)
+                                .toggleStyle(.switch)
+                        }
                             .help("API Server")
                             .popover(isPresented: $showAPIModelPicker, arrowEdge: .top) {
                                 LocalModelPicker()
@@ -786,22 +820,27 @@ struct ComposerView: View {
                             apiModelMenu
                         }
 
-                        Toggle("OpenRouter", isOn: Binding(
-                            get: { !app.openRouterModelIDs.isEmpty },
-                            set: { enabled in
-                                if enabled {
-                                    if app.openRouterModelIDs.isEmpty {
-                                        app.setOpenRouterModel(OpenRouterClient.defaultModelID, selected: true)
+                        HStack(spacing: Theme.s1) {
+                            Text("OpenRouter")
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Toggle("OpenRouter", isOn: Binding(
+                                get: { !app.openRouterModelIDs.isEmpty },
+                                set: { enabled in
+                                    if enabled {
+                                        if app.openRouterModelIDs.isEmpty {
+                                            app.setOpenRouterModel(OpenRouterClient.defaultModelID, selected: true)
+                                        }
+                                        showOpenRouterModelPicker = true
+                                    } else {
+                                        app.clearOpenRouterModels()
                                     }
-                                    showOpenRouterModelPicker = true
-                                } else {
-                                    app.clearOpenRouterModels()
                                 }
-                            }
-                        ))
-                        .font(.callout.weight(.semibold))
-                        .controlSize(.regular)
-                        .toggleStyle(.switch)
+                            ))
+                            .labelsHidden()
+                            .controlSize(.regular)
+                            .toggleStyle(.switch)
+                        }
                         .help("OpenRouter API key")
                         .popover(isPresented: $showOpenRouterModelPicker, arrowEdge: .top) {
                             OpenRouterModelPicker(customModel: $customOpenRouterModel)
@@ -812,20 +851,25 @@ struct ComposerView: View {
                             openRouterModelMenu
                         }
 
-                        Toggle("Anthropic", isOn: Binding(
-                            get: { app.claudeModelID != nil },
-                            set: { enabled in
-                                if enabled {
-                                    app.claudeModelID = app.claudeModelID ?? AnthropicClient.models[0].id
-                                    showAnthropicModelPicker = true
-                                } else {
-                                    app.claudeModelID = nil
+                        HStack(spacing: Theme.s1) {
+                            Text("Anthropic")
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Toggle("Anthropic", isOn: Binding(
+                                get: { app.claudeModelID != nil },
+                                set: { enabled in
+                                    if enabled {
+                                        app.claudeModelID = app.claudeModelID ?? AnthropicClient.models[0].id
+                                        showAnthropicModelPicker = true
+                                    } else {
+                                        app.claudeModelID = nil
+                                    }
                                 }
-                            }
-                        ))
-                            .font(.callout.weight(.semibold))
-                            .controlSize(.regular)
-                            .toggleStyle(.switch)
+                            ))
+                                .labelsHidden()
+                                .controlSize(.regular)
+                                .toggleStyle(.switch)
+                        }
                             .help("Anthropic API key")
                             .popover(isPresented: $showAnthropicModelPicker, arrowEdge: .top) {
                                 CloudModelPicker(
@@ -851,21 +895,26 @@ struct ComposerView: View {
                                 allowsCustom: false)
                         }
 
-                        Toggle("OpenAI", isOn: Binding(
-                            get: { app.openAIModelID != nil },
-                            set: { enabled in
-                                if enabled {
-                                    app.setPrimaryOpenAIModel(
-                                        app.openAIModelID ?? OpenAIClient.models[0].id)
-                                    showOpenAIModelPicker = true
-                                } else {
-                                    app.openAIModelID = nil
+                        HStack(spacing: Theme.s1) {
+                            Text("OpenAI")
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Toggle("OpenAI", isOn: Binding(
+                                get: { app.openAIModelID != nil },
+                                set: { enabled in
+                                    if enabled {
+                                        app.setPrimaryOpenAIModel(
+                                            app.openAIModelID ?? OpenAIClient.models[0].id)
+                                        showOpenAIModelPicker = true
+                                    } else {
+                                        app.openAIModelID = nil
+                                    }
                                 }
-                            }
-                        ))
-                            .font(.callout.weight(.semibold))
-                            .controlSize(.regular)
-                            .toggleStyle(.switch)
+                            ))
+                                .labelsHidden()
+                                .controlSize(.regular)
+                                .toggleStyle(.switch)
+                        }
                             .help("OpenAI API key — Responses API with reasoning.effort")
                             .popover(isPresented: $showOpenAIModelPicker, arrowEdge: .top) {
                                 CloudModelPicker(
@@ -945,8 +994,13 @@ struct ComposerView: View {
             }
             .glassCard(radius: Theme.radiusLarge)
             .padding(.horizontal, Theme.s5)
-            .padding(.bottom, Theme.s4)
+            .padding(.bottom, Theme.s2)
             .padding(.top, Theme.s2)
+        }
+        .sheet(isPresented: $showSmartPromptSheet) {
+            SmartPromptSheet { task, goals, notes in
+                app.startSmartPromptSelection(task: task, goals: goals, notes: notes)
+            }
         }
         .popover(isPresented: $showAgentDispatch, arrowEdge: .top) {
             agentDispatchPopover
@@ -1108,6 +1162,60 @@ struct ComposerView: View {
 
     private func pickPhoto() {
         showPhotoPicker = true
+    }
+
+    /// General file attach: images join pendingImages; PDFs are text-extracted;
+    /// everything else that decodes as text is inlined into the composer as a
+    /// fenced context block (JSON, Markdown, Swift, Shell, Python, …).
+    private func pickFiles() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Attach"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            attachFile(url)
+        }
+    }
+
+    private func attachFile(_ url: URL) {
+        let maxInlineChars = 30_000
+        let ext = url.pathExtension.lowercased()
+        let name = url.lastPathComponent
+
+        if ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "bmp"].contains(ext) {
+            if let data = try? Data(contentsOf: url) {
+                pendingImages.append(data)
+                app.composerText += (app.composerText.isEmpty ? "" : "\n") + "[photo:\(name)]"
+            }
+            return
+        }
+
+        var text: String?
+        if ext == "pdf" {
+            text = PDFDocument(url: url)?.string
+        } else if let utf8 = try? String(contentsOf: url, encoding: .utf8) {
+            text = utf8
+        } else if let latin = try? String(contentsOf: url, encoding: .isoLatin1) {
+            text = latin
+        }
+
+        guard var content = text, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            app.composerText +=
+                (app.composerText.isEmpty ? "" : "\n")
+                + "[could not read \(name) — unsupported or empty file]"
+            return
+        }
+        var clippedNote = ""
+        if content.count > maxInlineChars {
+            content = String(content.prefix(maxInlineChars))
+            clippedNote = "\n… [clipped to first \(maxInlineChars) characters]"
+        }
+        app.composerText +=
+            (app.composerText.isEmpty ? "" : "\n\n")
+            + "[file: \(name)]\n```\n\(content)\(clippedNote)\n```"
     }
 
     private func performSend() {

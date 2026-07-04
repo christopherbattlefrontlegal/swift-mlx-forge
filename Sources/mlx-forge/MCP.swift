@@ -27,6 +27,9 @@ struct MCPTool: Identifiable, Hashable, Sendable {
     var id: String { name }
     let name: String
     let description: String
+    /// JSON-serialized `inputSchema` from tools/list — advertised to providers
+    /// with native tool calling (Anthropic/OpenRouter).
+    var inputSchemaJSON: String? = nil
 }
 
 struct MCPToolBinding: Identifiable, Hashable, Sendable {
@@ -34,6 +37,27 @@ struct MCPToolBinding: Identifiable, Hashable, Sendable {
     let tool: MCPTool
 
     var id: String { "\(serverID).\(tool.name)" }
+
+    /// API-safe tool name for native tool calling (Anthropic requires
+    /// `^[a-zA-Z0-9_-]{1,64}$`): "<server>__<tool>", clipped to 64 chars.
+    var nativeToolName: String {
+        let sanitize = { (s: String) in
+            String(s.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" })
+        }
+        return String("\(sanitize(serverID))__\(sanitize(tool.name))".prefix(64))
+    }
+
+    /// Provider-neutral JSON Schema for the tool's arguments.
+    var inputSchemaObject: [String: Any] {
+        if let json = tool.inputSchemaJSON,
+            let obj = try? JSONSerialization.jsonObject(with: Data(json.utf8))
+                as? [String: Any],
+            obj["type"] != nil
+        {
+            return obj
+        }
+        return ["type": "object"]
+    }
 }
 
 enum MCPError: LocalizedError {
@@ -102,6 +126,15 @@ final class MCPManager {
     }
 
     nonisolated fileprivate static let commanderID = "forge-commander"
+
+    /// Serializes a tools/list entry's `inputSchema` for native tool calling.
+    nonisolated static func serializedInputSchema(from tool: [String: Any]) -> String? {
+        guard let schema = tool["inputSchema"] as? [String: Any],
+            JSONSerialization.isValidJSONObject(schema),
+            let data = try? JSONSerialization.data(withJSONObject: schema)
+        else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
 
     private var watcher: DispatchSourceFileSystemObject?
     private var hasStarted = false
@@ -481,9 +514,11 @@ final class MCPManager {
     }
 
     /// Connect enabled MCP servers and wait so prompt tool descriptions are live.
+    /// Capped at ~6s: a server that is slow or failing to start must not stall
+    /// every send for a minute — the turn proceeds with whatever is connected.
     func prepareToolCatalogForPrompt() async -> [MCPToolBinding] {
         connectAvailableServers()
-        for _ in 0..<240 {
+        for _ in 0..<24 {
             let pending = entries.contains { entry in
                 guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return false }
                 switch entry.status {
@@ -583,7 +618,8 @@ final class MCPManager {
                 guard let name = tool["name"] as? String else { return nil }
                 return MCPTool(
                     name: name,
-                    description: (tool["description"] as? String) ?? "")
+                    description: (tool["description"] as? String) ?? "",
+                    inputSchemaJSON: Self.serializedInputSchema(from: tool))
             }
             return (session, tools)
         }.value
@@ -1298,7 +1334,8 @@ struct MCPHTTPClient {
             guard let name = tool["name"] as? String else { return nil }
             return MCPTool(
                 name: name,
-                description: (tool["description"] as? String) ?? "")
+                description: (tool["description"] as? String) ?? "",
+                inputSchemaJSON: MCPManager.serializedInputSchema(from: tool))
         }
     }
 

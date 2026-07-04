@@ -52,6 +52,25 @@ struct OpenRouterClient {
     struct Message {
         let role: String
         let text: String
+        var images: [Data] = []
+    }
+
+    /// Text-only messages stay plain strings; image turns become content parts.
+    static func messagePayload(_ message: Message) -> [String: Any] {
+        guard !message.images.isEmpty else {
+            return ["role": message.role, "content": message.text]
+        }
+        var parts: [[String: Any]] = message.images.map { data in
+            [
+                "type": "image_url",
+                "image_url": [
+                    "url":
+                        "data:\(AnthropicClient.imageMediaType(data));base64,\(data.base64EncodedString())"
+                ],
+            ]
+        }
+        parts.append(["type": "text", "text": message.text])
+        return ["role": message.role, "content": parts]
     }
 
     struct ModelInfo: Identifiable, Codable, Equatable, Hashable {
@@ -145,11 +164,11 @@ struct OpenRouterClient {
     ) async throws -> String {
         guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
 
-        var payloadMessages = [[String: String]]()
+        var payloadMessages = [[String: Any]]()
         if let system, !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             payloadMessages.append(["role": "system", "content": system])
         }
-        payloadMessages.append(contentsOf: messages.map { ["role": $0.role, "content": $0.text] })
+        payloadMessages.append(contentsOf: messages.map(Self.messagePayload))
 
         var request = URLRequest(
             url: URL(string: "https://openrouter.ai/api/v1/chat/completions")!)
@@ -175,8 +194,8 @@ struct OpenRouterClient {
         else {
             throw OpenRouterError.stream("empty completion response")
         }
-        if let reasoning = message["reasoning"] as? String, !reasoning.isEmpty {
-            return "``\n\n" + (message["content"] as? String ?? "")
+        if let content = message["content"] as? String, !content.isEmpty {
+            return content
         }
         guard let content = message["content"] as? String else {
             throw OpenRouterError.stream("empty completion response")
@@ -190,19 +209,23 @@ struct OpenRouterClient {
         messages: [Message],
         config: OpenRouterStreamConfig = OpenRouterStreamConfig(),
         sessionID: String? = nil,
+        tools: [MCPToolBinding] = [],
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws {
         guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
 
-        var payloadMessages = [[String: String]]()
+        var payloadMessages = [[String: Any]]()
         if let system, !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             payloadMessages.append(["role": "system", "content": system])
         }
-        payloadMessages.append(contentsOf: messages.map { ["role": $0.role, "content": $0.text] })
+        payloadMessages.append(contentsOf: messages.map(Self.messagePayload))
 
         var request = URLRequest(
             url: URL(string: "https://openrouter.ai/api/v1/chat/completions")!)
         request.httpMethod = "POST"
+        // Reasoning models can go quiet between SSE events; the 60s URLSession
+        // default aborts them mid-reasoning.
+        request.timeoutInterval = 1800
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
@@ -211,6 +234,18 @@ struct OpenRouterClient {
             model: model, messages: payloadMessages, config: config, stream: true)
         if let sessionID, !sessionID.isEmpty {
             body["session_id"] = sessionID
+        }
+        if !tools.isEmpty {
+            body["tools"] = tools.map { binding in
+                [
+                    "type": "function",
+                    "function": [
+                        "name": binding.nativeToolName,
+                        "description": binding.tool.description,
+                        "parameters": binding.inputSchemaObject,
+                    ] as [String: Any],
+                ] as [String: Any]
+            }
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -226,6 +261,9 @@ struct OpenRouterClient {
         }
 
         var assembler = OpenRouterReasoningStreamAssembler()
+        // Native tool_calls accumulation: index → (nativeName, partial JSON args).
+        var toolCalls: [Int: (name: String, json: String)] = [:]
+        var finishReason: String?
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -242,10 +280,28 @@ struct OpenRouterClient {
             }
             guard
                 let choices = obj["choices"] as? [[String: Any]],
-                let first = choices.first,
-                let delta = first["delta"] as? [String: Any]
+                let first = choices.first
             else { continue }
+            if let reason = first["finish_reason"] as? String {
+                finishReason = reason
+            }
+            guard let delta = first["delta"] as? [String: Any] else { continue }
 
+            if let calls = delta["tool_calls"] as? [[String: Any]] {
+                for call in calls {
+                    let index = call["index"] as? Int ?? 0
+                    var entry = toolCalls[index] ?? (name: "", json: "")
+                    if let function = call["function"] as? [String: Any] {
+                        if let name = function["name"] as? String, !name.isEmpty {
+                            entry.name = name
+                        }
+                        if let fragment = function["arguments"] as? String {
+                            entry.json += fragment
+                        }
+                    }
+                    toolCalls[index] = entry
+                }
+            }
             if let chunk = assembler.ingest(delta: delta) {
                 await onChunk(chunk)
             }
@@ -253,11 +309,24 @@ struct OpenRouterClient {
         if let tail = assembler.finish() {
             await onChunk(tail)
         }
+        // Bridge the first native tool call into the FORGE_MCP_CALL sentinel the
+        // existing MCP round-trip machinery parses out of the message text.
+        if let call = toolCalls.sorted(by: { $0.key < $1.key }).first?.value,
+            let binding = tools.first(where: { $0.nativeToolName == call.name }) {
+            let arguments = call.json.isEmpty ? "{}" : call.json
+            await onChunk(
+                "\nFORGE_MCP_CALL {\"server\":\"\(binding.serverID)\",\"tool\":\"\(binding.tool.name)\",\"arguments\":\(arguments)}"
+            )
+        } else if finishReason == "length" {
+            await onChunk(
+                "\n\n⚠️ Output hit the max-token limit (\(config.maxTokens)) — raise Max Tokens in Tuning so reasoning can finish."
+            )
+        }
     }
 
     private static func baseBody(
         model: String,
-        messages: [[String: String]],
+        messages: [[String: Any]],
         config: OpenRouterStreamConfig,
         stream: Bool
     ) -> [String: Any] {
@@ -271,9 +340,10 @@ struct OpenRouterClient {
         }
         if config.reasoningEnabled {
             body["reasoning"] = ["effort": config.effort.rawValue, "exclude": false]
-        } else {
-            body["reasoning"] = ["effort": OpenRouterReasoningEffort.none.rawValue]
         }
+        // When reasoning is off, omit the field entirely: explicitly sending
+        // effort "none" 400s on reasoning-mandatory endpoints
+        // ("Reasoning is mandatory ... and cannot be disabled").
         return body
     }
 
@@ -296,7 +366,8 @@ struct OpenRouterClient {
     }
 }
 
-/// Wraps OpenRouter reasoning fields into `` markers for the chat UI.
+/// Wraps OpenRouter reasoning fields into <think> markers so the chat UI
+/// renders them as a live-streaming collapsible Reasoning block.
 private struct OpenRouterReasoningStreamAssembler {
     private var thinkingOpen = false
     private var thinkingClosed = false
@@ -328,7 +399,7 @@ private struct OpenRouterReasoningStreamAssembler {
     private mutating func appendThinking(_ text: String) -> String {
         if !thinkingOpen {
             thinkingOpen = true
-            return "``" + text
+            return "<think>\n" + text
         }
         return text
     }
@@ -336,7 +407,7 @@ private struct OpenRouterReasoningStreamAssembler {
     private mutating func closeThinkingIfNeeded() -> String? {
         guard thinkingOpen, !thinkingClosed else { return nil }
         thinkingClosed = true
-        return "``\n\n"
+        return "\n</think>\n\n"
     }
 
     mutating func finish() -> String? {

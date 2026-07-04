@@ -602,6 +602,31 @@ final class InferenceEngine {
                     // KV cache may be mid-turn; drop the session so the next
                     // generation re-hydrates cleanly from stored history.
                     self.sessions.removeValue(forKey: conversation.id)
+                    // Chat-template failures (Jinja.TemplateException) come from
+                    // ChatSession's templating; retry once through the token-level
+                    // path, which falls back to a hand-built ChatML prompt.
+                    if "\(error)".localizedCaseInsensitiveContains("template")
+                        || "\(error)".contains("Jinja"), entry.container != nil
+                    {
+                        do {
+                            let completionInfo = try await self.streamBudgetedMLXResponse(
+                                entry: entry,
+                                conversation: conversation,
+                                userPrompt: userPrompt,
+                                settings: settings,
+                                budgetTarget: nil,
+                                noThinkPrefill: false,
+                                start: start,
+                                onChunk: onChunk)
+                            self.finishGeneration()
+                            onComplete(completionInfo, nil)
+                            return
+                        } catch {
+                            self.finishGeneration()
+                            onComplete(nil, error.localizedDescription)
+                            return
+                        }
+                    }
                     self.finishGeneration()
                     onComplete(nil, error.localizedDescription)
                 }
@@ -998,9 +1023,10 @@ final class InferenceEngine {
                 }
                 if !emittedSyntheticThinkOpen {
                     emittedSyntheticThinkOpen = true
-                    if entry.chatTemplateThinkingBuiltIn, !noThinkPrefill,
-                        !text.hasPrefix("<think>")
-                    {
+                    // thinkingFromStart = the template pre-opened <think>, so the
+                    // raw stream begins mid-reasoning with no opening tag — surface
+                    // one so ThinkTagParser routes the tokens into the reasoning channel.
+                    if thinkingFromStart, !text.hasPrefix("<think>") {
                         onChunk("<think>")
                     }
                 }
@@ -1046,7 +1072,21 @@ final class InferenceEngine {
                     }
                     let userInput = UserInput(
                         chat: messages, additionalContext: additionalContext)
-                    let lmInput = try await context.processor.prepare(input: userInput)
+                    let lmInput: LMInput
+                    do {
+                        lmInput = try await context.processor.prepare(input: userInput)
+                    } catch {
+                        // Chat-template failure (e.g. Jinja.TemplateException on an
+                        // exotic community template): fall back to a hand-built
+                        // ChatML prompt so the turn still generates.
+                        let fallback =
+                            turns.map { "<|im_start|>\($0.role)\n\($0.content)<|im_end|>" }
+                            .joined(separator: "\n") + "\n<|im_start|>assistant\n"
+                        let ids = context.tokenizer.encode(
+                            text: fallback, addSpecialTokens: false)
+                        lmInput = LMInput(
+                            text: .init(tokens: MLXArray(ids.map { Int32($0) })))
+                    }
 
                     var promptTokens = lmInput.text.tokens
                     if let prefillText {

@@ -52,6 +52,23 @@ struct OpenAIClient {
     struct Turn {
         let role: String  // "user" | "assistant"
         let text: String
+        var images: [Data] = []
+    }
+
+    /// Text-only turns stay plain strings; image turns become content parts.
+    static func turnPayload(_ turn: Turn) -> [String: Any] {
+        guard !turn.images.isEmpty else {
+            return ["role": turn.role, "content": turn.text]
+        }
+        var parts: [[String: Any]] = turn.images.map { data in
+            [
+                "type": "input_image",
+                "image_url":
+                    "data:\(AnthropicClient.imageMediaType(data));base64,\(data.base64EncodedString())",
+            ]
+        }
+        parts.append(["type": "input_text", "text": turn.text])
+        return ["role": turn.role, "content": parts]
     }
 
     static let models: [(id: String, label: String)] = [
@@ -81,12 +98,13 @@ struct OpenAIClient {
 
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
         request.httpMethod = "POST"
+        // Reasoning models can go quiet between SSE events; the 60s URLSession
+        // default aborts them mid-reasoning.
+        request.timeoutInterval = 1800
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var input: [[String: Any]] = turns.map {
-            ["role": $0.role, "content": $0.text]
-        }
+        var input: [[String: Any]] = turns.map(Self.turnPayload)
 
         var body: [String: Any] = [
             "model": model,
@@ -204,7 +222,7 @@ private struct OpenAIReasoningStreamAssembler {
     private mutating func appendThinking(_ text: String) -> String {
         if !thinkingOpen {
             thinkingOpen = true
-            return "``" + text
+            return "<think>\n" + text
         }
         return text
     }
@@ -212,7 +230,7 @@ private struct OpenAIReasoningStreamAssembler {
     private mutating func closeThinkingIfNeeded() -> String? {
         guard thinkingOpen, !thinkingClosed else { return nil }
         thinkingClosed = true
-        return "``\n\n"
+        return "\n</think>\n\n"
     }
 
     mutating func finish() -> String? {
