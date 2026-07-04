@@ -232,6 +232,33 @@ struct TuningInspector: View {
                         label: "Port", value: $app.serverPort,
                         limit: 1024...65535)
 
+                    // OpenAI SDKs (LangGraph, LangChain, openai-python…) refuse to
+                    // start without an api_key. Forge doesn't check it — any
+                    // non-empty value passes; this gives users one to paste.
+                    HStack(spacing: Theme.s2) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("API key")
+                                .font(.callout)
+                            Text("Clients require one; Forge accepts any value")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Text("forge-local")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("forge-local", forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Copy the API key for OpenAI-compatible clients")
+                    }
+
                     Toggle(isOn: $app.serverExposeToNetwork) {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Serve on local network")

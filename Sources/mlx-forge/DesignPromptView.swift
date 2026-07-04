@@ -39,12 +39,68 @@ enum DesignPromptLocator {
     }
 }
 
+/// Serves the bundled dist directory over a private scheme. file:// loading is a
+/// dead end for this site: loadFileURL trips CORS on the `crossorigin` module
+/// script, and loadHTMLString never grants the web process read access to the
+/// ./assets subresources — both end in a silent blank white page.
+private final class DesignSiteSchemeHandler: NSObject, WKURLSchemeHandler {
+    static let scheme = "forge-design"
+    private let root: URL
+
+    init(root: URL) { self.root = root }
+
+    private static let mimeTypes: [String: String] = [
+        "html": "text/html", "js": "text/javascript", "mjs": "text/javascript",
+        "css": "text/css", "svg": "image/svg+xml", "json": "application/json",
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon",
+        "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf",
+        "map": "application/json", "txt": "text/plain",
+    ]
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let url = task.request.url else { return }
+        var relative = url.path.isEmpty || url.path == "/" ? "/index.html" : url.path
+        relative.removeFirst()  // leading "/"
+        let file = root.appendingPathComponent(relative)
+        guard file.path.hasPrefix(root.path),  // no traversal
+            let data = try? Data(contentsOf: file)
+        else {
+            task.didFailWithError(URLError(.fileDoesNotExist))
+            return
+        }
+        let mime = Self.mimeTypes[file.pathExtension.lowercased()] ?? "application/octet-stream"
+        let response = HTTPURLResponse(
+            url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": mime,
+                "Content-Length": "\(data.count)",
+                "Access-Control-Allow-Origin": "*",
+            ])!
+        task.didReceive(response)
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+}
+
 struct DesignPromptView: View {
     @Environment(AppState.self) private var app
     @Environment(\.dismiss) private var dismiss
-    @State private var webView = WKWebView()
+    @State private var webView = DesignPromptView.makeWebView()
     @State private var loadError: String?
     @State private var isLoading = true
+
+    private static func makeWebView() -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        if let root = DesignPromptLocator.siteRoot() {
+            configuration.setURLSchemeHandler(
+                DesignSiteSchemeHandler(root: root),
+                forURLScheme: DesignSiteSchemeHandler.scheme)
+        }
+        return WKWebView(frame: .zero, configuration: configuration)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,20 +148,14 @@ struct DesignPromptView: View {
     }
 
     private func loadSite() {
-        guard let root = DesignPromptLocator.siteRoot() else {
+        guard DesignPromptLocator.siteRoot() != nil else {
             loadError =
                 "Build the web app first:\nBundledTools/ai-design-prompt → npm install && npm run build"
             isLoading = false
             return
         }
-        let index = root.appendingPathComponent("index.html")
-        // WKWebView silently refuses ES-module scripts loaded from file:// when
-        // they carry `crossorigin` (null-origin CORS fails → blank white page).
-        // Strip the attribute and load via loadHTMLString with the resource dir
-        // as baseURL, so relative `./assets/...` imports still resolve.
-        let html = (try? String(contentsOf: index, encoding: .utf8)) ?? ""
-        let cleaned = html.replacingOccurrences(of: " crossorigin", with: "")
-        webView.loadHTMLString(cleaned, baseURL: root)
+        webView.load(
+            URLRequest(url: URL(string: "\(DesignSiteSchemeHandler.scheme)://site/index.html")!))
     }
 
     private func openInBrowser() {

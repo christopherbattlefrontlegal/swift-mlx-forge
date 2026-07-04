@@ -27,7 +27,7 @@ struct ForgeApp: App {
             RootView()
                 .environment(appState)
                 .preferredColorScheme(.dark)
-                .frame(minWidth: 980, minHeight: 640)
+                .frame(minWidth: 1140, minHeight: 640)
                 .onDisappear { appState.saveNow() }
         }
         .windowStyle(.automatic)
@@ -102,7 +102,10 @@ struct RootView: View {
                 SidebarView()
                     .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
             } detail: {
+                // Floor for the chat column: with the sidebar AND inspector open,
+                // the window must grow instead of squishing the transcript.
                 ChatView()
+                    .frame(minWidth: 560)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 

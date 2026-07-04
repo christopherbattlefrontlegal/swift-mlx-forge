@@ -557,6 +557,7 @@ struct ComposerView: View {
     @State private var depthMode = "Balanced"
     @State private var styleMode = "Standard"
     @State private var deliverableMode = "Text"
+    @State private var workflowMode = "None"
     @State private var showAgentDispatch = false
     @State private var showSmartPromptSheet = false
     @State private var showAPIModelPicker = false
@@ -603,13 +604,15 @@ struct ComposerView: View {
                 .pickerStyle(.menu)
                 .font(.caption)
 
-                Button("Workflow") {
-                    // Placeholder action — could open a workflow picker or append a workflow tag.
-                    app.composerText = (app.composerText.isEmpty ? "" : app.composerText + " ") + "[Workflow: step-by-step with verification]"
+                Picker("Workflow", selection: $workflowMode) {
+                    Text("None").tag("None")
+                    Text("Step-by-step + verify").tag("Step-by-step, verify each step")
+                    Text("Plan, then execute").tag("Plan first, then execute the plan")
+                    Text("Draft → critique → revise").tag("Draft, critique your draft, then revise")
+                    Text("Research → synthesize").tag("Gather the facts first, then synthesize")
                 }
+                .pickerStyle(.menu)
                 .font(.caption)
-                .buttonStyle(.plain)
-                .foregroundStyle(.blue)
 
                 // Graph feature removed for App Store readiness (sandbox incompatibilities and incomplete state). Use prompt library + modes for advanced chats.
             }
@@ -1248,8 +1251,18 @@ struct ComposerView: View {
             + "[file: \(name)]\n```\n\(content)\(clippedNote)\n```"
     }
 
+    /// Mode tags prepended to every send/dispatch; the Workflow pick joins the
+    /// Depth/Style/Deliverable tags so the model receives it as an instruction.
+    private var modeTags: String {
+        var tags = "[Depth: \(depthMode)] [Style: \(styleMode)] [Deliverable: \(deliverableMode)] "
+        if workflowMode != "None" {
+            tags += "[Workflow: \(workflowMode)] "
+        }
+        return tags
+    }
+
     private func performSend() {
-        let tags = "[Depth: \(depthMode)] [Style: \(styleMode)] [Deliverable: \(deliverableMode)] "
+        let tags = modeTags
         if !app.composerText.hasPrefix("[Depth:") {
             app.composerText = tags + app.composerText
         }
@@ -1278,7 +1291,7 @@ struct ComposerView: View {
                 text = lastUser
             }
         }
-        let tags = "[Depth: \(depthMode)] [Style: \(styleMode)] [Deliverable: \(deliverableMode)] "
+        let tags = modeTags
         if !text.hasPrefix("[Depth:") && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             text = tags + text
         }
@@ -1289,7 +1302,7 @@ struct ComposerView: View {
     }
 
     private func dispatchToAll() {
-        let tags = "[Depth: \(depthMode)] [Style: \(styleMode)] [Deliverable: \(deliverableMode)] "
+        let tags = modeTags
         var text = app.composerText
         if !text.hasPrefix("[Depth:") && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             text = tags + text
