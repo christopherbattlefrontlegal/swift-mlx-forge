@@ -25,6 +25,21 @@ actor MLXGate {
         return try await body()
     }
 
+    /// Same FIFO exclusive turn as ``withTurn``, but `body` runs on a
+    /// background thread (off the main actor). Used by the API server so a
+    /// long MLX generation doesn't freeze the app UI while it serves a
+    /// request. The gate still serializes GPU work — only one turn runs at
+    /// a time — but the main thread is free to keep the interface live.
+    func withTurnDetached<T: Sendable>(
+        _ body: @Sendable @escaping () async throws -> T
+    ) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        // body is nonisolated; called from this (non-MainActor) gate it runs on
+        // the cooperative pool — off the main thread — so the UI stays live.
+        return try await body()
+    }
+
     private func acquire() async {
         if !busy {
             busy = true

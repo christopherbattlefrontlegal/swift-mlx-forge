@@ -17,6 +17,14 @@ import MLXLMCommon
 import Network
 import Observation
 
+/// `@unchecked Sendable` box for handing a non-Sendable value (ChatSession,
+/// [Chat.Message]) into the server's off-main generation task. Safe because
+/// `MLXGate` serializes all GPU work — only one generation touches the session
+/// at a time, so there is no concurrent access across actors.
+fileprivate struct SendableBox<T>: @unchecked Sendable {
+    let value: T
+}
+
 @MainActor
 @Observable
 final class ForgeServer {
@@ -365,22 +373,9 @@ final class ForgeServer {
         await HTTPResponse.sendHead(
             on: connection, status: "200 OK", contentType: "text/event-stream",
             allowOrigin: allowOrigin)
-
-        func chunkJSON(delta: [String: Any], finish: String?) -> String {
-            let object: [String: Any] = [
-                "id": responseID, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [
-                    ["index": 0, "delta": delta, "finish_reason": finish as Any]
-                ],
-            ]
-            let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
-            return String(decoding: data, as: UTF8.self)
-        }
-
         await HTTPResponse.sendRaw(
             on: connection,
-            "data: \(chunkJSON(delta: ["role": "assistant"], finish: nil))\n\n")
+            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: ["role": "assistant"], finish: nil))\n\n")
         guard let gate = engine?.gate else {
             // Engine was torn down after we already sent the 200 head — terminate the SSE
             // stream explicitly so the client doesn't wait on a socket that never closes.
@@ -390,10 +385,14 @@ final class ForgeServer {
             await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
             return
         }
-        // Generation holds an exclusive MLX turn — it can never overlap the
-        // chat UI's stream or another API request (concurrent MLX evals on
-        // one Metal device are a GPU-fault, not a slowdown).
-        await gate.withTurn {
+        // Generation runs OFF the main actor (withTurnDetached) so a long MLX
+        // turn serving an API request doesn't freeze the app UI. The gate still
+        // serializes GPU work — only one turn runs at a time.
+        let sessionBox = SendableBox(value: session)
+        let messagesBox = SendableBox(value: messages)
+        await gate.withTurnDetached { [sessionBox, messagesBox] in
+            let session = sessionBox.value
+            let messages = messagesBox.value
             do {
                 // The session already carries the prior turns as history; the final user
                 // message is the turn we are replying to.
@@ -411,7 +410,7 @@ final class ForgeServer {
                     case .chunk(let chunk):
                         let delivered = await HTTPResponse.sendRaw(
                             on: connection,
-                            "data: \(chunkJSON(delta: ["content": chunk], finish: nil))\n\n")
+                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: ["content": chunk], finish: nil))\n\n")
                         // Client hung up — stop generating instead of burning GPU to
                         // completion into a dead socket (ending iteration cancels the
                         // underlying generation).
@@ -424,7 +423,7 @@ final class ForgeServer {
                     }
                 }
                 await HTTPResponse.sendRaw(
-                    on: connection, "data: \(chunkJSON(delta: [:], finish: finishReason))\n\n")
+                    on: connection, "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: [:], finish: finishReason))\n\n")
                 await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
             } catch {
                 FileHandle.standardError.write(
@@ -440,6 +439,23 @@ final class ForgeServer {
         }
     }
 
+    /// Builds an OpenAI-compatible `chat.completion.chunk` SSE payload. Static
+    /// and nonisolated so it is callable from the off-main generation task.
+    nonisolated private static func chunkJSON(
+        responseID: String, created: Int, model: String,
+        delta: [String: Any], finish: String?
+    ) -> String {
+        let object: [String: Any] = [
+            "id": responseID, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [
+                ["index": 0, "delta": delta, "finish_reason": finish as Any]
+            ],
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func completeChat(
         session: ChatSession, messages: [Chat.Message], model: String,
         responseID: String, created: Int, on connection: NWConnection, allowOrigin: String?
@@ -451,15 +467,20 @@ final class ForgeServer {
             return
         }
         do {
-            var output = ""
-            var info: GenerateCompletionInfo?
-            // Exclusive MLX turn — see streamChat for why.
-            try await gate.withTurn {
+            // Generation runs OFF the main actor (withTurnDetached) so a long MLX
+            // turn serving an API request doesn't freeze the app UI.
+            let sessionBox = SendableBox(value: session)
+            let messagesBox = SendableBox(value: messages)
+            let (output, info) = try await gate.withTurnDetached { [sessionBox, messagesBox] in
+                let session = sessionBox.value
+                let messages = messagesBox.value
                 let replyTarget = messages.last(where: { $0.role != .system })
                 let prompt = replyTarget?.content ?? ""
                 let role = replyTarget?.role ?? .user
                 let images = replyTarget?.images ?? []
                 let videos = replyTarget?.videos ?? []
+                var output = ""
+                var info: GenerateCompletionInfo?
                 for try await item in session.streamDetails(
                     to: prompt, role: role, images: images, videos: videos
                 ) {
@@ -469,6 +490,7 @@ final class ForgeServer {
                     case .toolCall: break
                     }
                 }
+                return (output, info)
             }
             let finishReason = info?.stopReason == .length ? "length" : "stop"
             let body: [String: Any] = [
