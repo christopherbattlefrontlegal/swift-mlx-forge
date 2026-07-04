@@ -44,7 +44,7 @@ models/
 hf_cache/
 hfcache/
 huggingface/
-llama.cpp/
+/llama.cpp/
 llama_cache/
 
 # Nested experiment builds
