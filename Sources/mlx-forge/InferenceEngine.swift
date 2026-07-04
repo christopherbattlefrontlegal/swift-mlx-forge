@@ -303,7 +303,11 @@ final class InferenceEngine {
         defer { loadingModels.removeValue(forKey: model.id) }
 
         let settings = generationSettings()
-        let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 8192
+        // 0 = auto. 8192 was far too small: a big system preset + long message
+        // overflows llama.cpp's context and the wrapper fails the turn with NO
+        // output at all. 32k covers real prompts; the wrapper still clamps to
+        // the model's trained context.
+        let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 32_768
         let url = model.directory
         let modelID = model.id
         // llama.cpp reports load progress per tensor from its loader thread —
@@ -689,7 +693,7 @@ final class InferenceEngine {
                 } else {
                     effectivePrompt = prompt
                 }
-                _ = await gguf.respond(
+                let fullText = await gguf.respond(
                     to: effectivePrompt, thinkingEnabled: settings.localThinkingEnabled
                 ) { delta in
                     await MainActor.run {
@@ -702,7 +706,22 @@ final class InferenceEngine {
                     }
                 }
                 self.finishGeneration()
-                onComplete(nil, nil)
+                // llama.cpp's wrapper fails a turn SILENTLY (empty streams) when the
+                // prompt doesn't fit the context — never leave the user a blank bubble.
+                let producedNothing =
+                    fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && self.liveTokenCount == 0
+                if producedNothing, !Task.isCancelled {
+                    onComplete(
+                        nil,
+                        "The model produced no output. The prompt (system prompt + history + message) "
+                            + "most likely exceeds the llama.cpp context window "
+                            + "(\(gguf.contextTokens) tokens). Raise Max KV cache in Tuning, "
+                            + "shorten the system prompt, or start a new chat — then reload the model."
+                    )
+                } else {
+                    onComplete(nil, nil)
+                }
             }
         }
     }

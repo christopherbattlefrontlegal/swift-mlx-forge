@@ -17,6 +17,8 @@ final class GGUFRuntime: @unchecked Sendable {
 
     private let llm: LLM
     private let fileURL: URL
+    /// Context window this llama context was created with (for error reporting).
+    let contextTokens: Int32
 
     /// `onLoadProgress` fires on llama.cpp's loader thread with 0…1 as tensors
     /// are read into memory (a 100GB+ file takes minutes — this is the only
@@ -42,6 +44,7 @@ final class GGUFRuntime: @unchecked Sendable {
         else { return nil }
         self.fileURL = fileURL
         self.llm = llm
+        self.contextTokens = ctx
     }
 
     /// LLM.swift doesn't expose the GGUF's embedded jinja template, so pick the
