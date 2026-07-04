@@ -458,7 +458,7 @@ struct TuningInspector: View {
         }
     }
 
-    private static let thinkingTokenPresets = [100, 250, 500, 750, 1000, 2000, 4000]
+    private static let thinkingTokenPresets = [500, 1000, 2000, 4000, 8000]
 
     private var localThinkingBudgetBinding: Binding<Int> {
         Binding(
