@@ -22,14 +22,14 @@ Forge is a local-first macOS app. The primary boundaries are:
 
 - Local model files stay on the user's machine.
 - API keys are stored in macOS Keychain.
-- The OpenAI-compatible server binds to loopback only.
+- The OpenAI-compatible server binds to loopback by default.
+- LAN serving is an explicit user-controlled mode.
 - The server enforces Host and Origin checks and does not use wildcard CORS.
-- The App Store-safe Forge target does not spawn external processes.
-- MCP stdio entries are not launched by the sandboxed app.
+- App Store sandbox builds should not spawn external processes.
+- Developer builds may launch user-configured stdio MCP servers after the user connects them.
 
 Run the static regression check:
 
 ```sh
 ./scripts/security-check.sh
 ```
-

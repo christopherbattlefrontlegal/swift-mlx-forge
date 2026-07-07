@@ -14,8 +14,8 @@ DerivedData/
 *.dSYM/
 *.ipa
 *.xcarchive/
-scripts/
 brand-spec.md
+AUDIT_PROMPT.md
 
 # Local configuration, secrets, and machine state
 .claude/
@@ -49,7 +49,11 @@ llama_cache/
 
 # Nested experiment builds
 research/experiments/**/.build/
+AppleDocumentation/
 
 # Optional local/marketplace-specific and experimental folders kept out of open-source publish
 MacAppStore/
+marketing/
 research/
+scripts/download_apple_docs.py
+scripts/update-runtimes.sh

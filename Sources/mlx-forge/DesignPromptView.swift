@@ -23,12 +23,15 @@ enum DesignPromptLocator {
 
     private static func repoDistRoot() -> URL? {
         guard let exe = Bundle.main.executableURL else { return nil }
-        let roots = [
-            exe.deletingLastPathComponent(),
-            exe.deletingLastPathComponent().deletingLastPathComponent(),
-            exe.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent(),
-            URL(fileURLWithPath: "/Volumes/TB4_1TB/swift-mlx-forge"),
-        ]
+        var roots: [URL] = []
+        var cursor = exe.deletingLastPathComponent()
+        for _ in 0..<8 {
+            roots.append(cursor)
+            let parent = cursor.deletingLastPathComponent()
+            guard parent != cursor else { break }
+            cursor = parent
+        }
+        roots.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
         for root in roots {
             let dist = root.appendingPathComponent("BundledTools/ai-design-prompt/dist", isDirectory: true)
             if FileManager.default.fileExists(atPath: dist.appendingPathComponent("index.html").path) {

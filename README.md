@@ -25,15 +25,28 @@ Forge does not ship model weights in this repository.
 - macOS 26+ (tested on macOS 27 beta / Golden Gate) with Swift 6.2+.
 - Apple Silicon Mac.
 - Xcode command line tools or Xcode with Swift 6.
+- Node.js/npm, used only when packaging the embedded design-prompt tool into `Forge.app`.
 - SwiftPM can resolve all dependencies directly from public git sources.
 - Optional: if you need local source overrides, use `swift package edit mlx-swift-lm`.
+
+## Install
+
+The GitHub release is source-installable today. A public drag-and-drop binary still needs Developer ID signing and notarization.
+
+```sh
+git clone https://github.com/christopherbattlefrontlegal/swift-mlx-forge.git
+cd swift-mlx-forge
+./scripts/install-forge-app.sh
+```
+
+That installs and opens `/Applications/Forge.app`. See `INSTALL.md` for the full path and signing notes.
 
 ## Build
 
 From the repository root:
 
 ```sh
-swift build
+swift build --product mlx-forge
 ```
 
 Run the app locally:
@@ -45,8 +58,7 @@ swift run mlx-forge
 Install a signed `.app` bundle (recommended for daily use):
 
 ```sh
-./scripts/build-app.sh /Applications
-open /Applications/Forge.app
+./scripts/install-forge-app.sh
 ```
 
 ## Run
@@ -70,8 +82,8 @@ Forge scans default locations plus any folders you add in **Settings → Model d
 Example layout (your paths will differ):
 
 ```text
-/Volumes/VAULT/machine/models/
-/Volumes/VAULT/machine/models/mlx-community/
+~/Models/
+~/Models/mlx-community/
   Qwen3-8B-4bit/
   glm-4-9b-4bit/
   granite-3.3-8b-instruct-4bit/
@@ -118,7 +130,8 @@ Use `mcp.example.json` as a safe template before adding your own local server pa
 
 Forge can expose a local OpenAI-compatible API server on loopback. The server:
 
-- Binds only to `127.0.0.1`.
+- Binds to `127.0.0.1` by default.
+- Can be explicitly exposed to LAN devices from Settings.
 - Enforces a Host allowlist.
 - Rejects cross-origin browser requests.
 - Does not emit wildcard CORS.
@@ -126,7 +139,7 @@ Forge can expose a local OpenAI-compatible API server on loopback. The server:
 Run a build before publishing changes:
 
 ```sh
-swift build
+swift build --product mlx-forge
 ```
 
 ## App Store Notes

@@ -776,8 +776,8 @@ private struct HTTPRequest {
 }
 
 private enum HTTPResponse {
-    /// CORS headers. `allowOrigin` is nil unless the request carried a *validated
-    /// loopback* Origin — we never emit a wildcard, so a random website cannot read
+    /// CORS headers. `allowOrigin` is nil unless the request carried a validated
+    /// local Origin — we never emit a wildcard, so a random website cannot read
     /// responses from this server.
     static func corsHeaders(_ allowOrigin: String?) -> String {
         guard let allowOrigin else { return "" }
