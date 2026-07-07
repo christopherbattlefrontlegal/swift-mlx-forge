@@ -399,6 +399,32 @@ h3 {
   font-weight: 720;
 }
 
+.hero-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 22px;
+  max-width: min(620px, 100%);
+}
+.hero-badges span {
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(255, 107, 53, 0.26);
+  border-radius: 8px;
+  background: rgba(255, 107, 53, 0.08);
+  color: #f2d7c8;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.76rem;
+  font-weight: 760;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.hero-badges span:nth-child(even) {
+  border-color: rgba(127, 176, 255, 0.28);
+  background: rgba(127, 176, 255, 0.075);
+  color: #dbe8ff;
+}
+
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
@@ -801,10 +827,13 @@ pre code {
   font-size: 0.72rem;
   font-weight: 700;
 }
+.composer-tools span:nth-child(3),
 .composer-tools span:nth-child(4),
 .composer-tools span:nth-child(5),
 .composer-tools span:nth-child(7),
-.composer-tools span:nth-child(8) {
+.composer-tools span:nth-child(8),
+.composer-tools span:nth-child(9),
+.composer-tools span:nth-child(10) {
   color: var(--ember-glow);
   border-color: rgba(255, 107, 53, 0.28);
   background: rgba(255, 107, 53, 0.08);
@@ -1261,6 +1290,10 @@ pre code {
   pre {
     font-size: 0.78rem;
     padding: 16px;
+  }
+  pre code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 }
 

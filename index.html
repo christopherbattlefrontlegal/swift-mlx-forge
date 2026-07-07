@@ -6,13 +6,13 @@
     <title>Forge — Native macOS workbench for local LLMs on Apple Silicon</title>
     <meta
       name="description"
-      content="Forge is a native macOS app and SwiftPM workspace that runs MLX and in-process GGUF models on Apple Silicon, with file/photo attachments, prompt libraries, Brave web research, a design prompt generator, a loopback OpenAI-compatible API server, MCP, multi-agent orchestration, and optional cloud providers."
+      content="Forge is a native macOS workbench for MLX and in-process GGUF models on Apple Silicon, with Smart Prompt Select, prompt folders, a design prompt builder, Brave research, a code loop, headless command composer, MCP, local API, and multi-agent dispatch."
     >
     <link rel="canonical" href="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
     <meta property="og:title" content="Forge — Native Mac workbench for local LLMs">
     <meta
       property="og:description"
-      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, attachments, prompt libraries, Brave research, design prompts, local API, MCP, and agents — MIT, open source."
+      content="MLX + in-process GGUF on Apple Silicon. Prompt libraries, Smart Select, design prompts, Brave research, code loop, headless commands, local API, MCP, and agents — MIT, open source."
     >
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
@@ -25,7 +25,7 @@
     <meta name="twitter:title" content="Forge — Native Mac workbench for local LLMs">
     <meta
       name="twitter:description"
-      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, attachments, Brave research, design prompts, local API, MCP, and agents."
+      content="MLX + in-process GGUF on Apple Silicon. Smart prompts, design builder, Brave research, code loop, headless command composer, local API, MCP, and agents."
     >
     <meta name="twitter:image" content="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/assets/social-preview.png">
     <meta name="theme-color" content="#0a0a0f">
@@ -84,11 +84,19 @@
           <h1 id="hero-title">Forge</h1>
           <p class="hero-lede">
             A native macOS workbench that runs <strong>MLX</strong> and in-process
-            <strong>GGUF</strong> (llama.cpp) models side by side on Apple Silicon — with a
-            SwiftUI chat surface, a loopback OpenAI-compatible API server, MCP configuration,
-            web research, prompt tools, multi-agent orchestration, and optional cloud providers.
+            <strong>GGUF</strong> (llama.cpp) models side by side on Apple Silicon — plus the
+            operator tools that make it useful: Smart Prompt Select, prompt folders, Brave research,
+            a WebKit design prompt builder, multi-agent dispatch, an OpenRouter coding loop, and a
+            headless command composer for Claude CLI work.
             Bring your own weights.
           </p>
+          <div class="hero-badges" aria-label="Workflow highlights">
+            <span>Smart Prompt Select</span>
+            <span>Design prompt builder</span>
+            <span>planner → coder → tester loop</span>
+            <span>Headless command helper</span>
+            <span>MCP tool chains</span>
+          </div>
           <div class="hero-actions" aria-label="Launch actions">
             <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
               View on GitHub
@@ -104,8 +112,8 @@
               <dd>MLX + GGUF</dd>
             </div>
             <div>
-              <dt>Interface</dt>
-              <dd>Native SwiftUI</dd>
+              <dt>Workflows</dt>
+              <dd>Prompts + code loop</dd>
             </div>
             <div>
               <dt>Server</dt>
@@ -123,15 +131,14 @@
             <span class="dot red"></span>
             <span class="dot amber"></span>
             <span class="dot green"></span>
-            <span class="terminal-title-text">forge — zsh</span>
+            <span class="terminal-title-text">forge — operator loop</span>
           </div>
-          <pre><code><span class="t-prompt">$</span> <span class="t-cmd">swift run mlx-forge</span>
-<span class="t-muted"># inspector → enable "Local API server"</span>
-<span class="t-ok">✓</span> Serving <span class="t-arg">http://127.0.0.1:3737/v1</span> <span class="t-muted">(loopback)</span>
-<span class="t-prompt">$</span> <span class="t-cmd">curl</span> $BASE/chat/completions -d <span class="t-str">'{"model":"local/8b-4bit",...}'</span>
-<span class="t-ok">↻</span> Cold model → loading weights from disk…
-<span class="t-ok">✓</span> Thinking template sniffed · KV cache capped at 10% RAM
-<span class="t-muted">{"choices":[{"message":{"content":"…"}}],"usage":{…}}</span><span class="t-cursor">▋</span></code></pre>
+          <pre><code><span class="t-ok">✓</span> Prompt folders mounted → category menu + presets
+<span class="t-ok">✓</span> Smart Select searches <span class="t-arg">prompt_database/search.py</span>
+<span class="t-ok">✓</span> Design builder served over <span class="t-arg">forge-design://</span>
+<span class="t-ok">↻</span> Code loop: planner → coder → auditor → fixer → tester
+<span class="t-ok">✓</span> Dispatch: local models + Claude + OpenRouter
+<span class="t-ok">›</span> Headless helper emits reviewed <span class="t-cmd">claude</span> commands<span class="t-cursor">▋</span></code></pre>
         </div>
       </section>
 
@@ -263,11 +270,12 @@
         <div class="section-inner workflow-stack-layout">
           <div class="section-heading reveal">
             <p class="eyebrow">The operator loop</p>
-            <h2 id="workflows-title">The composer is a workbench, not a text box.</h2>
+            <h2 id="workflows-title">The composer is a cockpit for prompts, agents, and code work.</h2>
             <p class="section-copy">
-              Forge wraps the chat surface with real working controls: mode tags, file intake,
-              prompt libraries, Brave-backed research, a bundled design prompt generator, and a
-              code loop that can hand work across planner, coder, auditor, fixer, and tester roles.
+              Forge wraps the chat surface with the buttons you actually reach for: mode tags,
+              file intake, prompt libraries, Smart Select, Brave-backed research, a bundled design
+              prompt generator, prompt enhancement, multi-agent dispatch, and a code loop that can
+              hand work across planner, coder, auditor, fixer, and tester roles.
             </p>
           </div>
 
@@ -280,23 +288,25 @@
             </div>
             <div class="composer-frame">
               <p class="composer-placeholder">
-                Attach a PDF, drop in a screenshot, select a prompt preset, turn on Brave, then
-                dispatch to local models and cloud agents.
+                Attach a PDF, drop in a screenshot, smart-select the right system prompt, open the
+                design builder, turn on Brave, then dispatch to agents or start the code loop.
               </p>
               <div class="composer-tools" aria-label="Composer tools">
                 <span>photo</span>
                 <span>file</span>
-                <span>prompts</span>
-                <span>design</span>
-                <span>web</span>
+                <span>smart prompts</span>
+                <span>design builder</span>
+                <span>Brave</span>
                 <span>think</span>
-                <span>enhance</span>
+                <span>enhance prompt</span>
                 <span>agents</span>
+                <span>code loop</span>
+                <span>headless</span>
               </div>
             </div>
             <div class="live-bar">
               <span class="pulse-dot" aria-hidden="true"></span>
-              <span>Agents: local 1, Claude, OpenRouter - streaming, citing, and monitoring live</span>
+              <span>Agents: local 1, Claude, OpenRouter - streaming, coding, citing, and monitoring live</span>
             </div>
           </div>
         </div>
@@ -312,10 +322,11 @@
           </article>
           <article class="workflow-card reveal">
             <span class="workflow-kicker">Prompting</span>
-            <h3>Prompt folders become a library.</h3>
+            <h3>Prompt folders become a searchable system-prompt library.</h3>
             <p>
-              Add external prompt directories, browse by category, smart-select from the library,
-              and keep the active system prompt label visible in the inspector.
+              Add external prompt directories, browse by category, save presets, and run Smart
+              Select so the active model can pick, combine, redraft, and install the best system
+              prompt for the job.
             </p>
           </article>
           <article class="workflow-card reveal">
@@ -336,7 +347,7 @@
           </article>
           <article class="workflow-card reveal">
             <span class="workflow-kicker">Polish</span>
-            <h3>Prompt enhancement on demand.</h3>
+            <h3>One wand turns a rough ask into an operator-grade prompt.</h3>
             <p>
               A wand action rewrites rough prompts into clearer instructions through Anthropic or
               OpenRouter, while preserving the top-bar depth/style/deliverable tags.
@@ -344,10 +355,11 @@
           </article>
           <article class="workflow-card reveal">
             <span class="workflow-kicker">Automation</span>
-            <h3>Code loop and multi-agent dispatch.</h3>
+            <h3>Code loop, dispatch, and headless command prep.</h3>
             <p>
               Send the same task to loaded local models, Claude, and OpenRouter, or run the
-              planner -> coder -> auditor -> fixer -> tester loop when you want iteration.
+              planner -> coder -> auditor -> fixer -> tester loop when you want iteration. The
+              Headless Helper turns the same intent into reviewed Claude CLI commands.
             </p>
           </article>
         </div>
@@ -496,7 +508,7 @@
         <div class="section-inner">
           <div class="section-heading reveal">
             <p class="eyebrow">Agents &amp; orchestration</p>
-            <h2 id="agents-title">Wire models together — locally or across providers.</h2>
+            <h2 id="agents-title">Dispatch agents, run the code loop, then package a headless run.</h2>
           </div>
 
           <div class="orchestration-grid">
@@ -518,8 +530,8 @@
               <span class="orch-label">Coding loop</span>
               <h3>planner → coder → auditor → fixer → tester</h3>
               <p>
-                A multi-agent coding loop over OpenRouter, driven by one model slug of your choice.
-                Runs in rounds until the tester signs off with
+                A multi-agent coding loop over OpenRouter, driven by one model slug of your choice
+                (default <code>qwen/qwen3-coder</code>). Runs in rounds until the tester signs off with
                 <code>VERDICT: PASS</code>, or <code>maxRounds</code> (default 3) is hit.
               </p>
               <p class="quiet">
@@ -529,12 +541,12 @@
 
             <article class="orch-card reveal">
               <span class="orch-label">Headless launcher</span>
-              <h3>A command composer — it never runs anything for you</h3>
+              <h3>Claude CLI command builder with safety rails</h3>
               <p>
-                Composes copy-pasteable commands (safe commented + ready-to-run) for an external
-                Claude CLI: model presets, permission modes (<code>plan</code>, <code>auto</code>,
-                <code>acceptEdits</code>…), and run presets (read-only review, safe edit, full
-                autonomous).
+                Composes copy-pasteable commands for external Claude CLI runs: mission prompt,
+                working directories, output folder, model and fallback, output format, permission
+                mode, tool allowlist, MCP config, and system prompt pulled from the same prompt
+                library.
               </p>
               <p class="quiet">
                 Forge generates the command; the operator runs it. Nothing is executed under the hood.
