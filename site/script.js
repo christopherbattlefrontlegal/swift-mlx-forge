@@ -108,7 +108,7 @@
 
     // Close if resized up to desktop
     window.addEventListener("resize", function () {
-      if (window.innerWidth > 760) setOpen(false);
+      if (window.innerWidth > 980) setOpen(false);
     });
   }
 
