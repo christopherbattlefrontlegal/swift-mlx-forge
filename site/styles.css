@@ -600,6 +600,12 @@ pre code {
 .api-band {
   background: linear-gradient(180deg, rgba(127, 176, 255, 0.035), transparent 40%), #07070c;
 }
+.workflow-stack-band {
+  background:
+    radial-gradient(90% 80% at 100% 0%, rgba(255, 107, 53, 0.08), transparent 55%),
+    radial-gradient(90% 70% at 0% 100%, rgba(95, 208, 127, 0.055), transparent 58%),
+    #08080e;
+}
 .security-band {
   background: #08080e;
 }
@@ -731,6 +737,136 @@ pre code {
 .feature-card p {
   color: var(--muted);
   font-size: 0.96rem;
+  line-height: 1.6;
+}
+
+/* ============================================================ WORKFLOW STACK */
+.workflow-stack-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 0.92fr) minmax(320px, 1fr);
+  gap: clamp(28px, 5vw, 64px);
+  align-items: center;
+}
+.workflow-console {
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.025)),
+    #090a10;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.36);
+}
+.control-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+}
+.control-strip span {
+  min-width: 0;
+  padding: 13px 14px;
+  background: rgba(14, 15, 21, 0.95);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 760;
+  overflow-wrap: anywhere;
+}
+.composer-frame {
+  margin: 16px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(5, 5, 9, 0.72);
+}
+.composer-placeholder {
+  min-height: 112px;
+  margin: 0;
+  color: #d5d9e3;
+  font-size: 1rem;
+  line-height: 1.65;
+}
+.composer-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+.composer-tools span {
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--quiet);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+.composer-tools span:nth-child(4),
+.composer-tools span:nth-child(5),
+.composer-tools span:nth-child(7),
+.composer-tools span:nth-child(8) {
+  color: var(--ember-glow);
+  border-color: rgba(255, 107, 53, 0.28);
+  background: rgba(255, 107, 53, 0.08);
+}
+.live-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+.pulse-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--signal);
+  box-shadow: 0 0 0 rgba(95, 208, 127, 0.58);
+  animation: pulse 1.7s var(--ease) infinite;
+}
+@keyframes pulse {
+  70% {
+    box-shadow: 0 0 0 12px rgba(95, 208, 127, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(95, 208, 127, 0);
+  }
+}
+.workflow-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: clamp(26px, 5vw, 48px);
+}
+.workflow-card {
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(90% 70% at 100% 0%, rgba(255, 107, 53, 0.055), transparent 55%),
+    var(--panel);
+}
+.workflow-kicker {
+  display: inline-flex;
+  margin-bottom: 26px;
+  color: var(--ember-glow);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.workflow-card h3 {
+  font-size: 1.08rem;
+}
+.workflow-card p {
+  color: var(--muted);
+  font-size: 0.94rem;
   line-height: 1.6;
 }
 
@@ -1046,12 +1182,14 @@ pre code {
   }
   .two-column,
   .build-layout,
-  .apple-fm-layout {
+  .apple-fm-layout,
+  .workflow-stack-layout {
     grid-template-columns: 1fr;
   }
   .two-column > *,
   .build-layout > *,
-  .apple-fm-layout > * {
+  .apple-fm-layout > *,
+  .workflow-stack-layout > * {
     min-width: 0;
   }
   .feature-grid,
@@ -1060,7 +1198,8 @@ pre code {
   .cli-grid,
   .provider-grid,
   .security-grid,
-  .mcp-grid {
+  .mcp-grid,
+  .workflow-card-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .security-grid,
@@ -1097,7 +1236,8 @@ pre code {
   .cli-grid,
   .provider-grid,
   .security-grid,
-  .mcp-grid {
+  .mcp-grid,
+  .workflow-card-grid {
     grid-template-columns: 1fr;
   }
   .brand-name {

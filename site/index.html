@@ -6,13 +6,13 @@
     <title>Forge — Native macOS workbench for local LLMs on Apple Silicon</title>
     <meta
       name="description"
-      content="Forge is a native macOS app and SwiftPM workspace that runs MLX and in-process GGUF (llama.cpp) models on Apple Silicon, with a SwiftUI chat surface, a loopback OpenAI-compatible API server, MCP configuration, multi-agent orchestration, and optional cloud providers — all keys in Keychain."
+      content="Forge is a native macOS app and SwiftPM workspace that runs MLX and in-process GGUF models on Apple Silicon, with file/photo attachments, prompt libraries, Brave web research, a design prompt generator, a loopback OpenAI-compatible API server, MCP, multi-agent orchestration, and optional cloud providers."
     >
     <link rel="canonical" href="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
     <meta property="og:title" content="Forge — Native Mac workbench for local LLMs">
     <meta
       property="og:description"
-      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, loopback OpenAI-compatible API, MCP support, agent graphs, and optional cloud providers — MIT, open source."
+      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, attachments, prompt libraries, Brave research, design prompts, local API, MCP, and agents — MIT, open source."
     >
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
@@ -25,7 +25,7 @@
     <meta name="twitter:title" content="Forge — Native Mac workbench for local LLMs">
     <meta
       name="twitter:description"
-      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, local OpenAI-compatible API, MCP support, and agent graphs."
+      content="MLX + in-process GGUF on Apple Silicon. Native SwiftUI chat, attachments, Brave research, design prompts, local API, MCP, and agents."
     >
     <meta name="twitter:image" content="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/assets/social-preview.png">
     <meta name="theme-color" content="#0a0a0f">
@@ -44,6 +44,7 @@
       <nav aria-label="Sections">
         <a href="#engines">Engines</a>
         <a href="#app">The app</a>
+        <a href="#workflows">Workflows</a>
         <a href="#api">Local API</a>
         <a href="#mcp">MCP</a>
         <a href="#agents">Agents</a>
@@ -61,6 +62,7 @@
     <nav id="mobile-nav" class="mobile-nav" aria-label="Mobile">
       <a href="#engines">Engines</a>
       <a href="#app">The app</a>
+      <a href="#workflows">Workflows</a>
       <a href="#api">Local API</a>
       <a href="#mcp">MCP</a>
       <a href="#agents">Agents</a>
@@ -84,7 +86,8 @@
             A native macOS workbench that runs <strong>MLX</strong> and in-process
             <strong>GGUF</strong> (llama.cpp) models side by side on Apple Silicon — with a
             SwiftUI chat surface, a loopback OpenAI-compatible API server, MCP configuration,
-            multi-agent orchestration, and optional cloud providers. Bring your own weights.
+            web research, prompt tools, multi-agent orchestration, and optional cloud providers.
+            Bring your own weights.
           </p>
           <div class="hero-actions" aria-label="Launch actions">
             <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
@@ -252,6 +255,101 @@
               </p>
             </article>
           </div>
+        </div>
+      </section>
+
+      <!-- ============================== WORKFLOWS ============================== -->
+      <section id="workflows" class="band workflow-stack-band" aria-labelledby="workflows-title">
+        <div class="section-inner workflow-stack-layout">
+          <div class="section-heading reveal">
+            <p class="eyebrow">The operator loop</p>
+            <h2 id="workflows-title">The composer is a workbench, not a text box.</h2>
+            <p class="section-copy">
+              Forge wraps the chat surface with real working controls: mode tags, file intake,
+              prompt libraries, Brave-backed research, a bundled design prompt generator, and a
+              code loop that can hand work across planner, coder, auditor, fixer, and tester roles.
+            </p>
+          </div>
+
+          <div class="workflow-console reveal" aria-label="Forge workflow controls">
+            <div class="control-strip" aria-label="Composer modes">
+              <span>Depth: Deep</span>
+              <span>Style: Detailed</span>
+              <span>Deliverable: Code</span>
+              <span>Workflow: Research -> synthesize</span>
+            </div>
+            <div class="composer-frame">
+              <p class="composer-placeholder">
+                Attach a PDF, drop in a screenshot, select a prompt preset, turn on Brave, then
+                dispatch to local models and cloud agents.
+              </p>
+              <div class="composer-tools" aria-label="Composer tools">
+                <span>photo</span>
+                <span>file</span>
+                <span>prompts</span>
+                <span>design</span>
+                <span>web</span>
+                <span>think</span>
+                <span>enhance</span>
+                <span>agents</span>
+              </div>
+            </div>
+            <div class="live-bar">
+              <span class="pulse-dot" aria-hidden="true"></span>
+              <span>Agents: local 1, Claude, OpenRouter - streaming, citing, and monitoring live</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-inner workflow-card-grid">
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Context</span>
+            <h3>Photos, PDFs, code, JSON, Markdown.</h3>
+            <p>
+              Images attach to local VLM paths or MCP photo-review tools. PDFs are text-extracted;
+              text/code files are inlined into the composer with clipping guards.
+            </p>
+          </article>
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Prompting</span>
+            <h3>Prompt folders become a library.</h3>
+            <p>
+              Add external prompt directories, browse by category, smart-select from the library,
+              and keep the active system prompt label visible in the inspector.
+            </p>
+          </article>
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Design</span>
+            <h3>A bundled design prompt generator.</h3>
+            <p>
+              The app hosts the WebKit prompt builder over a private <code>forge-design://</code>
+              scheme, then pastes the generated prompt straight back into chat.
+            </p>
+          </article>
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Research</span>
+            <h3>Brave Answers and research mode.</h3>
+            <p>
+              Web-grounded answers stream through Brave, with country/language settings, citation
+              parsing, usage tags, and a research mode for deeper synthesis.
+            </p>
+          </article>
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Polish</span>
+            <h3>Prompt enhancement on demand.</h3>
+            <p>
+              A wand action rewrites rough prompts into clearer instructions through Anthropic or
+              OpenRouter, while preserving the top-bar depth/style/deliverable tags.
+            </p>
+          </article>
+          <article class="workflow-card reveal">
+            <span class="workflow-kicker">Automation</span>
+            <h3>Code loop and multi-agent dispatch.</h3>
+            <p>
+              Send the same task to loaded local models, Claude, and OpenRouter, or run the
+              planner -> coder -> auditor -> fixer -> tester loop when you want iteration.
+            </p>
+          </article>
         </div>
       </section>
 
@@ -622,6 +720,7 @@ swift run mlx-forge">Copy build command</button>
       </div>
       <nav class="footer-nav" aria-label="Footer">
         <a href="#engines">Engines</a>
+        <a href="#workflows">Workflows</a>
         <a href="#api">Local API</a>
         <a href="#mcp">MCP</a>
         <a href="#agents">Agents</a>
