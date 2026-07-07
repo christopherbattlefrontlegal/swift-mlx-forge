@@ -358,11 +358,12 @@
         <div class="section-inner two-column">
           <div class="reveal">
             <p class="eyebrow">Local API server</p>
-            <h2 id="api-title">An OpenAI-compatible endpoint that never leaves your machine.</h2>
+            <h2 id="api-title">An OpenAI-compatible endpoint that defaults to loopback.</h2>
             <p class="section-copy">
               Forge serves a local server any OpenAI-SDK agent framework can talk to. Both MLX and
               GGUF models answer the same <code>/v1/chat/completions</code> surface — and a request
-              naming a cold model auto-loads it on demand.
+              naming a cold model auto-loads it on demand. It binds to <code>127.0.0.1</code> by
+              default, with explicit LAN exposure only when you turn that on.
             </p>
             <ul class="spec-list">
               <li>Flip it on or off in the inspector — models stream from disk on first request</li>
@@ -426,7 +427,7 @@
             </article>
             <article class="security-card reveal">
               <h3>Keys in Keychain</h3>
-              <p>Anthropic, OpenAI, OpenRouter, HuggingFace, and Brave keys — never plaintext on disk.</p>
+              <p>Anthropic, OpenAI, OpenRouter, Hugging Face, and Brave keys — never plaintext on disk.</p>
             </article>
             <article class="security-card reveal">
               <h3>Commander path-contained</h3>
@@ -500,16 +501,16 @@
 
           <div class="orchestration-grid">
             <article class="orch-card reveal">
-              <span class="orch-label">Agent graph</span>
-              <h3>Node-and-edge multi-agent pipelines</h3>
+              <span class="orch-label">Dispatch</span>
+              <h3>Send one task to several agents</h3>
               <p>
-                Drop agents on a canvas, connect them, give each one a prompt and a model. Each node
-                runs on <strong>Claude (Anthropic API)</strong> or a <strong>local MLX model</strong>.
-                Downstream agents receive upstream output under <code>## From &lt;name&gt;</code>.
+                The composer can dispatch the current prompt, top-bar modes, system prompt, and
+                attached images to numbered local models, Claude, and OpenRouter targets. Click
+                several buttons and Forge keeps a live in-flight bar while responses stream back.
               </p>
               <p class="quiet">
-                Validated by Kahn's topological sort — cycles are rejected. One node runs at a time;
-                a failure stops the run instead of cascading garbage.
+                The old node graph remains source scaffold for non-MAS work, but the public app
+                surface uses dispatch, prompt libraries, and the coding loop.
               </p>
             </article>
 
@@ -599,20 +600,20 @@
       <section class="band apple-fm-band" aria-labelledby="apple-fm-title">
         <div class="section-inner apple-fm-layout reveal">
           <div>
-            <p class="eyebrow">Apple Foundation Models</p>
-            <h2 id="apple-fm-title">Also bridges to on-device Apple Intelligence — and BYOM Core AI.</h2>
+            <p class="eyebrow">OS-gated roadmap</p>
+            <h2 id="apple-fm-title">Apple Foundation Models support is scaffolded, not the default path.</h2>
             <p class="section-copy">
-              Beyond MLX and GGUF, Forge can drive <code>SystemLanguageModel.default</code> (Apple's
-              on-device model) and load compiled <strong><code>.coreai</code></strong> bundles as
-              bring-your-own-model adapters — all channeled through one
-              <code>LanguageModelSession</code> bridge with the same streaming path as MLX.
+              Forge deploys to macOS 26, while Apple's Foundation Models APIs are macOS 27+.
+              The source includes the gated bridge for <code>SystemLanguageModel.default</code>
+              and compiled Core AI bring-your-own-model adapters, but the public runtime path
+              today is MLX plus in-process GGUF.
             </p>
           </div>
           <ul class="spec-list boxed">
-            <li>Apple FM via <code>SystemLanguageModel.default</code></li>
-            <li>Core AI BYOM: <code>.coreai</code> adapter compile &amp; load</li>
-            <li>Availability surfaced: not-eligible / not-enabled / downloading</li>
-            <li>Roadmap: unified executor bridge incl. PCC + MLXFoundationModels</li>
+            <li>macOS 26 target; Foundation Models calls are gated for macOS 27+</li>
+            <li>Apple default model path via <code>SystemLanguageModel.default</code></li>
+            <li>Core AI BYOM source path for compiled adapter bundles</li>
+            <li>Roadmap: unified executor bridge incl. MLXFoundationModels</li>
           </ul>
         </div>
       </section>
@@ -624,8 +625,8 @@
             <p class="eyebrow">SwiftPM executables</p>
             <h2 id="cli-title">Three binaries in the same package.</h2>
             <p class="section-copy">
-              <code>swift build</code> produces the GUI app plus two headless Swift-native tools —
-              no Python, no server, no daemon.
+              The SwiftPM package exposes the main Forge app plus two optional Swift-native tools.
+              Build the product you need; the app installer handles the release bundle path.
             </p>
           </div>
 
@@ -663,11 +664,13 @@
         <div class="section-inner build-layout">
           <div class="reveal">
             <p class="eyebrow">Build</p>
-            <h2 id="build-title">Public source. Native Mac build.</h2>
+            <h2 id="build-title">Public source. Source-installable today.</h2>
             <p class="section-copy">
               A SwiftPM package (Swift 6.2, macOS 26+) that resolves every dependency from public
-              git sources. Build it, run it, or install a signed <code>.app</code> bundle with one
-              script. Weights stay out of git.
+              git sources. The installer builds the release product, compiles the Metal library,
+              bundles the design prompt tool and llama.cpp framework, ad-hoc signs locally, installs
+              <code>/Applications/Forge.app</code>, and opens it. Public binary downloads still need
+              Developer ID signing and notarization.
             </p>
             <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
               Open the repository
@@ -680,16 +683,16 @@
               <span class="dot green"></span>
               <span class="terminal-title-text">build — zsh</span>
             </div>
-            <pre><code><span class="t-prompt">$</span> <span class="t-cmd">git clone</span> git@github.com:christopherbattlefrontlegal/swift-mlx-forge.git
+            <pre><code><span class="t-prompt">$</span> <span class="t-cmd">git clone</span> https://github.com/christopherbattlefrontlegal/swift-mlx-forge.git
 <span class="t-prompt">$</span> <span class="t-cmd">cd</span> swift-mlx-forge
-<span class="t-prompt">$</span> <span class="t-cmd">swift build</span>
+<span class="t-prompt">$</span> <span class="t-cmd">./scripts/install-forge-app.sh</span>
+<span class="t-muted"># manual developer run:</span>
+<span class="t-prompt">$</span> <span class="t-cmd">swift build</span> --product mlx-forge
 <span class="t-prompt">$</span> <span class="t-cmd">swift run</span> mlx-forge
-<span class="t-muted"># or install a signed .app bundle:</span>
-<span class="t-prompt">$</span> <span class="t-cmd">./scripts/build-app.sh</span> /Applications<span class="t-cursor">▋</span></code></pre>
-            <button class="copy-button" data-copy="git clone git@github.com:christopherbattlefrontlegal/swift-mlx-forge.git
+<span class="t-cursor">▋</span></code></pre>
+            <button class="copy-button" data-copy="git clone https://github.com/christopherbattlefrontlegal/swift-mlx-forge.git
 cd swift-mlx-forge
-swift build
-swift run mlx-forge">Copy build command</button>
+./scripts/install-forge-app.sh">Copy install command</button>
           </div>
         </div>
       </section>
