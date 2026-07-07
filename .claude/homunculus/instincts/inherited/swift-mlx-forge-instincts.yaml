@@ -1,0 +1,319 @@
+# Instincts generated from https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+# Generated: 2026-07-07T01:40:32.628Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: swift-mlx-forge-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: chore
+
+## Evidence
+
+- 1 commits analyzed
+- Detected conventional commit pattern
+- Examples: chore: make Forge source-installable
+
+---
+id: swift-mlx-forge-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Commit Length
+
+## Action
+
+Keep commit messages concise (~36 characters)
+
+## Evidence
+
+- Average commit message length: 36 chars
+- Based on 1 commits
+
+---
+id: swift-mlx-forge-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: swift-mlx-forge-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: swift-mlx-forge-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: swift-mlx-forge-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: swift-mlx-forge-instinct-file-naming
+trigger: "When creating a new Swift source file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct File Naming
+
+## Action
+
+Name the file using camelCase
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files
+
+---
+id: swift-mlx-forge-instinct-function-naming
+trigger: "When defining a new function in Swift"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Function Naming
+
+## Action
+
+Use camelCase for the function name
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: swift-mlx-forge-instinct-class-naming
+trigger: "When defining a new class in Swift"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Class Naming
+
+## Action
+
+Use PascalCase for the class name
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: swift-mlx-forge-instinct-constant-naming
+trigger: "When declaring a constant in Swift"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for the constant name
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: swift-mlx-forge-instinct-import-style
+trigger: "When importing modules in Swift files"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: swift-mlx-forge-instinct-export-style
+trigger: "When exporting modules or symbols in Swift"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: swift-mlx-forge-instinct-test-location
+trigger: "When adding new tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Test Location
+
+## Action
+
+Place test files in a separate folder from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation
+
+---
+id: swift-mlx-forge-instinct-commit-format
+trigger: "When making a git commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Commit Format
+
+## Action
+
+Format the commit message using the conventional commit style with a prefix (e.g., 'chore: ')
+
+## Evidence
+
+- Pattern in commits.prefixes
+- Seen in commit 'chore: make Forge source-installable'
+
+---
+id: swift-mlx-forge-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 36 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: swift-mlx-forge-instinct-ci-workflow-location
+trigger: "When configuring CI workflows"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: christopherbattlefrontlegal/swift-mlx-forge
+---
+
+# Swift Mlx Forge Instinct Ci Workflow Location
+
+## Action
+
+Place CI configuration files in the .github/workflows directory
+
+## Evidence
+
+- Pattern in architecture.configFiles
+- File: .github/workflows/ci.yml
+
