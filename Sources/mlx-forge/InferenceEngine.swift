@@ -310,6 +310,12 @@ final class InferenceEngine {
         let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 32_768
         let url = model.directory
         let modelID = model.id
+        // Tag this load so a late progress hop from a *previous* load of the same
+        // model (unload → reload while an old detached callback is still queued)
+        // can't resurrect the removed key and write a stale percent: the `contains`
+        // guard alone passes once the new load re-inserts the key.
+        let generation = (loadGenerations[model.id] ?? 0) + 1
+        loadGenerations[model.id] = generation
         // llama.cpp reports load progress per tensor from its loader thread —
         // throttle to whole-percent steps before hopping to the main actor.
         let lastPercent = GGUFLoadProgressThrottle()
@@ -323,6 +329,7 @@ final class InferenceEngine {
                         guard lastPercent.advance(to: fraction) else { return }
                         Task { @MainActor in
                             guard let self,
+                                self.loadGenerations[modelID] == generation,
                                 self.loadingModels.keys.contains(modelID)
                             else { return }
                             self.loadingModels[modelID] = fraction

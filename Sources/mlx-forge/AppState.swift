@@ -1294,6 +1294,10 @@ final class AppState {
                     conversationID: convID,
                     messageID: messageID
                 )
+                // Clear the streaming flag now that the awaited stream (plus any
+                // MCP follow-up, which streams into a *new* bubble) has finished —
+                // otherwise this bubble stays "streaming" forever.
+                self.endStreaming(messageID: messageID)
             } else if let oid = openRouterID {
                 await self.runOpenRouterAgentStream(
                     model: oid,
@@ -1302,6 +1306,7 @@ final class AppState {
                     conversationID: convID,
                     messageID: messageID
                 )
+                self.endStreaming(messageID: messageID)
             } else if let mid = localID {
                 let systemInstructions = await self.mcpEnrichedSystemPrompt(for: preSnapshot)
                 self.engine.generate(
@@ -1334,6 +1339,10 @@ final class AppState {
                                 }
                             }
                         }
+                        // Local generation completes here (engine.generate is
+                        // fire-and-forget, so the enclosing task's defer runs
+                        // before this callback) — clear the streaming flag now.
+                        self.endStreaming(messageID: messageID)
                     }
                 )
             }
