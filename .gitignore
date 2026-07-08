@@ -25,6 +25,7 @@ AUDIT_PROMPT.md
 *.local.json
 mcp-servers.json
 mcp.json
+.wrangler/
 
 # Model weights and tokenizer caches
 models/
