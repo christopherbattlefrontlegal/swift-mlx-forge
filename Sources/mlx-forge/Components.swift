@@ -25,6 +25,20 @@ struct ModelPickerControl: View {
                     }
                 }
                 }
+                Section("Parallel run — every selected model answers each send") {
+                    ForEach(app.engine.loadedModels) { entry in
+                        Button {
+                            app.toggleLocalFanout(entry.id)
+                        } label: {
+                            Label(
+                                menuDisplay(for: entry.model),
+                                systemImage: app.isLocalFanoutSelected(entry.id)
+                                    ? "circle.fill" : "circle")
+                        }
+                    }
+                    Button("Select all loaded") { app.selectAllLocalFanout() }
+                    Button("Clear parallel selection") { app.clearLocalFanout() }
+                }
                 Section {
                     Menu("Unload…") {
                         ForEach(app.engine.loadedModels) { entry in
@@ -121,20 +135,28 @@ struct ModelPickerControl: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                 } else {
-                    ForEach(loaded.prefix(4), id: \.1.id) { idx, entry in
+                    ForEach(loaded.prefix(6), id: \.1.id) { idx, entry in
                         Text("\(idx + 1). \(shortDisplay(for: entry.model)) · \(compactRuntime(for: entry.model))")
                             .font(.caption2.weight(.medium))
                             .lineLimit(1)
                             .padding(.horizontal, 4)
                             .background(
                                 (app.engine.activeModelID == entry.id && app.claudeModelID == nil)
-                                    ? Theme.ember.opacity(0.2) : Color.clear
+                                    ? Theme.ember.opacity(0.2)
+                                    : app.isLocalFanoutSelected(entry.id)
+                                        ? Theme.ember.opacity(0.1) : Color.clear
                             )
                             .clipShape(.capsule)
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    app.isLocalFanoutSelected(entry.id)
+                                        ? Theme.ember.opacity(0.6) : Color.clear,
+                                    lineWidth: 1)
+                            )
                     }
                 }
-                if loaded.count > 4 {
-                    Text("+\(loaded.count - 4)")
+                if loaded.count > 6 {
+                    Text("+\(loaded.count - 6)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

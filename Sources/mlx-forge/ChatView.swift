@@ -1344,6 +1344,10 @@ struct ComposerView: View {
         if let claudeID = app.claudeModelID, !claudeID.isEmpty {
             return "Message \(AnthropicClient.label(for: claudeID))…"
         }
+        let fanoutCount = app.engine.loadedModels.filter { app.isLocalFanoutSelected($0.id) }.count
+        if fanoutCount >= 2 {
+            return "Message \(fanoutCount) local models in parallel…"
+        }
         if let active = app.engine.activeModel {
             return "Message \(active.model.shortName)…"
         }

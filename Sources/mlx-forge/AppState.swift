@@ -211,6 +211,37 @@ final class AppState {
         assignOpenRouterModelIDs([])
     }
 
+    /// When 2+ loaded local models are selected here, a normal send fans out to
+    /// all of them — each answers in its own labeled bubble, and the MLX gate
+    /// queues the actual GPU runs back-to-back. Mirrors the OpenRouter multi-select.
+    var localFanoutModelIDs: [String] =
+        UserDefaults.standard.stringArray(forKey: "chat.localFanout") ?? []
+    {
+        didSet {
+            UserDefaults.standard.set(localFanoutModelIDs, forKey: "chat.localFanout")
+        }
+    }
+
+    func isLocalFanoutSelected(_ id: String) -> Bool {
+        localFanoutModelIDs.contains(id)
+    }
+
+    func toggleLocalFanout(_ id: String) {
+        if localFanoutModelIDs.contains(id) {
+            localFanoutModelIDs.removeAll { $0 == id }
+        } else {
+            localFanoutModelIDs.append(id)
+        }
+    }
+
+    func selectAllLocalFanout() {
+        localFanoutModelIDs = engine.loadedModels.map(\.id)
+    }
+
+    func clearLocalFanout() {
+        localFanoutModelIDs = []
+    }
+
     /// Use a single OpenRouter model for chat (clears multi-select).
     func setPrimaryOpenRouterModel(_ id: String) {
         claudeModelID = nil
@@ -1134,6 +1165,79 @@ final class AppState {
             return
         }
 
+        // Fan out one send to every parallel-selected loaded local model. Each gets
+        // its own labeled bubble; the MLX gate runs them back-to-back on the GPU.
+        let fanoutTargets = engine.loadedModels.filter { localFanoutModelIDs.contains($0.id) }
+        if claudeModelID?.isEmpty != false, fanoutTargets.count >= 2 {
+            var targets: [(modelID: String, label: String, messageID: UUID)] = []
+            for entry in fanoutTargets {
+                var bubble = ChatMessage(role: .assistant, content: "")
+                bubble.modelName = localModelLabel(entry.model)
+                conversation.messages.append(bubble)
+                targets.append((entry.id, localModelLabel(entry.model), bubble.id))
+            }
+            conversation.refreshTitle()
+            conversation.updatedAt = Date()
+            conversation.lastModelID = fanoutTargets.first?.model.name
+            selectedConversation = conversation
+            let conversationID = conversation.id
+            for target in targets { beginStreaming(messageID: target.messageID) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: historySnapshot)
+                let generationHistory = self.historyWithMCPInstructions(
+                    historySnapshot, mcpSystemPrompt: systemInstructions)
+                for target in targets {
+                    self.engine.generate(
+                        conversation: generationHistory,
+                        prompt: prompt,
+                        images: images,
+                        settings: self.settings,
+                        systemInstructions: systemInstructions,
+                        targetModelID: target.modelID,
+                        onChunk: { [weak self] delta in
+                            self?.enqueueStreamDelta(
+                                delta, conversationID: conversationID,
+                                messageID: target.messageID)
+                        },
+                        onComplete: { [weak self] info, errorMessage in
+                            guard let self else { return }
+                            self.finishStreamBuffer(target.messageID)
+                            self.appendToMessage(
+                                conversationID: conversationID, messageID: target.messageID
+                            ) {
+                                if let info {
+                                    $0.tokensPerSecond = info.tokensPerSecond
+                                    $0.generationTokenCount = info.generationTokenCount
+                                    $0.promptTokenCount = info.promptTokenCount
+                                    $0.promptTime = info.promptTime
+                                }
+                                if let errorMessage {
+                                    if $0.content.isEmpty {
+                                        $0.content = "⚠️ \(errorMessage)"
+                                        $0.isError = true
+                                    } else {
+                                        $0.content += "\n\n⚠️ stream interrupted: \(errorMessage)"
+                                    }
+                                }
+                            }
+                            self.endStreaming(messageID: target.messageID)
+                            self.scheduleSave()
+                            Task { @MainActor in
+                                await self.handleMCPToolRequestIfNeeded(
+                                    backend: .local(modelID: target.modelID, label: target.label),
+                                    originalPrompt: prompt,
+                                    images: images,
+                                    conversationID: conversationID,
+                                    messageID: target.messageID)
+                            }
+                        })
+                }
+            }
+            scheduleSave()
+            return
+        }
+
         var assistant = ChatMessage(role: .assistant, content: "")
         if let claudeID = claudeModelID, !claudeID.isEmpty {
             assistant.modelName = AnthropicClient.label(for: claudeID)
@@ -1774,18 +1878,34 @@ final class AppState {
         // Agent-loop bound. Tools stay available on every follow-up turn (so the model can
         // chain calls — e.g. sequential-thinking's repeated nextThoughtNeeded), so this cap
         // is the only backstop against a model that never stops calling tools. Reached only
-        // after `settings.mcpMaxIterations` tool calls in a single user turn.
-        let maxIterations = max(1, settings.mcpMaxIterations)
+        // after `settings.mcpMaxIterations` tool calls in a single user turn. A cap of 0
+        // (or below) means Unlimited.
+        let maxIterations = settings.mcpMaxIterations <= 0 ? Int.max : settings.mcpMaxIterations
         guard mcpDepth < maxIterations else {
             appendSystemMessage(
                 conversationID: conversationID,
-                content: "MCP tool loop reached the \(maxIterations)-call limit — stopping. Raise the MCP iteration cap in Settings for longer chains (e.g. sequential-thinking)."
+                content: "MCP tool loop reached the \(maxIterations)-call limit — stopping. Raise the tool-call limit in the Tuning panel (0 = Unlimited) for longer chains (e.g. sequential-thinking)."
             )
             return false
         }
-        guard let content = messageContent(conversationID: conversationID, messageID: messageID),
-              var request = Self.parseMCPCallRequest(from: content)
+        guard let content = messageContent(conversationID: conversationID, messageID: messageID)
         else { return false }
+        guard var request = Self.parseMCPCallRequest(from: content) else {
+            // The model tried to call a tool but in a shape no parser understands.
+            // Say so instead of silently ending the run mid-chain.
+            if content.contains("FORGE_MCP_CALL") || content.contains("MCP request:") {
+                appendSystemMessage(
+                    conversationID: conversationID,
+                    content: """
+                        Forge saw what looks like an MCP tool call but couldn't parse it, so the \
+                        run stopped here. Tool calls must be a single line: \
+                        `FORGE_MCP_CALL {"server":"<server-id>","tool":"<tool-name>","arguments":{...}}` \
+                        — reply "continue" to let the model retry.
+                        """
+                )
+            }
+            return false
+        }
 
         request.serverID = mcp.resolveEntryID(request.serverID)
         let requestLabel = "\(request.serverID).\(request.toolName)"
@@ -2212,8 +2332,40 @@ final class AppState {
             return request
         }
         if let request = parseMCPInvokeXML(from: content) { return request }
+        if let request = parseMCPDisplayFormat(from: content) { return request }
         if let request = parseMCPCallJSONObject(from: content) { return request }
         return nil
+    }
+
+    /// Parses the transcript display format Forge itself writes for executed calls
+    /// ("MCP request: `server.tool`" followed by a JSON arguments block). Models
+    /// see that format in their own history and imitate it on the next call instead
+    /// of emitting FORGE_MCP_CALL — without this parser the agent loop silently
+    /// stops the moment a model copies the display format.
+    private static func parseMCPDisplayFormat(from content: String) -> MCPCallRequest? {
+        guard let labelRange = content.range(
+            of: #"MCP request:\s*`([^`\n]+)`"#, options: .regularExpression)
+        else { return nil }
+        let label = String(content[labelRange])
+        guard let firstTick = label.firstIndex(of: "`"),
+              let lastTick = label.lastIndex(of: "`"),
+              firstTick < lastTick
+        else { return nil }
+        let rawName = String(label[label.index(after: firstTick)..<lastTick])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let dot = rawName.firstIndex(of: ".") else { return nil }
+        let serverID = String(rawName[..<dot])
+        let toolName = canonicalizeMCPToolName(
+            String(rawName[rawName.index(after: dot)...]), serverID: serverID)
+        guard !serverID.isEmpty, !toolName.isEmpty else { return nil }
+        // Require an actual arguments object after the label so prose that merely
+        // mentions a past request ("the MCP request: `x.y` failed") doesn't fire.
+        let tail = String(content[labelRange.upperBound...])
+        guard let json = firstJSONObject(in: tail),
+              let arguments = (try? JSONSerialization.jsonObject(with: Data(json.utf8)))
+                as? [String: Any]
+        else { return nil }
+        return MCPCallRequest(serverID: serverID, toolName: toolName, arguments: arguments)
     }
 
     private static func parseMCPCallJSONObject(from text: String) -> MCPCallRequest? {

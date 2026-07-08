@@ -374,21 +374,24 @@ struct TuningInspector: View {
                     MCPInspectorPanel()
                         .environment(app)
                     Stepper(
-                        "Tool-call limit: \(app.settings.mcpMaxIterations)",
+                        app.settings.mcpMaxIterations <= 0
+                            ? "Tool-call limit: Unlimited"
+                            : "Tool-call limit: \(app.settings.mcpMaxIterations)",
                         value: Binding(
                             get: { app.settings.mcpMaxIterations },
                             set: { value in
                                 var next = app.settings
-                                next.mcpMaxIterations = max(1, value)
+                                next.mcpMaxIterations = max(0, value)
                                 app.settings = next
                             }),
-                        in: 1...64
+                        in: 0...1_000_000
                     )
                     .font(.caption)
                     .help(
                         "Max chained MCP tool calls per turn — e.g. sequential-thinking's repeated "
-                        + "thoughts. Forge keeps tools available across follow-up turns and stops the "
-                        + "loop after this many calls so a runaway model can't loop forever."
+                        + "thoughts. Step down to 0 for Unlimited. Forge keeps tools available across "
+                        + "follow-up turns; a finite cap is the only backstop against a model that "
+                        + "never stops calling tools."
                     )
                 }
                 }
