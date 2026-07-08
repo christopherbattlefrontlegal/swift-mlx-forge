@@ -94,7 +94,10 @@ final class InferenceEngine {
     private(set) var loadAdvisory: String?
     private(set) var lastError: String?
     private(set) var isGenerating = false
-    private var activeGenerationCount = 0
+    /// IDs of generations that are live. `stop()` empties this set; a cancelled
+    /// generation that drains afterwards finds its ID gone and must not touch
+    /// state owned by a newer generation (EVAL.md #5).
+    private var activeGenerationIDs: Set<UUID> = []
 
     /// Live stats for the in-flight UI generation.
     private(set) var liveTokenCount = 0
@@ -140,6 +143,8 @@ final class InferenceEngine {
     private var loadTasks: [String: Task<ModelContainer, Error>] = [:]
     private var loadGenerations: [String: UInt64] = [:]
     private var loadTaskPolicies: [String: WeightLoadPolicy] = [:]
+    /// In-flight GGUF load per model ID — same dedup role as `loadTasks`.
+    private var ggufLoadTasks: [String: Task<GGUFRuntime?, Never>] = [:]
 
     /// Models unloaded while their load was still in flight. Without this, the
     /// load completes AFTER the unload and re-appends the entry — resurrecting
@@ -298,51 +303,84 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
 
-        lastError = nil
-        loadingModels.updateValue(nil, forKey: model.id)
-        defer { loadingModels.removeValue(forKey: model.id) }
+        // Same dedup + generation discipline as the MLX `loadTasks` path:
+        // concurrent callers (UI + API auto-load) await ONE runtime creation,
+        // and a superseded load can neither clean up the newer load's state
+        // nor resurrect a model the user just ejected (EVAL.md #2).
+        let task: Task<GGUFRuntime?, Never>
+        let generation: UInt64
+        if let inFlight = ggufLoadTasks[model.id] {
+            task = inFlight
+            generation = loadGenerations[model.id] ?? 0
+        } else {
+            discardedLoads.remove(model.id)
+            lastError = nil
+            loadingModels.updateValue(nil, forKey: model.id)
+            generation = (loadGenerations[model.id] ?? 0) + 1
+            loadGenerations[model.id] = generation
 
-        let settings = generationSettings()
-        // 0 = auto. 8192 was far too small: a big system preset + long message
-        // overflows llama.cpp's context and the wrapper fails the turn with NO
-        // output at all. 32k covers real prompts; the wrapper still clamps to
-        // the model's trained context.
-        let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 32_768
-        let url = model.directory
-        let modelID = model.id
-        // llama.cpp reports load progress per tensor from its loader thread —
-        // throttle to whole-percent steps before hopping to the main actor.
-        let lastPercent = GGUFLoadProgressThrottle()
-        let runtime = await gate.withTurn {
-            await Task.detached(priority: .userInitiated) {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                return GGUFRuntime(
-                    fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)),
-                    onLoadProgress: { [weak self] fraction in
-                        guard lastPercent.advance(to: fraction) else { return }
-                        Task { @MainActor in
-                            guard let self,
-                                self.loadingModels.keys.contains(modelID)
-                            else { return }
-                            self.loadingModels[modelID] = fraction
-                        }
-                    })
-            }.value
+            let settings = generationSettings()
+            // 0 = auto. 8192 was far too small: a big system preset + long message
+            // overflows llama.cpp's context and the wrapper fails the turn with NO
+            // output at all. 32k covers real prompts; the wrapper still clamps to
+            // the model's trained context.
+            let ctxTokens = settings.maxKVSize > 0 ? settings.maxKVSize : 32_768
+            let url = model.directory
+            let modelID = model.id
+            let loadGeneration = generation
+            // llama.cpp reports load progress per tensor from its loader thread —
+            // throttle to whole-percent steps before hopping to the main actor.
+            let lastPercent = GGUFLoadProgressThrottle()
+            task = Task {
+                await self.gate.withTurn {
+                    await Task.detached(priority: .userInitiated) {
+                        let scoped = url.startAccessingSecurityScopedResource()
+                        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                        return GGUFRuntime(
+                            fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)),
+                            onLoadProgress: { [weak self] fraction in
+                                guard lastPercent.advance(to: fraction) else { return }
+                                Task { @MainActor in
+                                    guard let self,
+                                        self.loadGenerations[modelID] == loadGeneration,
+                                        self.loadingModels.keys.contains(modelID)
+                                    else { return }
+                                    self.loadingModels[modelID] = fraction
+                                }
+                            })
+                    }.value
+                }
+            }
+            ggufLoadTasks[model.id] = task
+        }
+        defer {
+            // Only the owner of the current generation cleans up — a superseded
+            // load must not remove the newer load's task or progress entry.
+            if loadGenerations[model.id] == generation {
+                ggufLoadTasks.removeValue(forKey: model.id)
+                loadingModels.removeValue(forKey: model.id)
+            }
+        }
+
+        let runtime = await task.value
+        if discardedLoads.remove(model.id) != nil || loadGenerations[model.id] != generation {
+            // Unloaded mid-flight, or superseded by a newer load cycle — never
+            // surface a stale runtime (it would resurrect ejected gigabytes).
+            recordLoadCancelled(for: model)
+            throw CancellationError()
+        }
+        if let existing = loadedModels.first(where: { $0.id == model.id }) {
+            return existing
         }
         guard let runtime else {
-            let readable = FileManager.default.isReadableFile(atPath: url.path)
+            let readable = FileManager.default.isReadableFile(atPath: model.directory.path)
             let message =
-                "llama.cpp could not load \(model.shortName) at \(url.path) — "
+                "llama.cpp could not load \(model.shortName) at \(model.directory.path) — "
                 + (readable
                     ? "check RAM is available and the quantization is supported."
                     : "file is not readable (re-add the model folder in Settings if sandboxed).")
             lastError = message
             throw ForgeError.loadFailed(message)
-        }
-        if discardedLoads.remove(model.id) != nil {
-            recordLoadCancelled(for: model)
-            throw CancellationError()
         }
         let entry = Loaded(
             model: model, container: nil, loadedAt: Date(),
@@ -411,7 +449,7 @@ final class InferenceEngine {
 
         generationTasks.removeAll()
         materializingModelID = nil
-        activeGenerationCount = 0
+        activeGenerationIDs.removeAll()
         isGenerating = false
 
         tearDownLoadedModels(scheduleAsyncPurge: false)
@@ -430,6 +468,7 @@ final class InferenceEngine {
     private func tearDownLoadedModels(scheduleAsyncPurge: Bool) {
         loadTasks.removeAll()
         loadTaskPolicies.removeAll()
+        ggufLoadTasks.removeAll()
         loadingModels.removeAll()
         sessions.removeAll()
         loadedModels.removeAll()
@@ -443,12 +482,16 @@ final class InferenceEngine {
     /// Abort a background load and drop its progress indicator immediately.
     private func cancelInFlightLoad(for modelID: String) {
         guard loadTasks[modelID] != nil
+            || ggufLoadTasks[modelID] != nil
             || loadingModels[modelID] != nil
         else { return }
         discardedLoads.insert(modelID)
         loadTasks[modelID]?.cancel()
         loadTasks.removeValue(forKey: modelID)
         loadTaskPolicies.removeValue(forKey: modelID)
+        // llama.cpp loads aren't cancellable mid-read; dropping the task entry
+        // plus the discard flag/generation check keeps the result from landing.
+        ggufLoadTasks.removeValue(forKey: modelID)
         loadingModels.removeValue(forKey: modelID)
     }
 
@@ -503,7 +546,13 @@ final class InferenceEngine {
         onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
     ) {
         let entry: Loaded?
-        if let tid = targetModelID, let t = loadedModels.first(where: { $0.id == tid }) {
+        if let tid = targetModelID {
+            guard let t = loadedModels.first(where: { $0.id == tid }) else {
+                // A dispatched/fan-out target that was unloaded must fail loudly,
+                // not silently answer from whatever model is active (EVAL.md #4).
+                onComplete(nil, "Model is no longer loaded.")
+                return
+            }
             entry = t
         } else {
             entry = activeModel
@@ -567,10 +616,10 @@ final class InferenceEngine {
                             noThinkPrefill: noThinkPrefill,
                             start: start,
                             onChunk: onChunk)
-                        self.finishGeneration()
+                        self.finishGeneration(generationID)
                         onComplete(completionInfo, nil)
                     } catch {
-                        self.finishGeneration()
+                        self.finishGeneration(generationID)
                         onComplete(nil, error.localizedDescription)
                     }
                 }
@@ -613,7 +662,7 @@ final class InferenceEngine {
                         start: start,
                         onChunk: onChunk)
                     self.sessions[conversation.id]?.messageCount += 2
-                    self.finishGeneration()
+                    self.finishGeneration(generationID)
                     onComplete(completionInfo, nil)
                 } catch {
                     // KV cache may be mid-turn; drop the session so the next
@@ -635,16 +684,16 @@ final class InferenceEngine {
                                 noThinkPrefill: false,
                                 start: start,
                                 onChunk: onChunk)
-                            self.finishGeneration()
+                            self.finishGeneration(generationID)
                             onComplete(completionInfo, nil)
                             return
                         } catch {
-                            self.finishGeneration()
+                            self.finishGeneration(generationID)
                             onComplete(nil, error.localizedDescription)
                             return
                         }
                     }
-                    self.finishGeneration()
+                    self.finishGeneration(generationID)
                     onComplete(nil, error.localizedDescription)
                 }
             }
@@ -705,7 +754,7 @@ final class InferenceEngine {
                         onChunk(delta)
                     }
                 }
-                self.finishGeneration()
+                self.finishGeneration(generationID)
                 // llama.cpp's wrapper fails a turn SILENTLY (empty streams) when the
                 // prompt doesn't fit the context — never leave the user a blank bubble.
                 let producedNothing =
@@ -736,7 +785,7 @@ final class InferenceEngine {
             // match stored history; drop them all (cheap, they re-prefill).
             sessions.removeAll()
         }
-        activeGenerationCount = 0
+        activeGenerationIDs.removeAll()
         isGenerating = false
         refreshMemory()
     }
@@ -744,20 +793,20 @@ final class InferenceEngine {
     @discardableResult
     private func beginGeneration() -> UUID {
         let generationID = UUID()
-        if activeGenerationCount == 0 {
+        if activeGenerationIDs.isEmpty {
             liveTokenCount = 0
             liveTokensPerSecond = 0
         }
-        activeGenerationCount += 1
+        activeGenerationIDs.insert(generationID)
         isGenerating = true
         return generationID
     }
 
-    private func finishGeneration() {
-        if activeGenerationCount > 0 {
-            activeGenerationCount -= 1
-        }
-        isGenerating = activeGenerationCount > 0
+    private func finishGeneration(_ generationID: UUID) {
+        // Already cleared by stop() (or double-finished): don't decrement state
+        // that now belongs to a newer generation.
+        guard activeGenerationIDs.remove(generationID) != nil else { return }
+        isGenerating = !activeGenerationIDs.isEmpty
         refreshMemory()
     }
 

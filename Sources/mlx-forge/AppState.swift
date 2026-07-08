@@ -1385,6 +1385,9 @@ final class AppState {
             defer {
                 Task { @MainActor in
                     self.finishStreamBuffer(messageID)
+                    // Close the streaming state machine — without this the bubble
+                    // spins forever and the live-buffer entries leak (EVAL.md #1).
+                    self.endStreaming(messageID: messageID)
                     self.inFlightAgentLabels.removeValue(forKey: messageID)
                     self.agentTasks.removeValue(forKey: messageID)
                     self.scheduleSave()

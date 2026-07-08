@@ -765,6 +765,13 @@ private struct HTTPRequest {
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: readTimeoutNanos)
+                // The receive child is parked on a continuation that only the
+                // NWConnection callback resumes — and the group must await it
+                // before the timeout can propagate. Cancel the transport so
+                // that callback fires (with an error) and the group can drain;
+                // without this, an idle socket leaks the task + connection
+                // forever (EVAL.md #3).
+                connection.cancel()
                 throw URLError(.timedOut)
             }
             defer { group.cancelAll() }

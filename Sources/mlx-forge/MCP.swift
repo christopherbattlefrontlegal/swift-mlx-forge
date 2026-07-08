@@ -1140,6 +1140,11 @@ final class MCPStdioSession: @unchecked Sendable {
     private let output = Pipe()
     private let error = Pipe()
     private let lock = NSLock()
+    /// Serializes whole request/response exchanges. Concurrent callers (two
+    /// parallel agents hitting the same stdio server) would otherwise
+    /// interleave stdin writes and steal/drop each other's replies, since the
+    /// read loop discards every payload whose id isn't its own (EVAL.md #6).
+    private let requestLock = NSLock()
     private var outputBuffer = Data()
     private var errorBuffer = Data()
     private var nextRequestID = 10
@@ -1195,6 +1200,8 @@ final class MCPStdioSession: @unchecked Sendable {
     }
 
     func request(id: Int, method: String, params: Any) throws -> [String: Any] {
+        requestLock.lock()
+        defer { requestLock.unlock() }
         try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
         while true {
             let payload = try readMessage(timeout: 90)
