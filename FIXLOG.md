@@ -59,5 +59,21 @@ else"; findings 7–10 are MINOR and left as documented.
 - `swift build` (debug, full tree after all batches): recorded above per batch;
   re-run at the end — see below.
 - `./scripts/build-app.sh /Applications`: run from the root checkout after the
-  branch fast-forward (release build + bundle + install); output tail recorded
-  in the follow-up FIXLOG commit.
+  branch fast-forward. Output tail:
+
+  ```
+  Build complete! (176.06 sec)
+  ── assemble bundle ───────────────────────────────────
+  ── sign (ad-hoc, local testing only) ────────────────
+  ── verify ────────────────────────────────────────────
+  Identifier=com.forge.mlx
+  Signature=adhoc
+  sandbox entitlement: disabled for local stdio MCP developer build
+  ── install to /Applications ──────────────────────────
+  Installed /Applications/Forge.app
+  ── done ──────────────────────────────────────────────
+  ```
+
+  (Only pre-existing warnings in the release build — SecretsStore.swift:83 and
+  WeightLoading.swift:104 `var` never mutated; none in the files touched by
+  this pass.)
