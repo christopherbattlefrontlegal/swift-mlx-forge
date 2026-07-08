@@ -49,6 +49,7 @@
         <a href="#mcp">MCP</a>
         <a href="#agents">Agents</a>
         <a href="#cli">CLI</a>
+        <a href="#launch">Launch</a>
       </nav>
       <a class="header-cta" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
         <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -67,6 +68,7 @@
       <a href="#mcp">MCP</a>
       <a href="#agents">Agents</a>
       <a href="#cli">CLI</a>
+      <a href="#launch">Launch</a>
       <a class="mobile-cta" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">Star on GitHub</a>
     </nav>
 
@@ -74,8 +76,8 @@
       <span id="top" tabindex="-1"></span>
 
       <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-glow hero-glow-a" aria-hidden="true"></div>
-        <div class="hero-glow hero-glow-b" aria-hidden="true"></div>
+        <img class="hero-bg" src="./assets/forge-product-visual.png" alt="" aria-hidden="true">
+        <div class="hero-shade" aria-hidden="true"></div>
         <div class="hero-grid" aria-hidden="true"></div>
         <img class="hero-mark" src="./assets/forge-icon.png" alt="" aria-hidden="true">
 
@@ -104,6 +106,9 @@
             <a class="button secondary" href="#build">
               Build from source
             </a>
+            <a class="button secondary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases">
+              Latest release
+            </a>
           </div>
 
           <dl class="proof-strip" aria-label="Product facts">
@@ -125,20 +130,42 @@
             </div>
           </dl>
         </div>
+      </section>
 
-        <div class="terminal-window reveal" aria-label="Forge at a glance">
-          <div class="terminal-title">
-            <span class="dot red"></span>
-            <span class="dot amber"></span>
-            <span class="dot green"></span>
-            <span class="terminal-title-text">forge — operator loop</span>
+      <!-- ============================== LAUNCH ============================== -->
+      <section id="launch" class="band launch-band" aria-labelledby="launch-title">
+        <div class="section-inner launch-layout">
+          <div class="section-heading reveal">
+            <p class="eyebrow">Public launch</p>
+            <h2 id="launch-title">MIT-licensed, source-installable, and ready for Apple Silicon tinkerers.</h2>
+            <p class="section-copy">
+              Forge is open source and free to try today. The release is intentionally source-first:
+              clone the repo, run one installer script, and bring the MLX or GGUF models you already
+              keep on disk. A public drag-and-drop binary will come after Developer ID signing and
+              notarization.
+            </p>
           </div>
-          <pre><code><span class="t-ok">✓</span> Prompt folders mounted → category menu + presets
-<span class="t-ok">✓</span> Smart Select searches <span class="t-arg">prompt_database/search.py</span>
-<span class="t-ok">✓</span> Design builder served over <span class="t-arg">forge-design://</span>
-<span class="t-ok">↻</span> Code loop: planner → coder → auditor → fixer → tester
-<span class="t-ok">✓</span> Dispatch: local models + Claude + OpenRouter
-<span class="t-ok">›</span> Headless helper emits reviewed <span class="t-cmd">claude</span> commands<span class="t-cursor">▋</span></code></pre>
+
+          <div class="launch-grid" aria-label="Launch links">
+            <article class="launch-card reveal">
+              <span class="launch-kicker">01</span>
+              <h3>GitHub repository</h3>
+              <p>Star, fork, inspect the Swift source, and file issues or pull requests.</p>
+              <a class="button secondary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">Open repo</a>
+            </article>
+            <article class="launch-card reveal">
+              <span class="launch-kicker">02</span>
+              <h3>Latest release</h3>
+              <p>Release notes track what changed and keep the install boundary clear.</p>
+              <a class="button secondary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases">See releases</a>
+            </article>
+            <article class="launch-card reveal">
+              <span class="launch-kicker">03</span>
+              <h3>One-command installer</h3>
+              <p>Builds, bundles, ad-hoc signs locally, installs <code>/Applications/Forge.app</code>, and opens it.</p>
+              <a class="button secondary" href="#build">Install from source</a>
+            </article>
+          </div>
         </div>
       </section>
 
@@ -684,9 +711,14 @@
               <code>/Applications/Forge.app</code>, and opens it. Public binary downloads still need
               Developer ID signing and notarization.
             </p>
-            <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
-              Open the repository
-            </a>
+            <div class="build-actions">
+              <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
+                Open the repository
+              </a>
+              <a class="button secondary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases">
+                Read release notes
+              </a>
+            </div>
           </div>
           <div class="terminal-window reveal" aria-label="Build commands">
             <div class="terminal-title">
@@ -722,6 +754,9 @@ cd swift-mlx-forge
             <a class="button primary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">
               Star on GitHub
             </a>
+            <a class="button secondary" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases">
+              Latest release
+            </a>
             <a class="button secondary" href="#top">Back to top</a>
           </div>
         </div>
@@ -740,6 +775,7 @@ cd swift-mlx-forge
         <a href="#mcp">MCP</a>
         <a href="#agents">Agents</a>
         <a href="#cli">CLI</a>
+        <a href="#launch">Launch</a>
       </nav>
       <span class="footer-meta">MIT · Swift 6.2 · macOS 26+ · Apple Silicon</span>
       <a class="footer-gh" href="https://github.com/christopherbattlefrontlegal/swift-mlx-forge">GitHub →</a>
