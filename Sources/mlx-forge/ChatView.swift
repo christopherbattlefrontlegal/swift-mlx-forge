@@ -14,18 +14,26 @@ struct ChatView: View {
 
     var body: some View {
         @Bindable var app = app
-        Group {
-            if let conversation = app.selectedConversation {
-                if conversation.isEmpty && !app.canChat {
-                    WelcomeView()
+        VStack(spacing: 0) {
+            ModelSlotBar()
+            Group {
+                if let conversation = app.selectedConversation {
+                    if app.isRoomActive {
+                        RoomSplitView(conversation: conversation, onShowLargeText: { content in
+                            largeTextPopupContent = content
+                            showLargeTextPopup = true
+                        })
+                    } else if conversation.isEmpty && !app.canChat {
+                        WelcomeView()
+                    } else {
+                        TranscriptView(conversation: conversation, onShowLargeText: { content in
+                            largeTextPopupContent = content
+                            showLargeTextPopup = true
+                        })
+                    }
                 } else {
-                    TranscriptView(conversation: conversation, onShowLargeText: { content in
-                        largeTextPopupContent = content
-                        showLargeTextPopup = true
-                    })
+                    WelcomeView()
                 }
-            } else {
-                WelcomeView()
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -38,6 +46,230 @@ struct ChatView: View {
                 showLargeTextPopup = false
             }
         }
+    }
+}
+
+// MARK: - Model slots + Room
+
+/// Top strip: one chip per engine slot showing what's loaded where, plus the
+/// Room toggle (split-view multi-model chat) once 2+ models are resident.
+struct ModelSlotBar: View {
+    @Environment(AppState.self) private var app
+
+    var body: some View {
+        HStack(spacing: Theme.s2) {
+            ForEach(0..<ModelMemoryBudget.slotCount, id: \.self) { index in
+                slotChip(index)
+            }
+            Spacer(minLength: Theme.s2)
+            if app.engine.loadedModels.count >= 2 {
+                Button {
+                    app.roomModeEnabled.toggle()
+                } label: {
+                    Label("Room", systemImage: "rectangle.split.2x2")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(
+                            app.roomModeEnabled
+                                ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
+                        .padding(.horizontal, Theme.s2)
+                        .frame(height: 24)
+                        .background(
+                            app.roomModeEnabled ? .white.opacity(0.10) : .white.opacity(0.05),
+                            in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(
+                    app.roomModeEnabled
+                        ? "Room on — split panes + shared channel. Click to return to single chat."
+                        : "Room — split the chat into one pane per loaded model (up to 4) with a shared channel they all see.")
+            }
+        }
+        .padding(.horizontal, Theme.s3)
+        .padding(.vertical, Theme.s1)
+        .background(.white.opacity(0.02))
+    }
+
+    @ViewBuilder
+    private func slotChip(_ index: Int) -> some View {
+        let loaded = app.engine.loadedModels
+        if index < loaded.count {
+            let entry = loaded[index]
+            let isActive = app.engine.activeModelID == entry.id
+            Menu {
+                Button("Set Active") { app.engine.activeModelID = entry.id }
+                Button("Eject", role: .destructive) {
+                    app.engine.unload(entry.id)
+                    app.scheduleSave()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text("\(index + 1)")
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                        .foregroundStyle(isActive ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
+                    Text(entry.model.shortName)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.horizontal, Theme.s2)
+                .frame(height: 24)
+                .frame(maxWidth: 180)
+                .background(.white.opacity(isActive ? 0.10 : 0.05), in: Capsule())
+                .overlay(
+                    Capsule().strokeBorder(
+                        isActive ? Theme.ember.opacity(0.6) : .white.opacity(0.06),
+                        lineWidth: 1))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Slot \(index + 1): \(entry.model.name)\(isActive ? " (active)" : "")")
+        } else {
+            Button {
+                app.showModelBrowser = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "plus")
+                        .font(.caption2.weight(.semibold))
+                    Text("\(index + 1)")
+                        .font(.caption2.monospacedDigit())
+                }
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, Theme.s2)
+                .frame(height: 24)
+                .overlay(
+                    Capsule().strokeBorder(
+                        .white.opacity(0.08), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
+            }
+            .buttonStyle(.plain)
+            .help("Slot \(index + 1) — empty. Click to open the model library.")
+        }
+    }
+}
+
+/// Room mode: one pane per participating model (2 side-by-side, 3 across,
+/// 4 in a 2×2 grid) above the shared Room channel — the transcript every
+/// model sees and posts to.
+private struct RoomSplitView: View {
+    @Environment(AppState.self) private var app
+    let conversation: Conversation
+    var onShowLargeText: (String) -> Void = { _ in }
+
+    var body: some View {
+        GeometryReader { proxy in
+            VStack(spacing: 0) {
+                panes
+                    .frame(height: max(220, proxy.size.height * 0.52))
+                Divider()
+                roomChannel
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var panes: some View {
+        let models = app.roomModels
+        if models.count >= 4 {
+            VStack(spacing: 1) {
+                HStack(spacing: 1) {
+                    ModelPaneView(model: models[0], conversation: conversation, onShowLargeText: onShowLargeText)
+                    ModelPaneView(model: models[1], conversation: conversation, onShowLargeText: onShowLargeText)
+                }
+                HStack(spacing: 1) {
+                    ModelPaneView(model: models[2], conversation: conversation, onShowLargeText: onShowLargeText)
+                    ModelPaneView(model: models[3], conversation: conversation, onShowLargeText: onShowLargeText)
+                }
+            }
+        } else {
+            HStack(spacing: 1) {
+                ForEach(models) { model in
+                    ModelPaneView(model: model, conversation: conversation, onShowLargeText: onShowLargeText)
+                }
+            }
+        }
+    }
+
+    private var roomChannel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: Theme.s2) {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .font(.caption)
+                    .foregroundStyle(Theme.emberGlow)
+                Text("Room — shared channel · @all (default) or @1–@\(app.roomModels.count)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, Theme.s4)
+            .padding(.vertical, Theme.s1)
+            .background(.white.opacity(0.03))
+            TranscriptView(conversation: conversation, onShowLargeText: onShowLargeText)
+        }
+    }
+}
+
+/// One model's pane in the room: its replies only, filtered from the shared
+/// transcript by slot number.
+private struct ModelPaneView: View {
+    @Environment(AppState.self) private var app
+    let model: AppState.RoomModel
+    let conversation: Conversation
+    var onShowLargeText: (String) -> Void = { _ in }
+
+    private var messages: [ChatMessage] {
+        conversation.messages.filter { $0.slotNumber == model.slot }
+    }
+
+    private var isStreaming: Bool {
+        messages.contains { app.isMessageStreaming($0.id) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: Theme.s2) {
+                Text("\(model.slot)")
+                    .font(.caption.weight(.bold).monospacedDigit())
+                    .foregroundStyle(Theme.emberGradient)
+                Text(model.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if isStreaming {
+                    ProgressView()
+                        .controlSize(.mini)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, Theme.s3)
+            .padding(.vertical, Theme.s1)
+            .background(.white.opacity(0.04))
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.s3) {
+                    if messages.isEmpty {
+                        Text("Waiting for @\(model.slot) or @all…")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .padding(.top, Theme.s3)
+                    }
+                    ForEach(messages) { message in
+                        MessageView(
+                            message: message,
+                            isStreaming: app.isMessageStreaming(message.id),
+                            streamingText: app.streamingTextByMessageID[message.id],
+                            streamingReasoning: app.streamingReasoningByMessageID[message.id],
+                            onShowLargeText: onShowLargeText)
+                    }
+                }
+                .padding(Theme.s3)
+            }
+            .defaultScrollAnchor(.bottom)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.white.opacity(0.015))
+        .overlay(
+            Rectangle().strokeBorder(.white.opacity(0.05), lineWidth: 1)
+        )
     }
 }
 
@@ -1270,6 +1502,14 @@ struct ComposerView: View {
     }
 
     private func performSend() {
+        // Room mode: route through the room round (sequential turns, shared
+        // channel). Mode tags are skipped — the room preamble does that job.
+        if app.isRoomActive {
+            let imagesToSend = pendingImages
+            pendingImages = []
+            app.sendRoom(images: imagesToSend)
+            return
+        }
         let tags = modeTags
         if !app.composerText.hasPrefix("[Depth:") {
             app.composerText = tags + app.composerText
@@ -1332,6 +1572,9 @@ struct ComposerView: View {
     }
 
     private var placeholder: String {
+        if app.isRoomActive {
+            return "Message the room — @all (default) or @1–@\(app.roomModels.count), e.g. \"@2 critique @1\"…"
+        }
         if app.braveSearchEnabled {
             return "Ask Brave \(app.braveSearchConfig.enableResearch ? "Research" : "Answers")…"
         }

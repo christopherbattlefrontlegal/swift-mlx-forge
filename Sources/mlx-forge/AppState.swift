@@ -155,6 +155,7 @@ final class AppState {
             || isClaudeGenerating || isOpenRouterGenerating || isOpenAIGenerating
             || !inFlightAgentLabels.isEmpty
             || isMCPRunning || isCodingOrchestratorRunning || isBraveSearchGenerating
+            || isRoomRoundRunning
     }
     /// Whether a chat target is selected.
     var canChat: Bool {
@@ -241,6 +242,187 @@ final class AppState {
     func clearLocalFanout() {
         localFanoutModelIDs = []
     }
+
+    // MARK: - Model Room (split-view multi-model chat)
+
+    /// One participant in the room: a loaded local model bound to a numbered slot.
+    struct RoomModel: Identifiable, Equatable {
+        let slot: Int
+        let modelID: String
+        let label: String
+        var id: Int { slot }
+    }
+
+    /// Room mode: the transcript becomes a shared channel between up to four
+    /// loaded models; each model also gets its own pane. Persisted.
+    var roomModeEnabled: Bool = UserDefaults.standard.bool(forKey: "room.enabled") {
+        didSet { UserDefaults.standard.set(roomModeEnabled, forKey: "room.enabled") }
+    }
+
+    /// Room participants: the first four loaded models, in slot order.
+    var roomModels: [RoomModel] {
+        engine.loadedModels.prefix(4).enumerated().map { index, entry in
+            RoomModel(slot: index + 1, modelID: entry.id, label: entry.model.shortName)
+        }
+    }
+
+    var isRoomActive: Bool { roomModeEnabled && roomModels.count >= 2 }
+
+    /// True while a room round (one send → several sequential model turns) runs.
+    /// Included in `isBusy` so the composer stays locked in the brief gaps
+    /// between one model's completion and the next model's start.
+    private(set) var isRoomRoundRunning = false
+    private var roomRoundTask: Task<Void, Never>?
+
+    /// Sends the composer text to the room. "@all" (or no tag) fans out to every
+    /// participant SEQUENTIALLY in slot order — each later model sees the earlier
+    /// models' answers from the same round. "@2" (any combination) targets only
+    /// those slots. The shared transcript is the room; panes filter it by slot.
+    func sendRoom(images: [Data] = []) {
+        guard isRoomActive, !isBusy, var conversation = selectedConversation else { return }
+        let raw = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+        composerText = ""
+
+        let targets = Self.roomTargets(in: raw, models: roomModels)
+        var userMessage = ChatMessage(role: .user, content: raw)
+        userMessage.attachedImageData = images
+        conversation.messages.append(userMessage)
+        conversation.refreshTitle()
+        conversation.updatedAt = Date()
+        selectedConversation = conversation
+        scheduleSave()
+
+        let conversationID = conversation.id
+        isRoomRoundRunning = true
+        roomRoundTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isRoomRoundRunning = false
+                self.roomRoundTask = nil
+                self.scheduleSave()
+            }
+            for target in targets {
+                if Task.isCancelled { break }
+                guard self.engine.isLoaded(target.modelID) else { continue }
+                await self.runRoomTurn(target: target, images: images, conversationID: conversationID)
+            }
+        }
+    }
+
+    /// One model's turn: append its labeled bubble, stream into it, and finish.
+    /// The generation history is the FULL room transcript so far, with other
+    /// agents' replies relayed as user-role "[n.Name]:" lines — the model sees
+    /// everyone but can only ever speak as itself.
+    private func runRoomTurn(
+        target: RoomModel, images: [Data], conversationID: UUID
+    ) async {
+        guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+        var bubble = ChatMessage(role: .assistant, content: "")
+        bubble.modelName = "\(target.slot).\(target.label)"
+        bubble.slotNumber = target.slot
+        var conversation = conversations[ci]
+        conversation.messages.append(bubble)
+        conversation.updatedAt = Date()
+        conversations[ci] = conversation
+        let messageID = bubble.id
+        beginStreaming(messageID: messageID)
+
+        let history = roomTransformedHistory(conversations[ci], for: target, excluding: messageID)
+        let systemInstructions = roomSystemPrompt(for: target, history: conversations[ci])
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            engine.generate(
+                conversation: history,
+                prompt: Self.roomTurnPrompt,
+                images: images,
+                settings: settings,
+                systemInstructions: systemInstructions,
+                targetModelID: target.modelID,
+                onChunk: { [weak self] delta in
+                    self?.enqueueStreamDelta(
+                        delta, conversationID: conversationID, messageID: messageID)
+                },
+                onComplete: { [weak self] info, errorMessage in
+                    defer { continuation.resume() }
+                    guard let self else { return }
+                    self.finishStreamBuffer(messageID)
+                    self.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                        if let info {
+                            $0.tokensPerSecond = info.tokensPerSecond
+                            $0.generationTokenCount = info.generationTokenCount
+                            $0.promptTokenCount = info.promptTokenCount
+                            $0.promptTime = info.promptTime
+                        }
+                        if let errorMessage {
+                            if $0.content.isEmpty {
+                                $0.content = "⚠️ \(errorMessage)"
+                                $0.isError = true
+                            } else {
+                                $0.content += "\n\n⚠️ room turn interrupted: \(errorMessage)"
+                            }
+                        }
+                    }
+                    self.endStreaming(messageID: messageID)
+                    self.scheduleSave()
+                })
+        }
+    }
+
+    /// "@all" or no tag → everyone; "@1 @3" → those slots, in slot order.
+    nonisolated static func roomTargets(in text: String, models: [RoomModel]) -> [RoomModel] {
+        let lower = text.lowercased()
+        if lower.contains("@all") { return models }
+        let picked = models.filter { lower.contains("@\($0.slot)") }
+        return picked.isEmpty ? models : picked
+    }
+
+    /// Rewrites the shared transcript from one participant's point of view:
+    /// its own replies stay `assistant`, other agents' replies become user-role
+    /// relays ("[2.GLM]: …"), Forge system notices are dropped.
+    private func roomTransformedHistory(
+        _ conversation: Conversation, for target: RoomModel, excluding messageID: UUID
+    ) -> Conversation {
+        var copy = conversation
+        copy.messages = conversation.messages.compactMap { message in
+            guard message.id != messageID else { return nil }
+            switch message.role {
+            case .user:
+                return message
+            case .system:
+                return nil
+            case .assistant:
+                if message.content.isEmpty || message.isErrorMessage { return nil }
+                if message.slotNumber == target.slot { return message }
+                let speaker = message.modelName ?? "another agent"
+                return ChatMessage(role: .user, content: "[\(speaker)]:\n\(message.content)")
+            }
+        }
+        return copy
+    }
+
+    private func roomSystemPrompt(for target: RoomModel, history: Conversation) -> String {
+        let roster = roomModels
+            .map { "\($0.slot). \($0.label)\($0.slot == target.slot ? " (you)" : "")" }
+            .joined(separator: "\n")
+        let preamble = """
+            You are agent \(target.slot) ("\(target.label)") in a shared room with other AI agents:
+            \(roster)
+
+            Room rules:
+            - Messages from other agents appear as lines starting with "[n.Name]:". The plain messages are from the human user.
+            - Speak ONLY as yourself. Never write lines for other agents or the user, and never prefix your reply with your own "[\(target.slot).\(target.label)]:" tag — Forge labels it for you.
+            - The user addresses agents as @1–@4 or @all. When you refer to another agent, use its number.
+            - Be direct and add something of your own; don't just restate what another agent already said.
+            """
+        let base = baseSystemPrompt(for: history).trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? preamble : base + "\n\n" + preamble
+    }
+
+    /// Uniform per-turn prompt: the transformed history already carries the
+    /// user's latest message and any earlier same-round replies.
+    private static let roomTurnPrompt =
+        "It is your turn to speak in the room. Respond to the latest user message above and, where relevant, to the other agents' replies. Speak only as yourself."
 
     /// Use a single OpenRouter model for chat (clears multi-select).
     func setPrimaryOpenRouterModel(_ id: String) {
@@ -2541,6 +2723,9 @@ final class AppState {
 
     func stopGenerating() {
         flushAllStreamBuffers()
+        roomRoundTask?.cancel()
+        roomRoundTask = nil
+        isRoomRoundRunning = false
         engine.stop()
         claudeTask?.cancel()
         openRouterTasks.values.forEach { $0.cancel() }
