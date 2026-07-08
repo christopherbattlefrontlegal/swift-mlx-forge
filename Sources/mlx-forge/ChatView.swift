@@ -616,8 +616,16 @@ struct ComposerView: View {
 
                 // Graph feature removed for App Store readiness (sandbox incompatibilities and incomplete state). Use prompt library + modes for advanced chats.
             }
+            .padding(.horizontal, Theme.s2)
+            .padding(.vertical, Theme.s2)
+            .background(Theme.userBubble)
+            .clipShape(.rect(cornerRadius: Theme.radiusMedium))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusMedium)
+                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+            )
             .padding(.horizontal, Theme.s3)
-            .padding(.top, Theme.s2)
+            .padding(.top, Theme.s3)
 
             // The input area: text editor on top that starts small (1 line) and grows as you type (up to 10 lines),
             // then a fixed bottom bar with the attachment/prompt icons (horizontal) + send button.
@@ -1025,7 +1033,7 @@ struct ComposerView: View {
                 .padding(.horizontal, Theme.s3)
                 .padding(.vertical, Theme.s2)
             }
-            .glassCard(radius: Theme.radiusLarge)
+            .solidCard(radius: Theme.radiusLarge)
             .padding(.horizontal, Theme.s5)
             .padding(.bottom, Theme.s2)
             .padding(.top, Theme.s2)

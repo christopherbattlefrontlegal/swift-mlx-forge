@@ -97,24 +97,21 @@ struct RootView: View {
 
     var body: some View {
         @Bindable var app = app
-        HStack(spacing: 0) {
-            NavigationSplitView {
-                SidebarView()
-                    .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
-            } detail: {
-                // Floor for the chat column: with the sidebar AND inspector open,
-                // the window must grow instead of squishing the transcript.
-                ChatView()
-                    .frame(minWidth: 560)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if app.showInspector {
-                Divider()
-                TuningInspector()
-                    .frame(width: Theme.inspectorWidth)
-            }
+        NavigationSplitView {
+            SidebarView()
+                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+        } detail: {
+            ChatView()
+                .frame(minWidth: 560)
+                .inspector(isPresented: $app.showInspector) {
+                    TuningInspector()
+                        .inspectorColumnWidth(
+                            min: 300,
+                            ideal: Theme.inspectorWidth,
+                            max: 420)
+                }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(nil, value: app.showInspector)
         .background(Theme.backgroundGradient)
         .sheet(isPresented: $app.showModelBrowser) {
@@ -153,7 +150,7 @@ struct RootView: View {
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
-                .help("Show or hide the tuning panel (fixed width — no drag resize)")
+                .help("Show or hide the tuning panel")
             }
         }
         .onDisappear {

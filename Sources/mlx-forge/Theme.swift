@@ -12,7 +12,7 @@ enum Theme {
     static let s5: CGFloat = 24
     static let s6: CGFloat = 32
 
-    /// Fixed width for the Tuning panel — fully open or fully closed, no partial resize.
+    /// System-managed inspector target width.
     static let inspectorWidth: CGFloat = 340
 
     // Radius
@@ -41,6 +41,7 @@ enum Theme {
     static let userBubble = Color(red: 0.16, green: 0.17, blue: 0.21)
     static let assistantBubble = Color(red: 0.11, green: 0.11, blue: 0.14)
     static let codeBackground = Color(red: 0.07, green: 0.07, blue: 0.09)
+    static let composerBackground = Color(red: 0.13, green: 0.13, blue: 0.16)
 }
 
 /// A subtle glass card used for panels and grouped content.
@@ -61,6 +62,27 @@ struct GlassCard: ViewModifier {
 extension View {
     func glassCard(radius: CGFloat = Theme.radiusMedium) -> some View {
         modifier(GlassCard(radius: radius))
+    }
+}
+
+/// Opaque card for chrome that must remain readable over scrolling text.
+struct SolidCard: ViewModifier {
+    var radius: CGFloat = Theme.radiusMedium
+
+    func body(content: Content) -> some View {
+        content
+            .background(Theme.composerBackground)
+            .clipShape(.rect(cornerRadius: radius))
+            .overlay(
+                RoundedRectangle(cornerRadius: radius)
+                    .strokeBorder(.white.opacity(0.10), lineWidth: 1)
+            )
+    }
+}
+
+extension View {
+    func solidCard(radius: CGFloat = Theme.radiusMedium) -> some View {
+        modifier(SolidCard(radius: radius))
     }
 }
 
