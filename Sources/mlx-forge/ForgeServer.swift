@@ -748,19 +748,29 @@ private struct HTTPRequest {
     private static func receive(_ connection: NWConnection) async throws -> Data? {
         try await withThrowingTaskGroup(of: Data?.self) { group in
             group.addTask {
-                try await withCheckedThrowingContinuation { continuation in
-                    connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) {
-                        data, _, isComplete, error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else if let data {
-                            continuation.resume(returning: data)
-                        } else if isComplete {
-                            continuation.resume(returning: nil)
-                        } else {
-                            continuation.resume(returning: Data())
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) {
+                            data, _, isComplete, error in
+                            if let error {
+                                continuation.resume(throwing: error)
+                            } else if let data {
+                                continuation.resume(returning: data)
+                            } else if isComplete {
+                                continuation.resume(returning: nil)
+                            } else {
+                                continuation.resume(returning: Data())
+                            }
                         }
                     }
+                } onCancel: {
+                    // The timeout task won the race. `group.cancelAll()` only cancels
+                    // this Swift task — the pending `receive` continuation stays parked
+                    // until the socket delivers something, so the group's implicit await
+                    // on this child would hang (defeating the timeout on a slowloris
+                    // client). Tear the connection down so the completion handler fires
+                    // and resumes the continuation.
+                    connection.cancel()
                 }
             }
             group.addTask {
