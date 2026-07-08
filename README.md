@@ -20,6 +20,19 @@ The goal is a usable local model workbench:
 
 Forge does not ship model weights in this repository.
 
+## Launch status
+
+- Public repo: <https://github.com/christopherbattlefrontlegal/swift-mlx-forge>
+- Website: <https://christopherbattlefrontlegal.github.io/swift-mlx-forge/>
+- Releases: <https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases>
+- License: MIT
+- Install path today: source install with `./scripts/install-forge-app.sh`
+- Launch copy and repo metadata: [`LAUNCH.md`](LAUNCH.md)
+
+A public drag-and-drop `.app` download still needs Developer ID signing and notarization.
+Until then, the honest free path is source-installable: clone the repo, build locally, and
+bring your own MLX or GGUF model weights.
+
 ## Requirements
 
 - macOS 26+ (tested on macOS 27 beta / Golden Gate) with Swift 6.2+.
