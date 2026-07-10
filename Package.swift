@@ -24,7 +24,9 @@ let package = Package(
     dependencies: [
         // MLX runtime + LLM stack (public source).
         // 3.31.4 adds pure Mamba2 (SSM) models, Mixtral, and generation seeding.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", exact: "3.31.4"),
+        // Vendored from mlx-swift-lm 3.31.4 so Forge can carry its native
+        // Qwen3.5/Qwen3.6 MTP implementation until it lands upstream.
+        .package(path: "Vendor/mlx-swift-lm"),
 
         // PrismML fork of mlx-swift: upstream main (>= 0.31.4) plus 1-bit affine
         // quantization Metal kernels (Bonsai models). Root-package declaration

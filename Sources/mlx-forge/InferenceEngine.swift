@@ -36,6 +36,8 @@ final class InferenceEngine {
         let weightLoadPolicy: WeightLoadPolicy?
         /// llama.cpp context when this is a GGUF model.
         let gguf: GGUFRuntime?
+        /// Target was loaded with the separate native Qwen MTP sidecar.
+        let qwenMTPEnabled: Bool
         /// Sniffed at load: tokenizer ships a chat template.
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
@@ -49,12 +51,14 @@ final class InferenceEngine {
             model: LocalModel, container: ModelContainer?,
             weightLoadPolicy: WeightLoadPolicy? = nil,
             gguf: GGUFRuntime? = nil,
+            qwenMTPEnabled: Bool = false,
             templateCaps: ChatTemplateSniffer.Capabilities = ChatTemplateSniffer.Capabilities()
         ) {
             self.model = model
             self.container = container
             self.weightLoadPolicy = weightLoadPolicy
             self.gguf = gguf
+            self.qwenMTPEnabled = qwenMTPEnabled
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
             self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
@@ -188,7 +192,11 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
 
-        let useFactoryLoader = policy == .eager || model.prefersStandardMLXLoad
+        // Qwen MTP requires Forge's combined target+sidecar weight loader;
+        // upstream's factory sees only the target repository.
+        let hasQwenMTPSidecar = qwenMTPDrafterDirectory(for: model.directory) != nil
+        let useFactoryLoader = !hasQwenMTPSidecar
+            && (policy == .eager || model.prefersStandardMLXLoad)
         let task: Task<ModelContainer, Error>
         let generation: UInt64
         if let inFlight = loadTasks[model.id],
@@ -276,6 +284,7 @@ final class InferenceEngine {
             let entry = Loaded(
                 model: model, container: container,
                 weightLoadPolicy: recordedPolicy,
+                qwenMTPEnabled: hasQwenMTPSidecar,
                 templateCaps: templateCaps)
             loadedModels.append(entry)
             if activeModelID == nil { activeModelID = entry.id }
@@ -620,7 +629,9 @@ final class InferenceEngine {
             Self.thinkingBudgetApplies(to: entry, settings: settings)
             ? settings.localThinkingTokenLimit : nil
         let noThinkPrefill = Self.noThinkPrefillApplies(to: entry, settings: settings)
-        if budgetTarget != nil || noThinkPrefill, entry.container != nil {
+        if budgetTarget != nil || noThinkPrefill || entry.qwenMTPEnabled,
+            entry.container != nil
+        {
             sessions.removeValue(forKey: conversation.id)
             let userPrompt = Self.userPrompt(
                 prompt: prompt,
@@ -1036,6 +1047,7 @@ final class InferenceEngine {
             container: loadedModels[index].container,
             weightLoadPolicy: loadedModels[index].weightLoadPolicy,
             gguf: loadedModels[index].gguf,
+            qwenMTPEnabled: loadedModels[index].qwenMTPEnabled,
             templateCaps: caps)
     }
 
@@ -1271,14 +1283,29 @@ final class InferenceEngine {
                     }
 
                     // Phase 1 — decode until </think> closes naturally or the cap hits.
-                    let iterator = try TokenIterator(
-                        input: LMInput(text: .init(tokens: promptTokens)),
-                        model: context.model, parameters: parameters)
-                    let (phase1, phase1Task) = MLXLMCommon.generateTask(
-                        promptTokenCount: promptTokens.size,
-                        modelConfiguration: context.configuration,
-                        tokenizer: context.tokenizer,
-                        iterator: iterator)
+                    let phase1: AsyncStream<Generation>
+                    let phase1Task: Task<Void, Never>
+                    if let qwenMTP = context.model as? any QwenNativeMTPModel {
+                        let iterator = try QwenNativeMTPTokenIterator(
+                            input: LMInput(text: .init(tokens: promptTokens)),
+                            model: qwenMTP,
+                            parameters: parameters,
+                            numMTPTokens: 3)
+                        (phase1, phase1Task) = MLXLMCommon.generateTask(
+                            promptTokenCount: promptTokens.size,
+                            modelConfiguration: context.configuration,
+                            tokenizer: context.tokenizer,
+                            iterator: iterator)
+                    } else {
+                        let iterator = try TokenIterator(
+                            input: LMInput(text: .init(tokens: promptTokens)),
+                            model: context.model, parameters: parameters)
+                        (phase1, phase1Task) = MLXLMCommon.generateTask(
+                            promptTokenCount: promptTokens.size,
+                            modelConfiguration: context.configuration,
+                            tokenizer: context.tokenizer,
+                            iterator: iterator)
+                    }
 
                     var generated = ""
                     var thinkingClosed = false
@@ -1331,15 +1358,30 @@ final class InferenceEngine {
                         promptTokens,
                         MLXArray(continuationIDs.map { Int32($0) }),
                     ])
-                    let iterator2 = try TokenIterator(
-                        input: LMInput(text: .init(tokens: phase2Tokens)),
-                        model: context.model,
-                        parameters: phase2Parameters)
-                    let (phase2, phase2Task) = MLXLMCommon.generateTask(
-                        promptTokenCount: phase2Tokens.size,
-                        modelConfiguration: context.configuration,
-                        tokenizer: context.tokenizer,
-                        iterator: iterator2)
+                    let phase2: AsyncStream<Generation>
+                    let phase2Task: Task<Void, Never>
+                    if let qwenMTP = context.model as? any QwenNativeMTPModel {
+                        let iterator = try QwenNativeMTPTokenIterator(
+                            input: LMInput(text: .init(tokens: phase2Tokens)),
+                            model: qwenMTP,
+                            parameters: phase2Parameters,
+                            numMTPTokens: 3)
+                        (phase2, phase2Task) = MLXLMCommon.generateTask(
+                            promptTokenCount: phase2Tokens.size,
+                            modelConfiguration: context.configuration,
+                            tokenizer: context.tokenizer,
+                            iterator: iterator)
+                    } else {
+                        let iterator = try TokenIterator(
+                            input: LMInput(text: .init(tokens: phase2Tokens)),
+                            model: context.model,
+                            parameters: phase2Parameters)
+                        (phase2, phase2Task) = MLXLMCommon.generateTask(
+                            promptTokenCount: phase2Tokens.size,
+                            modelConfiguration: context.configuration,
+                            tokenizer: context.tokenizer,
+                            iterator: iterator)
+                    }
                     for await item in phase2 {
                         if Task.isCancelled { break }
                         continuation.yield(item)

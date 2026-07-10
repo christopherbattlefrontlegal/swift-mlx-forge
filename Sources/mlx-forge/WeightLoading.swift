@@ -27,6 +27,66 @@ enum WeightLoadError: Error, LocalizedError {
     }
 }
 
+/// Resolve the separately packaged AEON Qwen3.6 MTP drafter. Explicit
+/// configuration wins; otherwise accept a sidecar inside the target folder or
+/// any installed `qwen3_5_mtp` checkpoint in Forge's managed model cache.
+func qwenMTPDrafterDirectory(for targetDirectory: URL) -> URL? {
+    let fm = FileManager.default
+    guard let targetConfig = qwenConfiguration(at: targetDirectory),
+        qwenModelType(in: targetConfig).hasPrefix("qwen3_5"),
+        qwenModelType(in: targetConfig) != "qwen3_5_mtp"
+    else { return nil }
+
+    func isCompatibleDrafter(_ url: URL) -> Bool {
+        guard let draftConfig = qwenConfiguration(at: url),
+            qwenModelType(in: draftConfig) == "qwen3_5_mtp"
+        else { return false }
+
+        let targetText = qwenTextConfiguration(in: targetConfig)
+        let draftText = qwenTextConfiguration(in: draftConfig)
+        return targetText["hidden_size"] as? Int == draftText["hidden_size"] as? Int
+            && targetText["vocab_size"] as? Int == draftText["vocab_size"] as? Int
+    }
+
+    if let explicit = ProcessInfo.processInfo.environment["FORGE_QWEN_MTP_DRAFTER_PATH"],
+        !explicit.isEmpty
+    {
+        let url = URL(fileURLWithPath: explicit, isDirectory: true)
+        if isCompatibleDrafter(url) { return url }
+    }
+
+    for name in ["mtp-drafter", "MTP-Drafter", "qwen3_5_mtp"] {
+        let url = targetDirectory.appending(component: name, directoryHint: .isDirectory)
+        if isCompatibleDrafter(url) { return url }
+    }
+
+    guard let enumerator = fm.enumerator(
+        at: ForgePaths.modelsRoot,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else { return nil }
+    for case let url as URL in enumerator where url.lastPathComponent == "config.json" {
+        let directory = url.deletingLastPathComponent()
+        if isCompatibleDrafter(directory) { return directory }
+    }
+    return nil
+}
+
+private func qwenConfiguration(at directory: URL) -> [String: Any]? {
+    let url = directory.appending(component: "config.json")
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+}
+
+private func qwenTextConfiguration(in configuration: [String: Any]) -> [String: Any] {
+    configuration["text_config"] as? [String: Any] ?? configuration
+}
+
+private func qwenModelType(in configuration: [String: Any]) -> String {
+    if let modelType = configuration["model_type"] as? String { return modelType }
+    return qwenTextConfiguration(in: configuration)["model_type"] as? String ?? ""
+}
+
 /// Sorted shard URLs under `modelDirectory` (deterministic load order).
 func safetensorsShardURLs(in modelDirectory: URL) throws -> [URL] {
     var shardURLs: [URL] = []
@@ -43,11 +103,25 @@ func safetensorsShardURLs(in modelDirectory: URL) throws -> [URL] {
     return shardURLs
 }
 
+/// Translate the standalone Qwen MTP checkpoint namespace into the module
+/// namespace owned by `Qwen35Model`. Accept already-qualified keys so a future
+/// checkpoint can be packaged either bare or pre-namespaced.
+func qwenMTPWeightKey(_ rawKey: String) -> String {
+    if rawKey.hasPrefix("language_model.mtp.") {
+        return rawKey
+    }
+    if rawKey.hasPrefix("mtp.") {
+        return "language_model.mtp.0." + rawKey.dropFirst(4)
+    }
+    return "language_model.mtp.0." + rawKey
+}
+
 /// Load model weights with Forge's materialization policy.
 func loadWeights(
     modelDirectory: URL,
     model: BaseLanguageModel,
     policy: WeightLoadPolicy,
+    qwenMTPDrafterDirectory: URL? = nil,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     progress: (@Sendable (Double) -> Void)? = nil
@@ -75,6 +149,23 @@ func loadWeights(
         }
 
         progress?(Double(index + 1) / shardCount)
+    }
+
+    // The AEON target and native MTP head are separate repositories. Merge
+    // the sidecar's bare keys into the exact Qwen module namespace before the
+    // single verified module update.
+    if let qwenMTPDrafterDirectory {
+        for url in try safetensorsShardURLs(in: qwenMTPDrafterDirectory) {
+            let (draftWeights, _) = try loadArraysAndMetadata(url: url)
+            for (rawKey, value) in draftWeights {
+                let key = qwenMTPWeightKey(rawKey)
+                guard weights[key] == nil else {
+                    throw WeightLoadError.duplicateTensor(key, url)
+                }
+                weights[key] = value
+            }
+            if policy == .boundedEager { eval(Array(draftWeights.values)) }
+        }
     }
 
     try Task.checkCancellation()
@@ -131,6 +222,12 @@ func loadLLMContainerWithPolicy(
             configurationURL.lastPathComponent, configuration.name, error)
     }
 
+    let mtpDirectory = qwenMTPDrafterDirectory(for: modelDirectory)
+    if mtpDirectory != nil { setenv("FORGE_QWEN_MTP_ENABLE", "1", 1) }
+    defer {
+        if mtpDirectory != nil { unsetenv("FORGE_QWEN_MTP_ENABLE") }
+    }
+
     let model: LanguageModel
     do {
         model = try await LLMTypeRegistry.shared.createModel(
@@ -169,6 +266,7 @@ func loadLLMContainerWithPolicy(
         modelDirectory: modelDirectory,
         model: model,
         policy: policy,
+        qwenMTPDrafterDirectory: mtpDirectory,
         perLayerQuantization: baseConfig.perLayerQuantization,
         progress: progress)
 
