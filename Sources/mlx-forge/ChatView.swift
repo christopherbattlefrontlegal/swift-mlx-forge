@@ -59,12 +59,23 @@ struct ModelSlotBar: View {
     @Environment(AppState.self) private var app
 
     var body: some View {
-        HStack(spacing: Theme.s2) {
-            ForEach(0..<ModelMemoryBudget.slotCount, id: \.self) { index in
-                slotChip(index)
+        VStack(spacing: Theme.s1) {
+            HStack(spacing: Theme.s1) {
+                ForEach(0..<ModelMemoryBudget.slotCount, id: \.self) { index in
+                    slotChip(index)
+                        .frame(minWidth: 84, maxWidth: .infinity)
+                }
             }
-            Spacer(minLength: Theme.s2)
-            if app.engine.loadedModels.count >= 2 || app.roomModeEnabled {
+            HStack {
+                Button {
+                    app.showModelBrowser = true
+                } label: {
+                    Label("Model Library", systemImage: "shippingbox")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: Theme.s2)
+                if app.roomModels.count >= 2 || app.roomModeEnabled {
                 Button {
                     app.roomModeEnabled.toggle()
                 } label: {
@@ -84,7 +95,8 @@ struct ModelSlotBar: View {
                 .help(
                     app.roomModeEnabled
                         ? "Room on — split panes + shared channel. Click to return to single chat."
-                        : "Room — split the chat into one pane per loaded model (up to 4) with a shared channel they all see.")
+                        : "Room — one pane per assigned slot (up to 9) plus a shared channel every agent sees.")
+                }
             }
         }
         .padding(.horizontal, Theme.s3)
@@ -94,65 +106,71 @@ struct ModelSlotBar: View {
 
     @ViewBuilder
     private func slotChip(_ index: Int) -> some View {
-        let loaded = app.engine.loadedModels
-        if index < loaded.count {
-            let entry = loaded[index]
+        let assignments = app.effectiveModelSlotAssignments
+        if let modelID = assignments[index],
+            let entry = app.engine.loadedModels.first(where: { $0.id == modelID })
+        {
             let isActive = app.engine.activeModelID == entry.id
             Menu {
-                Button("Set Active") { app.engine.activeModelID = entry.id }
-                Button("Eject", role: .destructive) {
-                    app.engine.unload(entry.id)
-                    app.scheduleSave()
+                Button("Use for single chat") { app.engine.activeModelID = entry.id }
+                Menu("Replace Slot") {
+                    ForEach(app.store.localModels) { model in
+                        Button(model.shortName) { app.assignModel(model, toSlot: index) }
+                    }
                 }
+                Divider()
+                Button("Clear Slot", role: .destructive) { app.clearModelSlot(index) }
             } label: {
-                HStack(spacing: 4) {
-                    Text("\(index + 1)")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SLOT \(index + 1)")
                         .font(.caption2.weight(.bold).monospacedDigit())
                         .foregroundStyle(isActive ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
                     Text(entry.model.shortName)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.75)
                         .truncationMode(.middle)
                 }
                 .padding(.horizontal, Theme.s2)
-                .frame(height: 24)
-                .frame(maxWidth: 180)
-                .background(.white.opacity(isActive ? 0.10 : 0.05), in: Capsule())
+                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
+                .background(.white.opacity(isActive ? 0.10 : 0.05), in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
-                    Capsule().strokeBorder(
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(
                         isActive ? Theme.ember.opacity(0.6) : .white.opacity(0.06),
                         lineWidth: 1))
             }
             .menuStyle(.borderlessButton)
-            .fixedSize()
             .disabled(app.isBusy)
             .help("Slot \(index + 1): \(entry.model.name)\(isActive ? " (active)" : "")")
         } else {
-            Button {
-                app.showModelBrowser = true
+            Menu {
+                ForEach(app.store.localModels) { model in
+                    Button(model.shortName) { app.assignModel(model, toSlot: index) }
+                }
+                Divider()
+                Button("Open Model Library…") { app.showModelBrowser = true }
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "plus")
-                        .font(.caption2.weight(.semibold))
-                    Text("\(index + 1)")
-                        .font(.caption2.monospacedDigit())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SLOT \(index + 1)")
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                    Label("Load model", systemImage: "plus")
+                        .font(.caption.weight(.semibold))
                 }
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, Theme.s2)
-                .frame(height: 24)
+                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
                 .overlay(
-                    Capsule().strokeBorder(
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(
                         .white.opacity(0.08), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
             }
-            .buttonStyle(.plain)
+            .menuStyle(.borderlessButton)
             .help("Slot \(index + 1) — empty. Click to open the model library.")
         }
     }
 }
 
-/// Room mode: one pane per participating model (2 side-by-side, 3 across,
-/// 4 in a 2×2 grid) above the shared Room channel — the transcript every
-/// model sees and posts to.
+/// Room mode: one pane per participating slot in an adaptive 1×2, 1×3,
+/// 2-column, or 3-column grid above the shared Room channel.
 private struct RoomSplitView: View {
     @Environment(AppState.self) private var app
     let conversation: Conversation
@@ -162,7 +180,7 @@ private struct RoomSplitView: View {
         GeometryReader { proxy in
             VStack(spacing: 0) {
                 panes
-                    .frame(height: max(220, proxy.size.height * 0.52))
+                    .frame(height: max(240, proxy.size.height * 0.60))
                 Divider()
                 roomChannel
             }
@@ -172,15 +190,12 @@ private struct RoomSplitView: View {
     @ViewBuilder
     private var panes: some View {
         let models = app.roomModels
-        if models.count >= 4 {
-            VStack(spacing: 1) {
-                HStack(spacing: 1) {
-                    ModelPaneView(model: models[0], conversation: conversation, onShowLargeText: onShowLargeText)
-                    ModelPaneView(model: models[1], conversation: conversation, onShowLargeText: onShowLargeText)
-                }
-                HStack(spacing: 1) {
-                    ModelPaneView(model: models[2], conversation: conversation, onShowLargeText: onShowLargeText)
-                    ModelPaneView(model: models[3], conversation: conversation, onShowLargeText: onShowLargeText)
+        if models.count > 3 {
+            let columns = Array(repeating: GridItem(.flexible(), spacing: 1), count: models.count >= 7 ? 3 : 2)
+            LazyVGrid(columns: columns, spacing: 1) {
+                ForEach(models) { model in
+                    ModelPaneView(model: model, conversation: conversation, onShowLargeText: onShowLargeText)
+                        .frame(minHeight: 150)
                 }
             }
         } else {
@@ -198,7 +213,7 @@ private struct RoomSplitView: View {
                 Image(systemName: "bubble.left.and.bubble.right.fill")
                     .font(.caption)
                     .foregroundStyle(Theme.emberGlow)
-                Text("Room — shared channel · @all (default) or @1–@\(app.roomModels.count)")
+                Text("Room — shared channel · @all (default) or any assigned slot @1–@9")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
@@ -221,10 +236,7 @@ private struct ModelPaneView: View {
 
     private var messages: [ChatMessage] {
         conversation.messages.filter { message in
-            if let producerModelID = message.producerModelID {
-                return producerModelID == model.modelID
-            }
-            return message.slotNumber == model.slot
+            message.slotNumber == model.slot
         }
     }
 
@@ -272,7 +284,8 @@ private struct ModelPaneView: View {
                 }
                 .padding(Theme.s3)
             }
-            .defaultScrollAnchor(.bottom)
+            // Token generation must never seize the user's scroll position.
+            .defaultScrollAnchor(.top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.white.opacity(0.015))
@@ -388,6 +401,8 @@ struct TranscriptView: View {
             .frame(maxWidth: 860)
             .frame(maxWidth: .infinity)
         }
+        // Keep the viewport user-owned while the final row grows during a stream.
+        .defaultScrollAnchor(.top)
     }
 }
 
@@ -1821,7 +1836,7 @@ struct ComposerView: View {
 
     private var placeholder: String {
         if app.isRoomActive {
-            return "Message the room — @all (default) or @1–@\(app.roomModels.count), e.g. \"@2 critique @1\"…"
+            return "Message the room — @all (default) or any assigned slot @1–@9, e.g. \"@9 critique @1\"…"
         }
         if app.braveSearchEnabled {
             return "Ask Brave \(app.braveSearchConfig.enableResearch ? "Research" : "Answers")…"

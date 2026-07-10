@@ -149,9 +149,6 @@ struct RootView: View {
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                ModelPickerControl()
-            }
-            ToolbarItem(placement: .navigation) {
                 UnloadModelsToolbarButton()
             }
             ToolbarItemGroup(placement: .primaryAction) {

@@ -32,7 +32,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var promptTokenCount: Int?
     var promptTime: TimeInterval?
 
-    /// Room mode: which model slot (1–4) produced this reply, so each model's
+    /// Room mode: which model slot (1–9) produced this reply, so each model's
     /// pane can filter the shared transcript. Optional so older saved
     /// conversations decode cleanly; nil for non-room messages.
     var slotNumber: Int?

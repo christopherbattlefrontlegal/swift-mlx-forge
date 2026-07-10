@@ -5,7 +5,7 @@ import MLX
 
 enum ModelMemoryBudget {
     /// How many MLX/GGUF models Forge tracks as concurrent resident slots.
-    static let slotCount = 6
+    static let slotCount = 9
 
     struct LoadDecision: Equatable {
         let allowed: Bool

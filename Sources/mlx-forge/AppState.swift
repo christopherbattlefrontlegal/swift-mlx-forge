@@ -245,24 +245,87 @@ final class AppState {
 
     // MARK: - Model Room (split-view multi-model chat)
 
+    /// Nine independent agent slots. Multiple slots may intentionally point at
+    /// the same resident model: weights are shared, while each slot keeps its
+    /// own identity and receives its own reconstructed conversation context.
+    var modelSlotAssignments: [String] = {
+        let saved = UserDefaults.standard.stringArray(forKey: "room.modelSlots") ?? []
+        return Array((saved + Array(repeating: "", count: ModelMemoryBudget.slotCount))
+            .prefix(ModelMemoryBudget.slotCount))
+    }() {
+        didSet {
+            UserDefaults.standard.set(modelSlotAssignments, forKey: "room.modelSlots")
+        }
+    }
+
+    /// Saved assignments that still exist in memory, followed by any newly
+    /// loaded models in the first free slots. This keeps legacy loading paths
+    /// useful without collapsing deliberate duplicate slot assignments.
+    var effectiveModelSlotAssignments: [String?] {
+        let loadedIDs = Set(engine.loadedModels.map(\.id))
+        var result = modelSlotAssignments.map { id in
+            id.isEmpty || !loadedIDs.contains(id) ? nil : id
+        }
+        var represented = Set(result.compactMap { $0 })
+        for entry in engine.loadedModels where !represented.contains(entry.id) {
+            guard let empty = result.firstIndex(where: { $0 == nil }) else { break }
+            result[empty] = entry.id
+            represented.insert(entry.id)
+        }
+        return result
+    }
+
+    func assignModel(_ model: LocalModel, toSlot index: Int) {
+        guard modelSlotAssignments.indices.contains(index) else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let entry = try await self.engine.load(model)
+                self.modelSlotAssignments[index] = entry.id
+                self.engine.activeModelID = entry.id
+                self.scheduleSave()
+            } catch is CancellationError {
+                // User cancelled or unloaded while the model was loading.
+            } catch {
+                // InferenceEngine exposes the actionable load error.
+            }
+        }
+    }
+
+    func clearModelSlot(_ index: Int) {
+        guard modelSlotAssignments.indices.contains(index) else { return }
+        var current = effectiveModelSlotAssignments
+        guard let modelID = current[index] else { return }
+        modelSlotAssignments[index] = ""
+        current[index] = nil
+        if !current.contains(where: { $0 == modelID }) {
+            engine.unload(modelID)
+        }
+        scheduleSave()
+    }
+
     /// One participant in the room: a loaded local model bound to a numbered slot.
     struct RoomModel: Identifiable, Equatable {
         let slot: Int
         let modelID: String
         let label: String
-        var id: String { modelID }
+        var id: Int { slot }
     }
 
-    /// Room mode: the transcript becomes a shared channel between up to four
+    /// Room mode: the transcript becomes a shared channel between up to nine
     /// loaded models; each model also gets its own pane. Persisted.
     var roomModeEnabled: Bool = UserDefaults.standard.bool(forKey: "room.enabled") {
         didSet { UserDefaults.standard.set(roomModeEnabled, forKey: "room.enabled") }
     }
 
-    /// Room participants: the first four loaded models, in slot order.
+    /// Room participants: every assigned, resident slot in slot order. The same
+    /// model may occupy several slots without duplicating its weight container.
     var roomModels: [RoomModel] {
-        engine.loadedModels.prefix(4).enumerated().map { index, entry in
-            RoomModel(slot: index + 1, modelID: entry.id, label: entry.model.shortName)
+        effectiveModelSlotAssignments.enumerated().compactMap { index, modelID in
+            guard let modelID,
+                let entry = engine.loadedModels.first(where: { $0.id == modelID })
+            else { return nil }
+            return RoomModel(slot: index + 1, modelID: modelID, label: entry.model.shortName)
         }
     }
 
@@ -412,8 +475,11 @@ final class AppState {
                 return nil
             case .assistant:
                 if message.content.isEmpty || message.isErrorMessage { return nil }
-                let isOwnReply = message.producerModelID.map { $0 == target.modelID }
-                    ?? (message.slotNumber == target.slot)
+                // Slot identity wins because several agents may deliberately share
+                // one resident model/weight container.
+                let isOwnReply = message.slotNumber.map { $0 == target.slot }
+                    ?? message.producerModelID.map { $0 == target.modelID }
+                    ?? false
                 if isOwnReply { return message }
                 let speaker = message.modelName ?? "another agent"
                 return ChatMessage(role: .user, content: "[\(speaker)]:\n\(message.content)")
@@ -435,7 +501,7 @@ final class AppState {
             Room rules:
             - Messages from other agents appear as lines starting with "[n.Name]:". The plain messages are from the human user.
             - Speak ONLY as yourself. Never write lines for other agents or the user, and never prefix your reply with your own "[\(target.slot).\(target.label)]:" tag — Forge labels it for you.
-            - The user addresses agents as @1–@4 or @all. When you refer to another agent, use its number.
+            - The user addresses agents as @1–@9 or @all. When you refer to another agent, use its number.
             - Be direct and add something of your own; don't just restate what another agent already said.
             """
         let base = baseSystemPrompt(for: history).trimmingCharacters(in: .whitespacesAndNewlines)
