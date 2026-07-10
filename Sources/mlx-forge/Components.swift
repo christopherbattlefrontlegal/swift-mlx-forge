@@ -1,6 +1,7 @@
 // Forge — shared UI components: model picker, memory badge, markdown rendering.
 
 import AppKit
+import Combine
 import SwiftUI
 
 // MARK: - Model picker (toolbar)
@@ -16,14 +17,15 @@ struct ModelPickerControl: View {
                         Button {
                             app.claudeModelID = nil
                             app.engine.activeModelID = entry.id
-                    } label: {
-                        if app.claudeModelID == nil, app.engine.activeModelID == entry.id {
-                            Label(menuDisplay(for: entry.model), systemImage: "checkmark")
-                        } else {
-                            Label(menuDisplay(for: entry.model), systemImage: "bolt.fill")
+                        } label: {
+                            if app.claudeModelID == nil, app.engine.activeModelID == entry.id {
+                                Label(menuDisplay(for: entry.model), systemImage: "checkmark")
+                            } else {
+                                Label(menuDisplay(for: entry.model), systemImage: "bolt.fill")
+                            }
                         }
+                        .disabled(app.isBusy)
                     }
-                }
                 }
                 Section("Parallel run — every selected model answers each send") {
                     ForEach(app.engine.loadedModels) { entry in
@@ -35,20 +37,25 @@ struct ModelPickerControl: View {
                                 systemImage: app.isLocalFanoutSelected(entry.id)
                                     ? "circle.fill" : "circle")
                         }
+                        .disabled(app.isBusy)
                     }
                     Button("Select all loaded") { app.selectAllLocalFanout() }
+                        .disabled(app.isBusy)
                     Button("Clear parallel selection") { app.clearLocalFanout() }
+                        .disabled(app.isBusy)
                 }
                 Section {
                     Menu("Unload…") {
                         ForEach(app.engine.loadedModels) { entry in
                             Button(menuDisplay(for: entry.model)) {
+                                app.stopGenerating()
                                 app.engine.unload(entry.id)
                                 app.scheduleSave()
                             }
                         }
                         Divider()
                         Button("Unload All") {
+                            app.stopGenerating()
                             app.engine.unloadAll()
                             app.scheduleSave()
                         }
@@ -64,6 +71,7 @@ struct ModelPickerControl: View {
                             app.engine.loadAndActivate(model)
                             app.scheduleSave()
                         }
+                        .disabled(app.isBusy)
                     }
                 }
             }
@@ -115,6 +123,7 @@ struct ModelPickerControl: View {
                             Label(claude.label, systemImage: "cloud")
                         }
                     }
+                    .disabled(!app.hasAnthropicKey || app.isBusy)
                 }
                 if !app.hasAnthropicKey {
                     Text("Set an API key in the Tuning panel to use Claude")
@@ -260,7 +269,7 @@ struct UnloadModelsToolbarButton: View {
 struct MemoryBadge: View {
     @Environment(AppState.self) private var app
 
-    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 2, on: .main, in: .default).autoconnect()
 
     var body: some View {
         HStack(spacing: Theme.s1) {
@@ -402,6 +411,7 @@ struct CodeBlock: View {
     let code: String
     let language: String?
     @State private var copied = false
+    @State private var copiedResetTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -414,9 +424,12 @@ struct CodeBlock: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(code, forType: .string)
                     copied = true
-                    Task {
+                    copiedResetTask?.cancel()
+                    copiedResetTask = Task { @MainActor in
                         try? await Task.sleep(for: .seconds(1.5))
+                        guard !Task.isCancelled else { return }
                         copied = false
+                        copiedResetTask = nil
                     }
                 } label: {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
@@ -442,6 +455,10 @@ struct CodeBlock: View {
             RoundedRectangle(cornerRadius: Theme.radiusSmall)
                 .strokeBorder(.white.opacity(0.07), lineWidth: 1)
         )
+        .onDisappear {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+        }
     }
 }
 
@@ -452,6 +469,7 @@ struct CopyClipButton: View {
     var label: String? = nil
     let text: String
     @State private var copied = false
+    @State private var copiedResetTask: Task<Void, Never>?
 
     var body: some View {
         Button {
@@ -459,9 +477,12 @@ struct CopyClipButton: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
             copied = true
-            Task {
+            copiedResetTask?.cancel()
+            copiedResetTask = Task { @MainActor in
                 try? await Task.sleep(for: .seconds(1.2))
+                guard !Task.isCancelled else { return }
                 copied = false
+                copiedResetTask = nil
             }
         } label: {
             if let label {
@@ -479,6 +500,10 @@ struct CopyClipButton: View {
         .foregroundStyle(copied ? Theme.okGreen : .secondary)
         .help(copied ? "Copied" : (label ?? "Copy"))
         .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .onDisappear {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+        }
     }
 }
 

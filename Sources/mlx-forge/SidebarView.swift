@@ -5,6 +5,8 @@ import SwiftUI
 struct SidebarView: View {
     @Environment(AppState.self) private var app
     @State private var showClearAllConfirm = false
+    @State private var pendingDeleteConversationID: UUID?
+    @State private var pendingDeleteConversationTitle = ""
 
     var body: some View {
         @Bindable var app = app
@@ -20,7 +22,8 @@ struct SidebarView: View {
                             .tag(conversation.id)
                             .contextMenu {
                                 Button("Delete", role: .destructive) {
-                                    app.deleteConversation(conversation.id)
+                                    pendingDeleteConversationID = conversation.id
+                                    pendingDeleteConversationTitle = conversation.title
                                 }
                             }
                     }
@@ -46,11 +49,29 @@ struct SidebarView: View {
         } message: {
             Text("This removes every chat in the sidebar. You can’t undo this.")
         }
+        .alert(
+            "Delete conversation?",
+            isPresented: Binding(
+                get: { pendingDeleteConversationID != nil },
+                set: { if !$0 { pendingDeleteConversationID = nil } })
+        ) {
+            Button("Delete", role: .destructive) {
+                if let id = pendingDeleteConversationID {
+                    app.deleteConversation(id)
+                }
+                pendingDeleteConversationID = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteConversationID = nil
+            }
+        } message: {
+            Text("\"\(pendingDeleteConversationTitle)\" will be permanently removed.")
+        }
     }
 
     private var header: some View {
         HStack(spacing: Theme.s2) {
-            ForgeMark(size: 18)
+            ForgeMark(size: 18, animated: false)
             Text("FORGE")
                 .font(.headline.weight(.heavy))
                 .kerning(3)

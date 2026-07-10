@@ -23,6 +23,7 @@ enum SecretsStore {
         var openRouter: String?
         var braveSearch: String?
         var openAI: String?
+        var localServerAPIKey: String? = nil
     }
 
     private static let lock = NSLock()
@@ -39,35 +40,57 @@ enum SecretsStore {
     }
 
     static var huggingFaceToken: String? {
-        get { trimmed(bundle.huggingFace) }
+        get { read { normalized($0.huggingFace) } }
         set { mutate { $0.huggingFace = normalized(newValue) } }
     }
 
     static var anthropicAPIKey: String? {
-        get { trimmed(bundle.anthropic) }
+        get { read { normalized($0.anthropic) } }
         set { mutate { $0.anthropic = normalized(newValue) } }
     }
 
     static var openRouterAPIKey: String? {
-        get { trimmed(bundle.openRouter) }
+        get { read { normalized($0.openRouter) } }
         set { mutate { $0.openRouter = normalized(newValue) } }
     }
 
     static var openAIAPIKey: String? {
-        get { trimmed(bundle.openAI) }
+        get { read { normalized($0.openAI) } }
         set { mutate { $0.openAI = normalized(newValue) } }
     }
 
     static var braveSearchAPIKey: String? {
-        get { trimmed(bundle.braveSearch) }
+        get { read { normalized($0.braveSearch) } }
         set { mutate { $0.braveSearch = normalized(newValue) } }
     }
 
-    static var hasHuggingFaceToken: Bool { isStored(bundle.huggingFace) }
-    static var hasAnthropicKey: Bool { isStored(bundle.anthropic) }
-    static var hasOpenRouterKey: Bool { isStored(bundle.openRouter) }
-    static var hasOpenAIKey: Bool { isStored(bundle.openAI) }
-    static var hasBraveSearchKey: Bool { isStored(bundle.braveSearch) }
+    static var hasHuggingFaceToken: Bool { read { normalized($0.huggingFace) != nil } }
+    static var hasAnthropicKey: Bool { read { normalized($0.anthropic) != nil } }
+    static var hasOpenRouterKey: Bool { read { normalized($0.openRouter) != nil } }
+    static var hasOpenAIKey: Bool { read { normalized($0.openAI) != nil } }
+    static var hasBraveSearchKey: Bool { read { normalized($0.braveSearch) != nil } }
+
+    /// Lazily creates a 256-bit bearer token for authenticating LAN API
+    /// requests. A token is returned only after it has been verified in the
+    /// Keychain, so callers never advertise an ephemeral credential.
+    static var localServerAPIKey: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        ensureLoaded()
+        if let existing = normalized(bundle.localServerAPIKey) {
+            return existing
+        }
+        guard let generated = generateServerAPIKey() else { return nil }
+        var candidate = bundle
+        candidate.localServerAPIKey = generated
+        guard persistBundle(candidate) else { return nil }
+        bundle = candidate
+        return generated
+    }
+
+    static var hasLocalServerAPIKey: Bool {
+        read { normalized($0.localServerAPIKey) != nil }
+    }
 
     // MARK: - Load / persist
 
@@ -80,7 +103,7 @@ enum SecretsStore {
         }
 
         // One-time migration from older per-item Keychain layout.
-        var migrated = Bundle(
+        let migrated = Bundle(
             huggingFace: readKeychainString(account: hfAccount),
             anthropic: readKeychainString(account: anthropicAccount),
             openRouter: readKeychainString(account: openRouterAccount),
@@ -93,8 +116,9 @@ enum SecretsStore {
         ].contains { normalized($0) != nil }
 
         bundle = migrated
-        if hasAny {
-            persistBundle()
+        if hasAny, persistBundle(migrated) {
+            // Delete legacy items only after the bundled value was written and
+            // read back byte-for-byte from the Keychain.
             deleteKeychain(account: hfAccount)
             deleteKeychain(account: anthropicAccount)
             deleteKeychain(account: openRouterAccount)
@@ -106,14 +130,33 @@ enum SecretsStore {
     private static func mutate(_ edit: (inout Bundle) -> Void) {
         lock.lock()
         defer { lock.unlock() }
-        if !loaded { loaded = true; loadBundle() }
-        edit(&bundle)
-        persistBundle()
+        ensureLoaded()
+        var candidate = bundle
+        edit(&candidate)
+        if persistBundle(candidate) {
+            bundle = candidate
+        }
     }
 
-    private static func persistBundle() {
-        guard let data = try? JSONEncoder().encode(bundle) else { return }
-        writeKeychain(account: bundleAccount, data: data)
+    private static func read<T>(_ body: (Bundle) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        ensureLoaded()
+        return body(bundle)
+    }
+
+    private static func ensureLoaded() {
+        guard !loaded else { return }
+        loaded = true
+        loadBundle()
+    }
+
+    private static func persistBundle(_ value: Bundle) -> Bool {
+        guard let data = try? JSONEncoder().encode(value),
+            writeKeychain(account: bundleAccount, data: data),
+            readKeychainData(account: bundleAccount) == data
+        else { return false }
+        return true
     }
 
     // MARK: - Keychain primitives
@@ -138,23 +181,23 @@ enum SecretsStore {
         return String(data: data, encoding: .utf8)
     }
 
-    private static func writeKeychain(account: String, data: Data) {
+    @discardableResult
+    private static func writeKeychain(account: String, data: Data) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        let update: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]
+        let update: [String: Any] = [kSecValueData as String: data]
         let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecSuccess { return true }
         if status == errSecItemNotFound {
             var add = query
             add[kSecValueData as String] = data
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(add as CFDictionary, nil)
+            return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
         }
+        return false
     }
 
     private static func deleteKeychain(account: String) {
@@ -172,13 +215,17 @@ enum SecretsStore {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func trimmed(_ value: String?) -> String? {
-        warmCache()
-        return normalized(value)
-    }
-
-    private static func isStored(_ value: String?) -> Bool {
-        warmCache()
-        return normalized(value) != nil
+    private static func generateServerAPIKey() -> String? {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = bytes.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+        }
+        guard status == errSecSuccess else {
+            return nil
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

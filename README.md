@@ -1,50 +1,46 @@
 # Forge
 
-SwiftPM package name: `forge_swift_open_source`
+Forge is a native macOS workbench for running local language models on Apple Silicon. Its single `mlx-forge` app combines a SwiftUI chat interface with two in-process inference paths:
 
-Forge is a native macOS app and SwiftPM workspace for running local language models on Apple Silicon with Swift, MLX, and an in-process GGUF backend.
+- MLX models through `mlx-swift-lm`, including supported local vision-language models.
+- Compatible GGUF models through the vendored `LLM.swift`/llama.cpp backend.
 
-Bring your own models — Qwen, GLM, Granite, IQuest, or any MLX-community or GGUF weights you keep on disk. Forge scans folders you point it at; it does not ship weights in this repo.
+Forge does not include model weights. Add folders you already own, or download MLX models from the in-app Hugging Face browser.
 
-The goal is a usable local model workbench:
+## Project status
 
-- Native SwiftUI chat interface for local MLX models.
-- GGUF model discovery and chat through `LLM.swift`.
-- Multiple loaded local models with explicit load, unload, and stop controls.
-- Chat-template sniffing: thinking toggle, repetition penalty, KV cache, and sampling defaults tuned for real MLX models.
-- Named system-prompt presets — the inspector shows which preset (or library file) is actually loaded, not just a word count.
-- Optional cloud providers (Anthropic, OpenAI, OpenRouter) with Keychain-backed API keys.
-- Loopback OpenAI-compatible API server for local agent tools.
-- App Store-safe MCP configuration for HTTP/SSE servers.
-- Headless command cheat sheet that composes commands for the operator to run manually.
-
-Forge does not ship model weights in this repository.
-
-## Launch status
-
-- Public repo: <https://github.com/christopherbattlefrontlegal/swift-mlx-forge>
-- Website: <https://christopherbattlefrontlegal.github.io/swift-mlx-forge/>
-- Releases: <https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases>
+- Public repository: <https://github.com/christopherbattlefrontlegal/swift-mlx-forge>
 - License: MIT
-- Install path today: source install with `./scripts/install-forge-app.sh`
-- Launch copy and repo metadata: [`LAUNCH.md`](LAUNCH.md)
+- Current distribution: source install
+- Public notarized binary: not available yet
 
-A public drag-and-drop `.app` download still needs Developer ID signing and notarization.
-Until then, the honest free path is source-installable: clone the repo, build locally, and
-bring your own MLX or GGUF model weights.
+The local installer creates an ad-hoc-signed app for the Mac that built it. A binary intended for other Macs still requires Developer ID signing and Apple notarization.
+
+## What the Forge app provides
+
+- Recursive, bounded discovery of MLX model directories and loose `.gguf` files in folders you explicitly add.
+- Explicit load, activate, unload, unload-all, and stop controls, with up to six reserved resident model slots.
+- Local MLX chat, supported MLX VLM image input, and a text-only GGUF chat path.
+- A four-model Room view with stable per-model speaker identity and `@1` through `@4` or `@all` targeting.
+- Selected-model local fan-out and confirmed multi-agent dispatch to loaded locals, the selected Claude model, and selected OpenRouter models.
+- Sampling, reasoning, thinking-budget, KV-cache, weight-loading, and system-prompt controls.
+- Saved system-prompt presets, prompt-library folders, and an optional Smart Select workflow.
+- Optional Anthropic, OpenAI, OpenRouter, Brave Search, and Hugging Face credentials stored in macOS Keychain.
+- MCP tools with explicit server trust, per-tool selection, and a bounded tool-follow-up loop.
+- A local OpenAI-compatible HTTP subset for tools that need to call a loaded model.
+- A command composer for reviewing and copying Claude Code headless commands. Forge does not execute those generated commands.
 
 ## Requirements
 
-- macOS 26+ (tested on macOS 27 beta / Golden Gate) with Swift 6.2+.
 - Apple Silicon Mac.
-- Xcode command line tools or Xcode with Swift 6.
-- Node.js/npm, used only when packaging the embedded design-prompt tool into `Forge.app`.
-- SwiftPM can resolve all dependencies directly from public git sources.
-- Optional: if you need local source overrides, use `swift package edit mlx-swift-lm`.
+- macOS 26 or newer.
+- Swift 6.2 or newer through Xcode or the Xcode command-line tools.
+- Network access during the first SwiftPM dependency resolution.
+- Your own MLX or compatible GGUF model files.
+- Node.js/npm only when `scripts/build-app.sh` needs to rebuild the embedded design-prompt web bundle.
+- Python 3 only for optional Smart Select searches against an external `awesome-prompts`-style `prompt_database` containing `search.py` and `get.py`.
 
-## Install
-
-The GitHub release is source-installable today. A public drag-and-drop binary still needs Developer ID signing and notarization.
+## Install the app
 
 ```sh
 git clone https://github.com/christopherbattlefrontlegal/swift-mlx-forge.git
@@ -52,123 +48,172 @@ cd swift-mlx-forge
 ./scripts/install-forge-app.sh
 ```
 
-That installs and opens `/Applications/Forge.app`. See `INSTALL.md` for the full path and signing notes.
+The installer:
 
-## Build
+1. checks the local toolchain and packaging security rules;
+2. builds the release `mlx-forge` product and MLX Metal library;
+3. packages the design-prompt bundle and llama.cpp framework;
+4. ad-hoc signs the complete bundle;
+5. installs `/Applications/Forge.app`; and
+6. opens it unless `--no-open` is supplied.
 
-From the repository root:
+Build a local bundle without installing it:
+
+```sh
+./scripts/build-app.sh
+open ./Forge.app
+```
+
+See [INSTALL.md](INSTALL.md) for signing and packaging details.
+
+## Build from SwiftPM
+
+Build the Forge application executable:
 
 ```sh
 swift build --product mlx-forge
 ```
 
-Run the app locally:
+Run the primary app directly from the source tree:
 
 ```sh
 swift run mlx-forge
 ```
 
-Install a signed `.app` bundle (recommended for daily use):
+The package deliberately pins a PrismML fork of `mlx-swift` to retain its 1-bit affine kernels. SwiftPM may report that this fork and the upstream transitive dependency share the `mlx-swift` identity; removing the direct fork changes supported model behavior rather than merely silencing a warning.
 
-```sh
-./scripts/install-forge-app.sh
-```
+## Add local models
 
-## Run
+Open **Settings → Model directories**, add a folder, then refresh the Model Library. Forge searches a maximum of six directory levels, skips hidden and symlinked subdirectories, and recognizes:
 
-```sh
-open /Applications/Forge.app
-# or
-open ./Forge.app
-```
+- an MLX directory containing `config.json` and model weights;
+- Hugging Face cache entries such as `models--org--name/snapshots/<revision>`; and
+- loose `.gguf` files.
 
-For command-line experimentation, SwiftPM also builds:
-
-- `mlx-runtime`
-- `mlx-studio`
-- `mlx-forge`
-
-## Models
-
-Forge scans default locations plus any folders you add in **Settings → Model directories**. Point it at a parent folder or a `mlx-community` cache — it discovers MLX and GGUF trees recursively.
-
-Example layout (your paths will differ):
+Example:
 
 ```text
 ~/Models/
-~/Models/mlx-community/
-  Qwen3-8B-4bit/
-  glm-4-9b-4bit/
-  granite-3.3-8b-instruct-4bit/
+  mlx-community/
+    Qwen3-8B-4bit/
+      config.json
+      model.safetensors
+  gguf/
+    example-model-Q4_K_M.gguf
 ```
 
-Keep model files outside git. Ignored weight formats in the repo include:
+Model folders and weights should remain outside this repository.
 
-- `.safetensors`
-- `.gguf`
-- `.mlx`
-- `.bin`
-- `.onnx`
-- `.pt`
-- `.pth`
+### Backend limits
 
-Use the app's model browser or user-selected folders to add local models on your machine.
+MLX support follows the model families and processors implemented by the pinned `mlx-swift-lm` release. Image attachments are decoded and passed to supported MLX VLMs; an ordinary text model may still reject them.
 
-## System prompt presets
+The GGUF path is not a promise that every GGUF architecture or chat template will work. Forge uses the llama.cpp build vendored in this repository and currently infers several chat-template families from the filename because `LLM.swift` does not expose every embedded Jinja template. GGUF chat is text-only in Forge.
 
-In the tuning inspector **System Prompt** section:
+## Images and file attachments
 
-- Pick a saved preset from the bookmark menu — the active preset name appears in ember next to the word count.
-- Save the current prompt as a named preset; saving also marks it active.
-- Load prompts from external folders via the chat toolbar library; the file name shows as the loaded source.
-- Manual edits switch the label to **Custom** until text matches a preset again.
+Attachments are always user-selected. Forge does not automatically transmit a newly chosen image.
 
-## Roadmap: Apple on-device AI (macOS 27+)
+- Images are limited to 25 MiB each, eight pending images, and 64 MiB total.
+- Text files are read as UTF-8 only, limited to 1 MiB, and clipped before insertion into the composer.
+- PDFs are size-checked before text extraction and their inserted text is clipped.
+- **Send** attaches images to the selected local or cloud model.
+- **Review** is a separate explicit action that uses an enabled vision MCP tool when available, otherwise the selected model.
+- Confirmed multi-agent fan-out warns that the same attachments will be sent to every selected target.
 
-Forge today runs MLX and GGUF directly. Apple's macOS 27 stack (Core AI `.aimodel` artifacts, Foundation Models `LanguageModelSession`) is the direction for a unified executor bridge — see [macOS 27 release notes](https://developer.apple.com/documentation/macos-release-notes/macos-27-release-notes) and [coreai-models](https://github.com/apple/coreai-models). MLXFoundationModels integration will land when it ships in the upstream MLX Swift LM package.
+Using a cloud target sends the prompt and selected attachments to that provider and may incur provider charges.
 
-## MCP
+## MCP security and configuration
 
-The App Store-safe MCP path is HTTP/SSE:
+The installed app stores its primary MCP configuration at:
 
-- HTTPS MCP servers are allowed.
-- Plain HTTP is allowed only on loopback: `127.0.0.1`, `localhost`, or `::1`.
-- Stdio MCP entries stay idle at launch and can be checked manually from the MCP UI in developer builds.
+```text
+~/Library/Application Support/Forge/mcp.json
+```
 
-Forge reads MCP server configuration from the local `mcp.json` in the project working directory.
-Run with a working directory that is your repo clone so Forge and the headless helper use that file only.
-Use `mcp.example.json` as a safe template before adding your own local server paths.
+A source-tree development run may discover the ignored `mcp.json` in the selected project/working directory. `mcp.example.json` is a reference template; do not commit credentials or machine-local command paths.
 
-## Local API Server
+External MCP entries are fail-closed:
 
-Forge can expose a local OpenAI-compatible API server on loopback. The server:
+- Forge records a SHA-256 fingerprint only when the user explicitly enables an entry.
+- A new entry, or any change to its command, arguments, environment, URL, or headers, is disabled until it is explicitly enabled again.
+- Startup loads configuration but does not immediately launch or connect every external server.
+- Disabling or reloading a server invalidates pending connection work and stops its stdio session.
+- Malformed JSON is left intact for repair; Forge never replaces it with an empty template.
 
-- Binds to `127.0.0.1` by default.
-- Can be explicitly exposed to LAN devices from Settings.
-- Enforces a Host allowlist.
-- Rejects cross-origin browser requests.
-- Does not emit wildcard CORS.
+Transport rules:
 
-Run a build before publishing changes:
+- HTTPS MCP endpoints are allowed.
+- Plain HTTP is allowed only for `127.0.0.1`, `localhost`, or `::1`.
+- Developer builds may run trusted, enabled stdio commands.
+- Mac App Store sandbox builds must use the built-in workspace tools or an HTTP bridge.
+
+The built-in `forge-commander` can access Forge's Application Support folder plus only the workspace folders explicitly granted in Settings. Tool selection has three distinct states: no saved selection means all current and future tools, a saved subset means only that subset, and an explicit empty selection means no tools.
+
+Model output can invoke MCP only through Forge's explicit call formats. Generic JSON in prose and content inside `<think>` reasoning blocks are not executable tool requests. Pressing **Stop** invalidates subsequent calls and model follow-ups in the same tool chain; it cannot undo a tool side effect that already started.
+
+## Local OpenAI-compatible API subset
+
+Enable the server in the Tuning inspector. It provides:
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+The server binds to `127.0.0.1` by default, validates `Host` and browser `Origin`, caps requested output at 32,768 tokens, and can auto-load a discovered model by name. It is an OpenAI-compatible subset, not a complete implementation of every OpenAI request field; the current request parser is text-oriented.
+
+Loopback clients can use any nonempty SDK placeholder key. When **Expose to LAN** is enabled, every non-OPTIONS request requires the exact Keychain-generated token shown in the inspector:
+
+```http
+Authorization: Bearer <Forge API key>
+```
+
+Example on the same Mac:
 
 ```sh
-swift build --product mlx-forge
+curl http://127.0.0.1:3737/v1/models
 ```
 
-## App Store Notes
+Example for LAN mode:
 
-This open-source snapshot excludes App Store submission assets. Local signing and App Store packaging workflows are maintained in a private/internal branch or repo.
+```sh
+curl \
+  -H "Authorization: Bearer <Forge API key>" \
+  http://<mac-lan-address>:3737/v1/models
+```
 
-## Repository Hygiene
+LAN mode uses plain HTTP, not TLS. Enable it only on a trusted network and treat the bearer token as a secret.
 
-This public repository intentionally excludes:
+## Cloud providers
 
-- SwiftPM build products.
-- App bundles.
-- `.DS_Store` files.
-- Local agent/editor settings.
-- Model weights and tokenizer caches.
+Add optional keys under **Settings → Cloud APIs**. Forge stores them as one Keychain-backed secret bundle and migrates older per-key entries only after a verified write.
+
+- Anthropic: Claude chat and selected agent dispatch.
+- OpenAI: Responses API chat with reasoning-summary streaming.
+- OpenRouter: selected multi-model chat, agent dispatch, and the coding loop.
+- Brave Search: Answers or Research mode.
+- Hugging Face: authenticated model discovery/downloads when needed.
+
+No cloud key is required for local MLX or GGUF inference.
+
+## Repository layout
+
+```text
+Sources/mlx-forge/    Forge application
+Vendor/LLM.swift/     Vendored GGUF/llama.cpp bridge
+BundledTools/         Embedded design-prompt source/build
+scripts/              Build, install, Metal, and security helpers
+site/                 Project website
+```
+
+## Known limitations
+
+- There is no publicly notarized drag-and-drop build yet.
+- The local HTTP API is a compatibility subset and does not currently accept OpenAI image-part requests.
+- GGUF compatibility depends on the vendored llama.cpp build and Forge's template inference.
+- Smart Select needs an external compatible prompt database and local Python 3.
+- Cloud model IDs and availability remain subject to their providers.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).

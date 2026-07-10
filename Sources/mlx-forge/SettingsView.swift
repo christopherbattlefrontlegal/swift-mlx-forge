@@ -661,7 +661,7 @@ private struct PromptLibrarySettings: View {
                 .tint(Theme.ember)
 
                 Button("Reload Prompts") {
-                    // Triggers re-scan on next menu open
+                    app.refreshPrompts()
                 }
                 .buttonStyle(.bordered)
 

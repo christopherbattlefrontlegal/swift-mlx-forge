@@ -41,7 +41,9 @@ struct ChatView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.backgroundGradient)
-        .sheet(isPresented: $showLargeTextPopup) {
+        .sheet(isPresented: $showLargeTextPopup, onDismiss: {
+            largeTextPopupContent = ""
+        }) {
             LargeTextView(text: largeTextPopupContent) {
                 showLargeTextPopup = false
             }
@@ -62,7 +64,7 @@ struct ModelSlotBar: View {
                 slotChip(index)
             }
             Spacer(minLength: Theme.s2)
-            if app.engine.loadedModels.count >= 2 {
+            if app.engine.loadedModels.count >= 2 || app.roomModeEnabled {
                 Button {
                     app.roomModeEnabled.toggle()
                 } label: {
@@ -78,6 +80,7 @@ struct ModelSlotBar: View {
                             in: Capsule())
                 }
                 .buttonStyle(.plain)
+                .disabled(app.isBusy)
                 .help(
                     app.roomModeEnabled
                         ? "Room on — split panes + shared channel. Click to return to single chat."
@@ -122,6 +125,7 @@ struct ModelSlotBar: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .disabled(app.isBusy)
             .help("Slot \(index + 1): \(entry.model.name)\(isActive ? " (active)" : "")")
         } else {
             Button {
@@ -207,8 +211,8 @@ private struct RoomSplitView: View {
     }
 }
 
-/// One model's pane in the room: its replies only, filtered from the shared
-/// transcript by slot number.
+/// One model's pane in the room: its replies only, filtered by stable model
+/// identity. The slot fallback keeps older saved conversations readable.
 private struct ModelPaneView: View {
     @Environment(AppState.self) private var app
     let model: AppState.RoomModel
@@ -216,7 +220,12 @@ private struct ModelPaneView: View {
     var onShowLargeText: (String) -> Void = { _ in }
 
     private var messages: [ChatMessage] {
-        conversation.messages.filter { $0.slotNumber == model.slot }
+        conversation.messages.filter { message in
+            if let producerModelID = message.producerModelID {
+                return producerModelID == model.modelID
+            }
+            return message.slotNumber == model.slot
+        }
     }
 
     private var isStreaming: Bool {
@@ -245,7 +254,7 @@ private struct ModelPaneView: View {
             .background(.white.opacity(0.04))
 
             ScrollView {
-                VStack(alignment: .leading, spacing: Theme.s3) {
+                LazyVStack(alignment: .leading, spacing: Theme.s3) {
                     if messages.isEmpty {
                         Text("Waiting for @\(model.slot) or @all…")
                             .font(.caption)
@@ -344,7 +353,7 @@ struct TranscriptView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.s4) {
+            LazyVStack(alignment: .leading, spacing: Theme.s4) {
                 // Unmissable load state: a 100GB GGUF takes minutes to come up,
                 // and the thin composer caption was the only signal before.
                 if let loading = app.engine.loadingModels.first {
@@ -533,7 +542,7 @@ struct MessageView: View {
 
     private var header: some View {
         HStack(spacing: Theme.s2) {
-            ForgeMark(size: 12)
+            ForgeMark(size: 12, animated: false)
             Text(message.modelName ?? "Assistant")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
@@ -783,6 +792,10 @@ struct ComposerView: View {
 
     @State private var showPhotoPicker = false
     @State private var pendingImages: [Data] = []
+    @State private var attachmentError: String?
+    @State private var isPreparingAttachments = false
+    @State private var attachmentImportID: UUID?
+    @State private var attachmentImportTask: Task<Void, Never>?
 
     // Mode states for the frontline-style top bar (Depth/Style/Deliverable/Workflow).
     // On send we tag the prompt so the model adapts (works for both local and Claude).
@@ -797,6 +810,28 @@ struct ComposerView: View {
     @State private var showAnthropicModelPicker = false
     @State private var showOpenAIModelPicker = false
     @State private var customOpenRouterModel = ""
+    @State private var confirmDispatchAll = false
+
+    nonisolated private static let maxImageBytes = 25 * 1_024 * 1_024
+    nonisolated private static let maxPendingImageBytes = 64 * 1_024 * 1_024
+    nonisolated private static let maxPendingImageCount = 8
+    nonisolated private static let maxTextBytes = 1 * 1_024 * 1_024
+    nonisolated private static let maxPDFBytes = 50 * 1_024 * 1_024
+    nonisolated private static let maxInlineChars = 30_000
+    nonisolated private static let maxAttachmentFileCount = 20
+    nonisolated private static let maxComposerAttachmentChars = 120_000
+
+    private enum PreparedAttachment: Sendable {
+        case image(name: String, data: Data)
+        case text(name: String, content: String, clipped: Bool)
+        case failure(String)
+        case cancelled
+    }
+
+    private enum BoundedRead: Sendable {
+        case success(Data)
+        case failure(String)
+    }
 
     var body: some View {
         @Bindable var app = app
@@ -884,6 +919,46 @@ struct ComposerView: View {
                 .padding(.top, Theme.s3)
                 .padding(.bottom, Theme.s1)
 
+                if isPreparingAttachments || !pendingImages.isEmpty || attachmentError != nil {
+                    HStack(spacing: Theme.s2) {
+                        if isPreparingAttachments {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Reading attachment…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if !pendingImages.isEmpty {
+                            Label(
+                                "\(pendingImages.count) image\(pendingImages.count == 1 ? "" : "s") · \(Format.bytes(pendingImages.reduce(0) { $0 + $1.count }))",
+                                systemImage: "paperclip")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Theme.emberGlow)
+                        }
+                        if let attachmentError {
+                            Text(attachmentError)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: 0)
+                        if !pendingImages.isEmpty || isPreparingAttachments {
+                            Button(pendingImages.isEmpty ? "Cancel" : "Clear Images") {
+                                clearPendingAttachments()
+                            }
+                                .font(.caption)
+                                .buttonStyle(.borderless)
+                                .help("Cancel attachment reading and remove all pending images")
+                        } else if attachmentError != nil {
+                            Button("Dismiss") { attachmentError = nil }
+                                .font(.caption)
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.horizontal, Theme.s3)
+                    .padding(.bottom, Theme.s1)
+                }
+
                 // Bottom command bar. Sections are deliberately spread across the wide composer
                 // so the controls read as grouped actions instead of one cramped icon run.
                 HStack(spacing: 0) {
@@ -897,14 +972,16 @@ struct ComposerView: View {
                         .help("Attach photo for review or context (user-selected; sandbox-safe). Data is available for local VLM or MCP photo-review tools.")
 
                         Button {
+                            let images = pendingImages
                             Task {
-                                await app.reviewAttachedPhotoWithMCP(using: pendingImages)
+                                await app.reviewAttachedPhotoWithMCP(using: images)
                             }
                         } label: {
                             ToolbarIcon("eye.circle")
                         }
                         .buttonStyle(.plain)
-                        .help("Review attached photo(s) using a connected MCP photo/vision tool")
+                        .disabled(pendingImages.isEmpty || isPreparingAttachments)
+                        .help("Explicitly send the attached photo to a selected vision MCP tool or the active model for review")
 
                         Button {
                             pickFiles()
@@ -1067,7 +1144,7 @@ struct ComposerView: View {
                     Spacer(minLength: Theme.s6)
 
                     HStack(spacing: Theme.s3) {
-                        // Right side as requested: loaded model name, API server switch, cloud provider switches
+                        // Right side: local API and cloud-provider controls.
                         HStack(spacing: Theme.s1) {
                             Text("API")
                                 .font(.callout.weight(.semibold))
@@ -1252,12 +1329,15 @@ struct ComposerView: View {
                             Image(systemName: "arrow.up")
                                 .font(.body.weight(.bold))
                                 .frame(width: 24, height: 24)
-                                .background(app.canSend ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.quaternary))
+                                .background(
+                                    app.canSend && !isPreparingAttachments
+                                        ? AnyShapeStyle(Theme.emberGradient)
+                                        : AnyShapeStyle(.quaternary))
                                 .foregroundStyle(.white)
                                 .clipShape(.circle)
                         }
                         .buttonStyle(.plain)
-                        .disabled(!app.canSend)
+                        .disabled(!app.canSend || isPreparingAttachments)
                         .keyboardShortcut(.return, modifiers: .command)
                         .help("Send (⌘↩)")
                     }
@@ -1278,6 +1358,18 @@ struct ComposerView: View {
         .popover(isPresented: $showAgentDispatch, arrowEdge: .top) {
             agentDispatchPopover
         }
+        .confirmationDialog(
+            "Dispatch \(dispatchAllTargets.count) separate requests?",
+            isPresented: $confirmDispatchAll,
+            titleVisibility: .visible
+        ) {
+            Button("Dispatch \(dispatchAllTargets.count) Requests", role: .destructive) {
+                dispatchToAll()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(dispatchAllConfirmationMessage)
+        }
         .background(.clear)
         .onAppear { focused = true }
         .fileImporter(
@@ -1288,41 +1380,10 @@ struct ComposerView: View {
             switch result {
             case .success(let urls):
                 if let url = urls.first {
-                    let didStart = url.startAccessingSecurityScopedResource()
-                    defer { if didStart { url.stopAccessingSecurityScopedResource() } }
-
-                    if let data = try? Data(contentsOf: url) {
-                        pendingImages.append(data)
-
-                        // Visual token in the text so the user sees the attachment.
-                        // The actual Data travels with the message on send.
-                        // See AppState.reviewAttachedPhotoWithMCP for how this Data is base64'd and
-                        // sent to an MCP "review_photo" tool under "image_base64".
-                        let token = "[photo:\(url.lastPathComponent)]"
-                        if app.composerText.isEmpty {
-                            app.composerText = token + " "
-                        } else {
-                            app.composerText += " " + token
-                        }
-
-                        // Auto Review Photo with MCP if a suitable connected server exists (per strict list "either auto or button").
-                        let hasSuitable = app.mcp.entries.contains { entry in
-                            if case .connected = entry.status {
-                                let idLower = entry.id.lowercased()
-                                return idLower.contains("photo") || idLower.contains("vision") || idLower.contains("review") || idLower.contains("image")
-                            }
-                            return false
-                        }
-                        if hasSuitable {
-                            Task {
-                                await app.reviewAttachedPhotoWithMCP(using: pendingImages)
-                            }
-                        }
-                    }
+                    beginAttachmentImport([url], imagesOnly: true)
                 }
             case .failure(let error):
-                // Surface in a real app (e.g. via a toast or lastError).
-                print("Photo picker error: \(error)")
+                attachmentError = "Photo picker failed: \(error.localizedDescription)"
             }
         }
     }
@@ -1447,48 +1508,183 @@ struct ComposerView: View {
         panel.allowsMultipleSelection = true
         panel.prompt = "Attach"
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls {
-            attachFile(url)
+        beginAttachmentImport(panel.urls, imagesOnly: false)
+    }
+
+    private func clearPendingAttachments() {
+        attachmentImportID = nil
+        attachmentImportTask?.cancel()
+        attachmentImportTask = nil
+        isPreparingAttachments = false
+        pendingImages.removeAll()
+        attachmentError = nil
+    }
+
+    private func beginAttachmentImport(_ urls: [URL], imagesOnly: Bool) {
+        guard !urls.isEmpty else { return }
+        attachmentImportTask?.cancel()
+        let selectedURLs = Array(urls.prefix(Self.maxAttachmentFileCount))
+        let skippedCount = urls.count - selectedURLs.count
+        let importID = UUID()
+        attachmentImportID = importID
+        isPreparingAttachments = true
+        attachmentError = nil
+        attachmentImportTask = Task { @MainActor in
+            defer {
+                if attachmentImportID == importID {
+                    attachmentImportID = nil
+                    attachmentImportTask = nil
+                    isPreparingAttachments = false
+                }
+            }
+            for url in selectedURLs {
+                guard !Task.isCancelled, attachmentImportID == importID else { return }
+                if imagesOnly, pendingImages.count >= Self.maxPendingImageCount {
+                    attachmentError =
+                        "Attachment limit reached (\(Self.maxPendingImageCount) images)."
+                    break
+                }
+                let prepared = await Self.prepareAttachment(at: url, imagesOnly: imagesOnly)
+                guard !Task.isCancelled, attachmentImportID == importID else { return }
+                applyPreparedAttachment(prepared)
+            }
+            if skippedCount > 0, attachmentError == nil {
+                attachmentError =
+                    "Attached the first \(Self.maxAttachmentFileCount) files; skipped \(skippedCount)."
+            }
         }
     }
 
-    private func attachFile(_ url: URL) {
-        let maxInlineChars = 30_000
-        let ext = url.pathExtension.lowercased()
-        let name = url.lastPathComponent
-
-        if ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "bmp"].contains(ext) {
-            if let data = try? Data(contentsOf: url) {
-                pendingImages.append(data)
-                app.composerText += (app.composerText.isEmpty ? "" : "\n") + "[photo:\(name)]"
+    private func applyPreparedAttachment(_ attachment: PreparedAttachment) {
+        switch attachment {
+        case .image(let name, let data):
+            guard pendingImages.count < Self.maxPendingImageCount else {
+                attachmentError = "Attachment limit reached (\(Self.maxPendingImageCount) images)."
+                return
             }
-            return
+            let pendingBytes = pendingImages.reduce(0) { $0 + $1.count }
+            guard pendingBytes + data.count <= Self.maxPendingImageBytes else {
+                attachmentError = "Pending images may total at most \(Format.bytes(Self.maxPendingImageBytes))."
+                return
+            }
+            pendingImages.append(data)
+            if app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                app.composerText = "Review the attached image \(name)."
+            }
+        case .text(let name, let content, let clipped):
+            let clippedNote = clipped
+                ? "\n… [clipped to first \(Self.maxInlineChars) characters]" : ""
+            let block =
+                (app.composerText.isEmpty ? "" : "\n\n")
+                + "[file: \(name)]\n```\n\(content)\(clippedNote)\n```"
+            guard app.composerText.count + block.count <= Self.maxComposerAttachmentChars else {
+                attachmentError =
+                    "Inline attachments may use at most \(Self.maxComposerAttachmentChars) characters in the composer."
+                return
+            }
+            app.composerText += block
+        case .failure(let message):
+            attachmentError = message
+        case .cancelled:
+            break
+        }
+    }
+
+    private nonisolated static func prepareAttachment(
+        at url: URL, imagesOnly: Bool
+    ) async -> PreparedAttachment {
+        let worker = Task.detached(priority: .userInitiated) {
+            prepareAttachmentSynchronously(at: url, imagesOnly: imagesOnly)
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private nonisolated static func prepareAttachmentSynchronously(
+        at url: URL, imagesOnly: Bool
+    ) -> PreparedAttachment {
+        guard !Task.isCancelled else { return .cancelled }
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+
+        let name = url.lastPathComponent
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        let ext = url.pathExtension.lowercased()
+        let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "bmp"])
+
+        if imagesOnly || imageExtensions.contains(ext) {
+            switch boundedData(at: url, limit: maxImageBytes) {
+            case .success(let data):
+                return data.isEmpty
+                    ? .failure("\(name) is empty.")
+                    : .image(name: name, data: data)
+            case .failure(let message):
+                return .failure("Could not attach \(name): \(message)")
+            }
         }
 
-        var text: String?
         if ext == "pdf" {
-            text = PDFDocument(url: url)?.string
-        } else if let utf8 = try? String(contentsOf: url, encoding: .utf8) {
-            text = utf8
-        } else if let latin = try? String(contentsOf: url, encoding: .isoLatin1) {
-            text = latin
+            guard let size = fileSize(at: url) else {
+                return .failure("Could not determine the size of \(name).")
+            }
+            guard size <= maxPDFBytes else {
+                return .failure("\(name) is \(Format.bytes(size)); PDFs are limited to \(Format.bytes(maxPDFBytes)).")
+            }
+            guard !Task.isCancelled else { return .cancelled }
+            guard let raw = PDFDocument(url: url)?.string,
+                !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                return .failure("Could not extract text from \(name).")
+            }
+            let clipped = raw.count > maxInlineChars
+            return .text(
+                name: name,
+                content: clipped ? String(raw.prefix(maxInlineChars)) : raw,
+                clipped: clipped)
         }
 
-        guard var content = text, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            app.composerText +=
-                (app.composerText.isEmpty ? "" : "\n")
-                + "[could not read \(name) — unsupported or empty file]"
-            return
+        switch boundedData(at: url, limit: maxTextBytes) {
+        case .success(let data):
+            guard !Task.isCancelled else { return .cancelled }
+            let raw = String(data: data, encoding: .utf8)
+            guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .failure("\(name) is unsupported, binary, or empty.")
+            }
+            let clipped = raw.count > maxInlineChars
+            return .text(
+                name: name,
+                content: clipped ? String(raw.prefix(maxInlineChars)) : raw,
+                clipped: clipped)
+        case .failure(let message):
+            return .failure("Could not attach \(name): \(message)")
         }
-        var clippedNote = ""
-        if content.count > maxInlineChars {
-            content = String(content.prefix(maxInlineChars))
-            clippedNote = "\n… [clipped to first \(maxInlineChars) characters]"
+    }
+
+    private nonisolated static func boundedData(
+        at url: URL, limit: Int
+    ) -> BoundedRead {
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: limit + 1) ?? Data()
+            guard data.count <= limit else {
+                return .failure("file exceeds the \(Format.bytes(limit)) limit")
+            }
+            return .success(data)
+        } catch {
+            return .failure(error.localizedDescription)
         }
-        app.composerText +=
-            (app.composerText.isEmpty ? "" : "\n\n")
-            + "[file: \(name)]\n```\n\(content)\(clippedNote)\n```"
+    }
+
+    private nonisolated static func fileSize(at url: URL) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let size = attributes[.size] as? NSNumber
+        else { return nil }
+        return size.intValue
     }
 
     /// Mode tags prepended to every send/dispatch; the Workflow pick joins the
@@ -1502,6 +1698,7 @@ struct ComposerView: View {
     }
 
     private func performSend() {
+        guard !isPreparingAttachments else { return }
         // Room mode: route through the room round (sequential turns, shared
         // channel). Mode tags are skipped — the room preamble does that job.
         if app.isRoomActive {
@@ -1531,18 +1728,19 @@ struct ComposerView: View {
     }
 
     private func dispatchTo(target: AppState.AgentTarget) {
-        var text = app.composerText
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // Support clicking additional agents from the popover after the first one cleared the box,
-            // or when composer is empty: re-use the last user prompt as the task for this agent.
-            if let lastUser = app.selectedConversation?.messages.last(where: { $0.role == .user })?.content {
-                text = lastUser
-            }
+        switch target {
+        case .claude where !app.hasAnthropicKey:
+            attachmentError = "Add an Anthropic API key before dispatching to Claude."
+            return
+        case .openRouter where !app.hasOpenRouterKey:
+            attachmentError = "Add an OpenRouter API key before dispatching to OpenRouter."
+            return
+        default:
+            break
         }
-        let tags = modeTags
-        if !text.hasPrefix("[Depth:") && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            text = tags + text
-        }
+
+        let text = modeTaggedDispatchPrompt
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let imgs = pendingImages
         pendingImages = []
         app.dispatchToAgent(prompt: text, target: target, images: imgs)
@@ -1550,25 +1748,75 @@ struct ComposerView: View {
     }
 
     private func dispatchToAll() {
-        let tags = modeTags
-        var text = app.composerText
-        if !text.hasPrefix("[Depth:") && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            text = tags + text
-        }
+        let text = modeTaggedDispatchPrompt
+        let targets = dispatchAllTargets
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            !targets.isEmpty,
+            !isPreparingAttachments
+        else { return }
+
         let imgs = pendingImages
         pendingImages = []
         app.composerText = ""
-        let loaded = Array(app.engine.loadedModels.enumerated())
-        for (idx, entry) in loaded {
-            let sname = shortNameForButton(entry.model)
-            app.dispatchToAgent(prompt: text, target: .local(modelID: entry.id, number: idx + 1, shortName: sname), images: imgs)
+        for target in targets {
+            app.dispatchToAgent(prompt: text, target: target, images: imgs)
         }
-        for clm in AnthropicClient.models {
-            app.dispatchToAgent(prompt: text, target: .claude(modelID: clm.id, label: clm.label), images: imgs)
+    }
+
+    /// The task currently in the composer, or the last user task when the
+    /// popover remains open after dispatching to one agent.
+    private var dispatchPromptCandidate: String {
+        let current = app.composerText
+        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return current
         }
-        for model in OpenRouterClient.models {
-            app.dispatchToAgent(prompt: text, target: .openRouter(modelID: model.id, label: model.label), images: imgs)
+        return app.selectedConversation?.messages.last(where: { $0.role == .user })?.content ?? ""
+    }
+
+    private var modeTaggedDispatchPrompt: String {
+        let prompt = dispatchPromptCandidate
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+        return prompt.hasPrefix("[Depth:") ? prompt : modeTags + prompt
+    }
+
+    /// "All" is deliberately bounded to targets the user has actually loaded
+    /// or selected and whose provider key is available. It never fans out over
+    /// every model advertised by a provider.
+    private var dispatchAllTargets: [AppState.AgentTarget] {
+        var targets: [AppState.AgentTarget] = []
+        for (index, entry) in app.engine.loadedModels.enumerated() {
+            targets.append(
+                .local(
+                    modelID: entry.id,
+                    number: index + 1,
+                    shortName: shortNameForButton(entry.model)))
         }
+        if app.hasAnthropicKey, let modelID = app.claudeModelID, !modelID.isEmpty {
+            targets.append(.claude(modelID: modelID, label: AnthropicClient.label(for: modelID)))
+        }
+        if app.hasOpenRouterKey {
+            for modelID in app.openRouterModelIDs where !modelID.isEmpty {
+                targets.append(
+                    .openRouter(modelID: modelID, label: OpenRouterClient.label(for: modelID)))
+            }
+        }
+        return targets
+    }
+
+    private var dispatchAllConfirmationMessage: String {
+        let attachmentNotice: String
+        if pendingImages.isEmpty {
+            attachmentNotice = "No image attachments will be sent."
+        } else {
+            attachmentNotice = "The same \(pendingImages.count) image attachment\(pendingImages.count == 1 ? "" : "s") will be sent to every target."
+        }
+        return "This will start \(dispatchAllTargets.count) separate model requests. \(attachmentNotice)"
+    }
+
+    private var canDispatchAll: Bool {
+        !dispatchAllTargets.isEmpty
+            && !modeTaggedDispatchPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isPreparingAttachments
     }
 
     private var placeholder: String {
@@ -1732,6 +1980,7 @@ struct ComposerView: View {
                                 .font(.caption2.weight(.medium))
                         }
                         .buttonStyle(.bordered)
+                        .disabled(!app.hasAnthropicKey)
                     }
                 }
             }
@@ -1749,19 +1998,23 @@ struct ComposerView: View {
                                 .font(.caption2.weight(.medium))
                         }
                         .buttonStyle(.bordered)
+                        .disabled(!app.hasOpenRouterKey)
                     }
                 }
             }
 
             HStack {
                 Button {
-                    dispatchToAll()
+                    confirmDispatchAll = true
                 } label: {
-                    Label("All agents at once ▶", systemImage: "paperplane.fill")
+                    Label(
+                        "All configured (\(dispatchAllTargets.count)) ▶",
+                        systemImage: "paperplane.fill")
                         .font(.caption2.bold())
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.ember)
+                .disabled(!canDispatchAll)
 
                 Spacer()
 

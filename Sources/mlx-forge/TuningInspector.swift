@@ -232,30 +232,33 @@ struct TuningInspector: View {
                         label: "Port", value: $app.serverPort,
                         limit: 1024...65535)
 
-                    // OpenAI SDKs (LangGraph, LangChain, openai-python…) refuse to
-                    // start without an api_key. Forge doesn't check it — any
-                    // non-empty value passes; this gives users one to paste.
+                    // Persistent bearer credential used by OpenAI-compatible clients.
+                    // It is generated once, stored in Keychain, and never editable here.
                     HStack(spacing: Theme.s2) {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("API key")
                                 .font(.callout)
-                            Text("Clients require one; Forge accepts any value")
+                            Text("Stored in Keychain; required for LAN access")
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
                         Spacer()
-                        Text("forge-local")
+                        Text(app.serverAPIKey.isEmpty ? "Unavailable" : app.serverAPIKey)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 170)
                             .textSelection(.enabled)
                         Button {
                             NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString("forge-local", forType: .string)
+                            NSPasteboard.general.setString(app.serverAPIKey, forType: .string)
                         } label: {
                             Image(systemName: "doc.on.doc")
                                 .font(.caption)
                         }
                         .buttonStyle(.plain)
+                        .disabled(app.serverAPIKey.isEmpty)
                         .help("Copy the API key for OpenAI-compatible clients")
                     }
 
@@ -273,6 +276,22 @@ struct TuningInspector: View {
                     .help(
                         "Binds the server to all interfaces so other devices on your network "
                             + "can reach it at the addresses shown below. Off = loopback only.")
+
+                    if app.serverExposeToNetwork && app.serverAPIKey.isEmpty {
+                        Label(
+                            "LAN access is fail-closed because Forge could not load an API key from Keychain.",
+                            systemImage: "exclamationmark.octagon.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if app.serverExposeToNetwork {
+                        Label(
+                            "LAN exposure is enabled. Clients must send this bearer key; treat it as a secret.",
+                            systemImage: "exclamationmark.shield.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     switch app.server.state {
                     case .running:
@@ -351,7 +370,7 @@ struct TuningInspector: View {
                     }
                     if app.runtimeUpdates.updatesAvailable {
                         Text(
-                            "Runtimes are compiled in — run scripts/update-runtimes.sh to bump the pins and rebuild Forge.app."
+                            "The runtime is compiled in. Update the mlx-swift-lm pin in Package.swift, review upstream changes, then rebuild Forge."
                         )
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -734,7 +753,7 @@ private struct MCPInspectorRow: View {
         return tools.filter { selected.contains($0.name) }
     }
     private var usesImplicitAllTools: Bool {
-        app.mcp.selectedTools(for: entry.id).isEmpty && !tools.isEmpty
+        app.mcp.usesImplicitAllTools(for: entry.id) && !tools.isEmpty
     }
 
     var body: some View {

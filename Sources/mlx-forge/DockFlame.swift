@@ -4,8 +4,8 @@
 // .icns). But while the app is RUNNING we own the Dock icon — so Forge's Dock
 // icon literally burns.
 //
-// Transport: `NSApp.applicationIconImage`, pushed ~8×/sec. Frames render OFF the
-// main thread; only the NSImage handoff runs on main. The timer uses the default
+// Transport: `NSApp.applicationIconImage`, pushed ~8×/sec. Animated frames render
+// off the main actor; only the NSImage handoff runs on main. The timer uses the default
 // run-loop mode (not `.common`) and pauses during live window resize so split
 // bars and edge drags stay responsive.
 
@@ -14,18 +14,24 @@ import AppKit
 @MainActor
 final class DockFlame {
     private var timer: Timer?
+    private var renderTask: Task<Void, Never>?
     private let renderer = FlameIconRenderer()
     private var pausedForResize = false
     private var renderGeneration = 0
+    private var isPrimed = false
+    private var isStarted = false
 
     /// Paint the first animated frame immediately so the Dock never flashes the
     /// static bundle icon before the flame loop starts.
     func prime() {
         NSApp.applicationIconImage = renderer.renderNextFrame()
+        isPrimed = true
     }
 
     func start() {
-        prime()
+        if !isPrimed { prime() }
+        guard !isStarted else { return }
+        isStarted = true
         startTimer()
         let nc = NotificationCenter.default
         nc.addObserver(
@@ -43,9 +49,13 @@ final class DockFlame {
     }
 
     func stop() {
+        isStarted = false
+        isPrimed = false
         NotificationCenter.default.removeObserver(self)
         timer?.invalidate()
         timer = nil
+        renderTask?.cancel()
+        renderTask = nil
         renderGeneration += 1
         NSApp.applicationIconImage = nil
     }
@@ -53,7 +63,7 @@ final class DockFlame {
     private func startTimer() {
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 8.0, repeats: true) { [weak self] _ in
-            self?.pushNextFrame()
+            Task { @MainActor [weak self] in self?.pushNextFrame() }
         }
         // Default mode — do NOT use `.common` (that fires during resize drags and
         // competes with window splitters / sliders for main-thread time).
@@ -62,16 +72,29 @@ final class DockFlame {
     }
 
     private func pushNextFrame() {
-        guard !pausedForResize else { return }
+        guard !pausedForResize, renderTask == nil else { return }
         let generation = renderGeneration
-        let image = renderer.renderNextFrame()
-        guard generation == renderGeneration else { return }
-        NSApp.applicationIconImage = image
+        let renderer = renderer
+        renderTask = Task { @MainActor [weak self] in
+            let frame = await Task.detached(priority: .utility) {
+                SendableIconFrame(image: renderer.renderNextFrame())
+            }.value
+            guard let self else { return }
+            self.renderTask = nil
+            guard !Task.isCancelled,
+                generation == self.renderGeneration,
+                !self.pausedForResize,
+                self.timer != nil
+            else { return }
+            NSApp.applicationIconImage = frame.image
+        }
     }
 
     @objc private func pause() {
         timer?.invalidate()
         timer = nil
+        renderTask?.cancel()
+        renderTask = nil
     }
 
     @objc private func resume() {
@@ -84,6 +107,8 @@ final class DockFlame {
         pausedForResize = true
         timer?.invalidate()
         timer = nil
+        renderTask?.cancel()
+        renderTask = nil
     }
 
     @objc private func resumeFromResize() {
@@ -95,6 +120,12 @@ final class DockFlame {
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
+}
+
+/// `NSImage` does not declare `Sendable`, but each frame is fully constructed on
+/// one worker and is immutable before it crosses to the main actor for display.
+private struct SendableIconFrame: @unchecked Sendable {
+    let image: NSImage
 }
 
 /// Renders one flame frame as an NSImage. Thread-safe — drawing never blocks UI.

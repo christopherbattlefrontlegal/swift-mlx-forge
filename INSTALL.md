@@ -36,13 +36,11 @@ open ./Forge.app
 
 ## MCP Config
 
-Forge starts with an empty MCP config. Copy the template only if you want to edit local MCP servers:
-
-```sh
-cp mcp.example.json mcp.json
-```
-
-`mcp.json` is intentionally ignored by git because it can contain machine-local paths and credentials.
+The installed app seeds an empty config at
+`~/Library/Application Support/Forge/mcp.json`. A development run from the source
+tree may use the ignored repository `mcp.json`; `mcp.example.json` is only a
+reference template. New or changed external entries remain disabled until you
+explicitly enable and trust their current configuration in Forge.
 
 ## Public Binary Status
 

@@ -1,11 +1,10 @@
 // Forge — inference runtime update checker.
 //
-// The runtimes (mlx-swift-lm for MLX, LLM.swift for GGUF/llama.cpp) are compiled
-// into the app by SwiftPM — they cannot be hot-swapped at runtime the way LM
-// Studio downloads runtime packs. What Forge does instead: check the upstream
-// GitHub releases once a day (and on demand), surface "update available" in the
-// Tuning panel, and ship `scripts/update-runtimes.sh` which bumps the pins,
-// rebuilds, and repackages Forge.app in one step.
+// The MLX runtime is compiled into the app by SwiftPM and cannot be hot-swapped.
+// Forge checks its upstream release once a day and tells source builders when a
+// manual Package.swift update and rebuild may be available. The GGUF backend is
+// a locally vendored, patched LLM.swift/llama.cpp build, so comparing it with an
+// unrelated upstream release would be misleading and is intentionally omitted.
 
 import Foundation
 import Observation
@@ -14,11 +13,8 @@ import Observation
 @Observable
 final class RuntimeUpdateChecker {
 
-    /// Pinned runtime versions. `scripts/update-runtimes.sh` rewrites these in
-    /// lock-step with Package.swift — keep the literal formatting intact.
     static let pinnedRuntimes: [(id: String, label: String, repo: String, version: String)] = [
         ("mlx", "MLX runtime (mlx-swift-lm)", "ml-explore/mlx-swift-lm", "3.31.4"),
-        ("gguf", "GGUF runtime (LLM.swift · llama.cpp)", "eastriverlee/LLM.swift", "2.1.0"),
     ]
 
     struct RuntimeStatus: Identifiable {
@@ -64,16 +60,20 @@ final class RuntimeUpdateChecker {
         lastError = nil
         Task {
             defer { isChecking = false }
+            var successfulChecks = 0
             for index in statuses.indices {
                 let repo = statuses[index].repo
                 do {
                     statuses[index].latest = try await Self.latestReleaseTag(repo: repo)
+                    successfulChecks += 1
                 } catch {
                     lastError = "Update check failed for \(repo): \(error.localizedDescription)"
                 }
             }
-            lastChecked = Date()
-            UserDefaults.standard.set(lastChecked, forKey: Self.lastCheckedKey)
+            if successfulChecks > 0 {
+                lastChecked = Date()
+                UserDefaults.standard.set(lastChecked, forKey: Self.lastCheckedKey)
+            }
         }
     }
 

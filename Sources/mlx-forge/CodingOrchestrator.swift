@@ -81,6 +81,7 @@ enum CodingOrchestrator {
     ) async throws -> String {
         var artifact = ""
         var lastTester = ""
+        var context = ""
 
         // maxRounds <= 0 means "disabled" — don't silently run one full round (5 LLM calls).
         guard config.maxRounds > 0 else {
@@ -96,7 +97,8 @@ enum CodingOrchestrator {
                 await onPhaseStart(round, phase)
 
                 let user = buildUserPrompt(
-                    task: task, phase: phase, round: round, artifact: artifact, lastTester: lastTester)
+                    task: task, phase: phase, round: round, artifact: artifact,
+                    context: context, lastTester: lastTester)
                 let reply = try await client.complete(
                     model: config.modelID,
                     system: phase.systemPrompt,
@@ -110,6 +112,7 @@ enum CodingOrchestrator {
                 if phase == .tester {
                     lastTester = reply
                 }
+                context += "\n\n[Round \(round) · \(phase.title)]\n\(reply)"
 
                 await onPhaseComplete(round, phase, reply)
                 await onAppend(
@@ -121,7 +124,7 @@ enum CodingOrchestrator {
                     """)
             }
 
-            if lastTester.uppercased().contains("VERDICT: PASS") {
+            if hasPassingVerdict(lastTester) {
                 await onAppend("\n\n✅ **Code loop finished** — tester signed off in round \(round).\n")
                 return artifact
             }
@@ -141,7 +144,7 @@ enum CodingOrchestrator {
                         reasoningEnabled: false, maxTokens: 2048))
                 await onPhaseComplete(round, .orchestrator, steer)
                 await onAppend("\n\n## Round \(round) · Orchestrator\n\n\(steer)\n")
-                artifact = artifact + "\n\n[Orchestrator steering]\n" + steer
+                context += "\n\n[Round \(round) · Orchestrator steering]\n\(steer)"
             }
         }
 
@@ -151,16 +154,29 @@ enum CodingOrchestrator {
     }
 
     private static func buildUserPrompt(
-        task: String, phase: Phase, round: Int, artifact: String, lastTester: String
+        task: String, phase: Phase, round: Int, artifact: String,
+        context: String, lastTester: String
     ) -> String {
         var parts = ["User task:\n\(task)", "Round: \(round)"]
+        if !context.isEmpty {
+            parts.append("Prior phase outputs (authoritative loop context):\n\(context)")
+        }
         if !artifact.isEmpty {
-            parts.append("Current implementation / context:\n\(artifact)")
+            parts.append("Latest implementation artifact:\n\(artifact)")
         }
         if phase != .planner, !lastTester.isEmpty {
             parts.append("Previous tester output:\n\(lastTester)")
         }
         parts.append("Your role: \(phase.title). Respond in markdown.")
         return parts.joined(separator: "\n\n")
+    }
+
+    private static func hasPassingVerdict(_ text: String) -> Bool {
+        guard let verdict = text.split(whereSeparator: \.isNewline)
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .last(where: { !$0.isEmpty })
+        else { return false }
+        let upper = verdict.uppercased()
+        return upper == "VERDICT: PASS" || upper.hasPrefix("VERDICT: PASS ")
     }
 }

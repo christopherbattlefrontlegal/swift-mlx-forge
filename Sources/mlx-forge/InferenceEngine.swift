@@ -6,6 +6,7 @@
 // ChatSessions keep KV caches alive across turns.
 
 import AppKit
+import CoreImage
 import Foundation
 import MLX
 import MLXHuggingFace
@@ -16,6 +17,12 @@ import Observation
 import Tokenizers
 import os.log
 
+private struct BudgetTurn: Sendable {
+    var role: String
+    var content: String
+    var images: [Data] = []
+}
+
 @MainActor
 @Observable
 final class InferenceEngine {
@@ -25,13 +32,10 @@ final class InferenceEngine {
     struct Loaded: Identifiable {
         let model: LocalModel
         let container: ModelContainer?
-        var loadedAt: Date
         /// Forge weight materialization policy when loaded via the policy path.
         let weightLoadPolicy: WeightLoadPolicy?
         /// llama.cpp context when this is a GGUF model.
         let gguf: GGUFRuntime?
-        /// Whether the tokenizer chat template accepts a `system` role.
-        let supportsChatSystemRole: Bool
         /// Sniffed at load: tokenizer ships a chat template.
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
@@ -42,31 +46,19 @@ final class InferenceEngine {
         let chatTemplateThinkingBuiltIn: Bool
 
         init(
-            model: LocalModel, container: ModelContainer?, loadedAt: Date,
+            model: LocalModel, container: ModelContainer?,
             weightLoadPolicy: WeightLoadPolicy? = nil,
             gguf: GGUFRuntime? = nil,
-            supportsChatSystemRole: Bool = true,
             templateCaps: ChatTemplateSniffer.Capabilities = ChatTemplateSniffer.Capabilities()
         ) {
             self.model = model
             self.container = container
-            self.loadedAt = loadedAt
             self.weightLoadPolicy = weightLoadPolicy
             self.gguf = gguf
-            self.supportsChatSystemRole = supportsChatSystemRole
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
             self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
             self.chatTemplateThinkingBuiltIn = templateCaps.thinkingBuiltIntoTemplate
-        }
-
-        var expectsReasoningOutput: Bool {
-            ChatTemplateSniffer.expectsReasoningOutput(
-                ChatTemplateSniffer.Capabilities(
-                    hasChatTemplate: chatTemplateHasTemplate,
-                    supportsThinkingToggle: chatTemplateSupportsThinkingToggle,
-                    thinkingOnly: chatTemplateThinkingOnly,
-                    thinkingBuiltIntoTemplate: chatTemplateThinkingBuiltIn))
         }
 
         var id: String { model.id }
@@ -96,7 +88,7 @@ final class InferenceEngine {
     private(set) var isGenerating = false
     /// IDs of generations that are live. `stop()` empties this set; a cancelled
     /// generation that drains afterwards finds its ID gone and must not touch
-    /// state owned by a newer generation (EVAL.md #5).
+    /// state owned by a newer generation.
     private var activeGenerationIDs: Set<UUID> = []
 
     /// Live stats for the in-flight UI generation.
@@ -143,6 +135,10 @@ final class InferenceEngine {
     private var loadTasks: [String: Task<ModelContainer, Error>] = [:]
     private var loadGenerations: [String: UInt64] = [:]
     private var loadTaskPolicies: [String: WeightLoadPolicy] = [:]
+    /// Models that have passed admission and are queued/loading but are not yet
+    /// resident. They reserve RAM and slots so concurrent loads cannot each
+    /// admit themselves against the same stale snapshot.
+    private var pendingLoadModels: [String: LocalModel] = [:]
     /// In-flight GGUF load per model ID — same dedup role as `loadTasks`.
     private var ggufLoadTasks: [String: Task<GGUFRuntime?, Never>] = [:]
 
@@ -157,6 +153,18 @@ final class InferenceEngine {
     var weightLoadPolicy: () -> WeightLoadPolicy = { .eager }
     /// Generation settings for GGUF context sizing and sampling.
     var generationSettings: () -> GenerationSettings = { GenerationSettings() }
+
+    private func admissionDecision(for model: LocalModel) -> ModelMemoryBudget.LoadDecision {
+        let reservations = pendingLoadModels.values.filter { $0.id != model.id }
+        var knownModels = loadedModels.map(\.model) + reservations
+        if !knownModels.contains(where: { $0.id == model.id }) {
+            knownModels.append(model)
+        }
+        return ModelMemoryBudget.canLoad(
+            model,
+            slotAssignments: loadedModels.map(\.id) + reservations.map(\.id),
+            allModels: knownModels)
+    }
 
     /// Loads a model into memory (idempotent) without changing the active model.
     @discardableResult
@@ -173,14 +181,7 @@ final class InferenceEngine {
             return try await loadGGUF(model)
         }
 
-        var knownModels = loadedModels.map(\.model)
-        if !knownModels.contains(where: { $0.id == model.id }) {
-            knownModels.append(model)
-        }
-        let admission = ModelMemoryBudget.canLoad(
-            model,
-            slotAssignments: loadedModels.map(\.id),
-            allModels: knownModels)
+        let admission = admissionDecision(for: model)
         if !admission.allowed {
             let message = admission.message ?? "Not enough RAM to load \(model.shortName)."
             lastError = message
@@ -210,6 +211,8 @@ final class InferenceEngine {
             generation = (loadGenerations[model.id] ?? 0) + 1
             loadGenerations[model.id] = generation
             loadTaskPolicies[model.id] = policy
+            pendingLoadModels[model.id] = model
+            let loadGeneration = generation
             if loadPolicy != .eager, model.prefersStandardMLXLoad {
                 Self.log.info(
                     "load(\(modelID, privacy: .public)): MoE/dense-mix — using standard MLX loader for full speed"
@@ -224,18 +227,21 @@ final class InferenceEngine {
             } else {
                 loadAdvisory = nil
             }
-            task = Task {
-                try await self.gate.withTurn {
+            task = Task { [weak self] in
+                guard let self else { throw CancellationError() }
+                return try await self.gate.withTurn {
                     try Task.checkCancellation()
                     return try await Self.loadMLXContainerOffMainThread(
                         directory: directory,
                         loadPolicy: loadPolicy,
                         useFactoryLoader: useFactoryLoader
-                    ) { fraction in
-                        Task { @MainActor [weak self] in
-                            if self?.loadingModels.keys.contains(modelID) == true {
-                                self?.loadingModels[modelID] = fraction
-                            }
+                    ) { [weak self, modelID, loadGeneration] fraction in
+                        Task { @MainActor [weak self, modelID, loadGeneration] in
+                            guard let self,
+                                self.loadGenerations[modelID] == loadGeneration,
+                                self.loadingModels.keys.contains(modelID)
+                            else { return }
+                            self.loadingModels[modelID] = fraction
                         }
                     }
                 }
@@ -247,12 +253,15 @@ final class InferenceEngine {
                 loadTasks.removeValue(forKey: model.id)
                 loadTaskPolicies.removeValue(forKey: model.id)
                 loadingModels.removeValue(forKey: model.id)
+                pendingLoadModels.removeValue(forKey: model.id)
             }
         }
 
         do {
             let container = try await task.value
-            if discardedLoads.remove(model.id) != nil {
+            if loadGenerations[model.id] != generation
+                || discardedLoads.remove(model.id) != nil
+            {
                 Self.log.info("load(\(model.id, privacy: .public)) discarded — unloaded mid-flight")
                 recordLoadCancelled(for: model)
                 scheduleCachePurge()
@@ -265,7 +274,7 @@ final class InferenceEngine {
                 useFactoryLoader && policy != .eager ? .eager : policy
             let templateCaps = Self.templateCaps(for: model)
             let entry = Loaded(
-                model: model, container: container, loadedAt: Date(),
+                model: model, container: container,
                 weightLoadPolicy: recordedPolicy,
                 templateCaps: templateCaps)
             loadedModels.append(entry)
@@ -289,14 +298,7 @@ final class InferenceEngine {
 
     /// Loads a GGUF model on the llama.cpp backend.
     private func loadGGUF(_ model: LocalModel) async throws -> Loaded {
-        var knownModels = loadedModels.map(\.model)
-        if !knownModels.contains(where: { $0.id == model.id }) {
-            knownModels.append(model)
-        }
-        let admission = ModelMemoryBudget.canLoad(
-            model,
-            slotAssignments: loadedModels.map(\.id),
-            allModels: knownModels)
+        let admission = admissionDecision(for: model)
         if !admission.allowed {
             let message = admission.message ?? "Not enough RAM to load \(model.shortName)."
             lastError = message
@@ -306,7 +308,7 @@ final class InferenceEngine {
         // Same dedup + generation discipline as the MLX `loadTasks` path:
         // concurrent callers (UI + API auto-load) await ONE runtime creation,
         // and a superseded load can neither clean up the newer load's state
-        // nor resurrect a model the user just ejected (EVAL.md #2).
+        // nor resurrect a model the user just ejected.
         let task: Task<GGUFRuntime?, Never>
         let generation: UInt64
         if let inFlight = ggufLoadTasks[model.id] {
@@ -318,6 +320,7 @@ final class InferenceEngine {
             loadingModels.updateValue(nil, forKey: model.id)
             generation = (loadGenerations[model.id] ?? 0) + 1
             loadGenerations[model.id] = generation
+            pendingLoadModels[model.id] = model
 
             let settings = generationSettings()
             // 0 = auto. 8192 was far too small: a big system preset + long message
@@ -331,24 +334,31 @@ final class InferenceEngine {
             // llama.cpp reports load progress per tensor from its loader thread —
             // throttle to whole-percent steps before hopping to the main actor.
             let lastPercent = GGUFLoadProgressThrottle()
-            task = Task {
-                await self.gate.withTurn {
-                    await Task.detached(priority: .userInitiated) {
-                        let scoped = url.startAccessingSecurityScopedResource()
-                        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                        return GGUFRuntime(
-                            fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)),
-                            onLoadProgress: { [weak self] fraction in
-                                guard lastPercent.advance(to: fraction) else { return }
-                                Task { @MainActor in
-                                    guard let self,
-                                        self.loadGenerations[modelID] == loadGeneration,
-                                        self.loadingModels.keys.contains(modelID)
-                                    else { return }
-                                    self.loadingModels[modelID] = fraction
-                                }
-                            })
-                    }.value
+            task = Task { [weak self, url, ctxTokens, modelID, loadGeneration, lastPercent] in
+                guard let self else { return nil }
+                do {
+                    return try await self.gate.withTurn {
+                        await Task.detached(priority: .userInitiated) {
+                            [url, ctxTokens, modelID, loadGeneration, lastPercent, weak self] in
+                            let scoped = url.startAccessingSecurityScopedResource()
+                            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                            return GGUFRuntime(
+                                fileURL: url, maxTokens: Int32(min(ctxTokens, 131_072)),
+                                onLoadProgress: {
+                                    [weak self, modelID, loadGeneration, lastPercent] fraction in
+                                    guard lastPercent.advance(to: fraction) else { return }
+                                    Task { @MainActor [weak self, modelID, loadGeneration] in
+                                        guard let self,
+                                            self.loadGenerations[modelID] == loadGeneration,
+                                            self.loadingModels.keys.contains(modelID)
+                                        else { return }
+                                        self.loadingModels[modelID] = fraction
+                                    }
+                                })
+                        }.value
+                    }
+                } catch {
+                    return nil
                 }
             }
             ggufLoadTasks[model.id] = task
@@ -359,6 +369,7 @@ final class InferenceEngine {
             if loadGenerations[model.id] == generation {
                 ggufLoadTasks.removeValue(forKey: model.id)
                 loadingModels.removeValue(forKey: model.id)
+                pendingLoadModels.removeValue(forKey: model.id)
             }
         }
 
@@ -383,7 +394,7 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
         let entry = Loaded(
-            model: model, container: nil, loadedAt: Date(),
+            model: model, container: nil,
             weightLoadPolicy: nil, gguf: runtime,
             templateCaps: Self.templateCaps(for: model))
         loadedModels.append(entry)
@@ -400,7 +411,8 @@ final class InferenceEngine {
 
     /// UI path: load in the background and make active when ready.
     func loadAndActivate(_ model: LocalModel, policy: WeightLoadPolicy = .eager) {
-        Task {
+        Task { [weak self, model, policy] in
+            guard let self else { return }
             do {
                 let entry = try await load(model, policy: policy)
                 activeModelID = entry.id
@@ -413,7 +425,7 @@ final class InferenceEngine {
     }
 
     func unload(_ modelID: String) {
-        if activeModelID == modelID, isGenerating { stop() }
+        cancelGenerations(for: modelID)
         cancelInFlightLoad(for: modelID)
         sessions = sessions.filter { $0.value.modelID != modelID }
         loadedModels.removeAll { $0.id == modelID }
@@ -448,13 +460,14 @@ final class InferenceEngine {
         for task in loadSnapshot { _ = try? await task.value }
 
         generationTasks.removeAll()
+        generationModelIDs.removeAll()
         materializingModelID = nil
         activeGenerationIDs.removeAll()
         isGenerating = false
 
         tearDownLoadedModels(scheduleAsyncPurge: false)
 
-        await gate.withTurn {
+        _ = try? await gate.withTurn {
             await Task.detached(priority: .utility) {
                 Memory.clearCache()
             }.value
@@ -466,10 +479,21 @@ final class InferenceEngine {
     }
 
     private func tearDownLoadedModels(scheduleAsyncPurge: Bool) {
+        let inFlight = Set(loadTasks.keys)
+            .union(ggufLoadTasks.keys)
+            .union(loadingModels.keys)
+            .union(pendingLoadModels.keys)
+        discardedLoads.formUnion(inFlight)
+        for modelID in inFlight {
+            loadGenerations[modelID] = (loadGenerations[modelID] ?? 0) + 1
+        }
+        loadTasks.values.forEach { $0.cancel() }
+        ggufLoadTasks.values.forEach { $0.cancel() }
         loadTasks.removeAll()
         loadTaskPolicies.removeAll()
         ggufLoadTasks.removeAll()
         loadingModels.removeAll()
+        pendingLoadModels.removeAll()
         sessions.removeAll()
         loadedModels.removeAll()
         activeModelID = nil
@@ -486,6 +510,7 @@ final class InferenceEngine {
             || loadingModels[modelID] != nil
         else { return }
         discardedLoads.insert(modelID)
+        loadGenerations[modelID] = (loadGenerations[modelID] ?? 0) + 1
         loadTasks[modelID]?.cancel()
         loadTasks.removeValue(forKey: modelID)
         loadTaskPolicies.removeValue(forKey: modelID)
@@ -493,6 +518,7 @@ final class InferenceEngine {
         // plus the discard flag/generation check keeps the result from landing.
         ggufLoadTasks.removeValue(forKey: modelID)
         loadingModels.removeValue(forKey: modelID)
+        pendingLoadModels.removeValue(forKey: modelID)
     }
 
     /// Purging the MLX buffer cache while a generation is mid-stream frees
@@ -501,8 +527,9 @@ final class InferenceEngine {
     /// (ARC keeps the container alive for any draining stream); the purge
     /// itself waits its turn until the GPU is quiet.
     private func scheduleCachePurge() {
-        Task {
-            await gate.withTurn {
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await gate.withTurn {
                 await Task.detached(priority: .utility) {
                     Memory.clearCache()
                 }.value
@@ -527,6 +554,7 @@ final class InferenceEngine {
 
     private var sessions: [UUID: SessionBox] = [:]
     private var generationTasks: [UUID: Task<Void, Never>] = [:]
+    private var generationModelIDs: [UUID: String] = [:]
 
     /// Streams a response to `prompt` using the active model (or a specific target for
     /// multi-agent dispatch) in the context of `conversation`.
@@ -549,7 +577,7 @@ final class InferenceEngine {
         if let tid = targetModelID {
             guard let t = loadedModels.first(where: { $0.id == tid }) else {
                 // A dispatched/fan-out target that was unloaded must fail loudly,
-                // not silently answer from whatever model is active (EVAL.md #4).
+                // not silently answer from whatever model is active.
                 onComplete(nil, "Model is no longer loaded.")
                 return
             }
@@ -570,8 +598,15 @@ final class InferenceEngine {
             explicit: systemInstructions, conversation: conversation, settings: settings)
 
         if let gguf = entry.gguf {
+            guard images.isEmpty else {
+                onComplete(
+                    nil,
+                    "GGUF models in Forge are text-only. Load an MLX vision model to send images.")
+                return
+            }
             generateGGUF(
-                gguf, conversation: conversation, prompt: prompt, settings: settings,
+                gguf, modelID: entry.id, conversation: conversation,
+                prompt: prompt, settings: settings,
                 systemInstructions: resolvedSystem,
                 onChunk: onChunk, onComplete: onComplete)
             return
@@ -589,18 +624,18 @@ final class InferenceEngine {
             sessions.removeValue(forKey: conversation.id)
             let userPrompt = Self.userPrompt(
                 prompt: prompt,
-                system: resolvedSystem,
                 thinkingDirective: Self.thinkingBudgetFrontDirective(
                     for: entry, settings: settings))
-            let generationID = beginGeneration()
+            let generationID = beginGeneration(modelID: entry.id)
             if entry.weightLoadPolicy == .deferred {
                 materializingModelID = entry.id
                 loadAdvisory = nil
             }
             generationTasks[generationID] = Task { [generationID] in
-                await self.gate.withTurn {
+                _ = try? await self.gate.withTurn {
                     defer {
                         self.generationTasks.removeValue(forKey: generationID)
+                        self.generationModelIDs.removeValue(forKey: generationID)
                         if self.materializingModelID == entry.id {
                             self.materializingModelID = nil
                         }
@@ -611,6 +646,8 @@ final class InferenceEngine {
                             entry: entry,
                             conversation: conversation,
                             userPrompt: userPrompt,
+                            systemInstructions: resolvedSystem,
+                            images: images,
                             settings: settings,
                             budgetTarget: budgetTarget,
                             noThinkPrefill: noThinkPrefill,
@@ -627,13 +664,20 @@ final class InferenceEngine {
             return
         }
 
-        let (session, userPrompt) = preparedSession(
-            for: conversation, entry: entry, settings: settings,
-            prompt: prompt,
-            systemInstructions: resolvedSystem)
+        let session: ChatSession
+        let userPrompt: String
+        do {
+            (session, userPrompt) = try preparedSession(
+                for: conversation, entry: entry, settings: settings,
+                prompt: prompt,
+                systemInstructions: resolvedSystem)
+        } catch {
+            onComplete(nil, error.localizedDescription)
+            return
+        }
         session.generateParameters = Self.parameters(from: settings)
 
-        let generationID = beginGeneration()
+        let generationID = beginGeneration(modelID: entry.id)
         let deferredMaterialize = entry.weightLoadPolicy == .deferred
         if deferredMaterialize {
             materializingModelID = entry.id
@@ -644,9 +688,10 @@ final class InferenceEngine {
             // One gate turn for the whole stream: no API-server request can
             // overlap this generation, and a stop-then-resend queues here
             // until the cancelled stream has fully drained.
-            await self.gate.withTurn {
+            _ = try? await self.gate.withTurn {
                 defer {
                     self.generationTasks.removeValue(forKey: generationID)
+                    self.generationModelIDs.removeValue(forKey: generationID)
                     if self.materializingModelID == entry.id {
                         self.materializingModelID = nil
                     }
@@ -656,9 +701,8 @@ final class InferenceEngine {
                     let completionInfo = try await self.streamMLXResponse(
                         session: session,
                         userPrompt: userPrompt,
-                        conversation: conversation,
                         entry: entry,
-                        settings: settings,
+                        images: images,
                         start: start,
                         onChunk: onChunk)
                     self.sessions[conversation.id]?.messageCount += 2
@@ -679,6 +723,8 @@ final class InferenceEngine {
                                 entry: entry,
                                 conversation: conversation,
                                 userPrompt: userPrompt,
+                                systemInstructions: resolvedSystem,
+                                images: images,
                                 settings: settings,
                                 budgetTarget: nil,
                                 noThinkPrefill: false,
@@ -704,9 +750,9 @@ final class InferenceEngine {
     /// the MLX path — llama.cpp competes for the same GPU.
     private func generateGGUF(
         _ gguf: GGUFRuntime,
+        modelID: String,
         conversation: Conversation,
         prompt: String,
-        images: [Data] = [],   // ignored for GGUF (text-only); present for API compatibility
         settings: GenerationSettings,
         systemInstructions: String,
         onChunk: @escaping @MainActor (String) -> Void,
@@ -724,11 +770,14 @@ final class InferenceEngine {
                 }
             }
 
-        let generationID = beginGeneration()
+        let generationID = beginGeneration(modelID: modelID)
 
         generationTasks[generationID] = Task { [generationID] in
-            await self.gate.withTurn {
-                defer { self.generationTasks.removeValue(forKey: generationID) }
+            _ = try? await self.gate.withTurn {
+                defer {
+                    self.generationTasks.removeValue(forKey: generationID)
+                    self.generationModelIDs.removeValue(forKey: generationID)
+                }
                 gguf.configure(
                     temperature: settings.temperature, topP: settings.topP,
                     topK: settings.topK, system: systemPrompt, history: history)
@@ -779,6 +828,7 @@ final class InferenceEngine {
         loadedModels.compactMap(\.gguf).forEach { $0.stop() }
         generationTasks.values.forEach { $0.cancel() }
         generationTasks.removeAll()
+        generationModelIDs.removeAll()
         materializingModelID = nil
         if isGenerating {
             // Cancelled mid-turn: KV caches of in-flight sessions no longer
@@ -790,14 +840,29 @@ final class InferenceEngine {
         refreshMemory()
     }
 
+    private func cancelGenerations(for modelID: String) {
+        let matching = generationModelIDs.compactMap { generationID, candidate in
+            candidate == modelID ? generationID : nil
+        }
+        guard !matching.isEmpty else { return }
+        loadedModels.first(where: { $0.id == modelID })?.gguf?.stop()
+        for generationID in matching {
+            generationTasks[generationID]?.cancel()
+            activeGenerationIDs.remove(generationID)
+            generationModelIDs.removeValue(forKey: generationID)
+        }
+        isGenerating = !activeGenerationIDs.isEmpty
+    }
+
     @discardableResult
-    private func beginGeneration() -> UUID {
+    private func beginGeneration(modelID: String) -> UUID {
         let generationID = UUID()
         if activeGenerationIDs.isEmpty {
             liveTokenCount = 0
             liveTokensPerSecond = 0
         }
         activeGenerationIDs.insert(generationID)
+        generationModelIDs[generationID] = modelID
         isGenerating = true
         return generationID
     }
@@ -806,6 +871,7 @@ final class InferenceEngine {
         // Already cleared by stop() (or double-finished): don't decrement state
         // that now belongs to a newer generation.
         guard activeGenerationIDs.remove(generationID) != nil else { return }
+        generationModelIDs.removeValue(forKey: generationID)
         isGenerating = !activeGenerationIDs.isEmpty
         refreshMemory()
     }
@@ -818,7 +884,7 @@ final class InferenceEngine {
         for conversation: Conversation, entry: Loaded, settings: GenerationSettings,
         prompt: String,
         systemInstructions: String
-    ) -> (ChatSession, String) {
+    ) throws -> (ChatSession, String) {
         let systemPrompt = systemInstructions
         let thinkingDirective = Self.thinkingBudgetFrontDirective(
             for: entry, settings: settings)
@@ -834,18 +900,25 @@ final class InferenceEngine {
             sessions[conversation.id] = box
             let userPrompt = Self.userPrompt(
                 prompt: prompt,
-                system: systemPrompt,
                 thinkingDirective: thinkingDirective)
             return (box.session, userPrompt)
         }
 
-        let history: [Chat.Message] = conversation.messages.compactMap { message in
+        var history: [Chat.Message] = []
+        for message in conversation.messages {
             switch message.role {
-            case .user: return .user(message.content)
+            case .user:
+                history.append(
+                    .user(
+                        message.content,
+                        images: try Self.mlxImages(from: message.attachedImageData)))
             // Don't feed our own "⚠️ …" notices back to the model as prior turns.
             case .assistant:
-                return message.isErrorMessage ? nil : .assistant(message.content)
-            case .system: return .system(message.content)
+                if !message.isErrorMessage, !message.content.isEmpty {
+                    history.append(.assistant(message.content))
+                }
+            case .system:
+                history.append(.system(message.content))
             }
         }
 
@@ -853,7 +926,8 @@ final class InferenceEngine {
         // first, so every entry in this path has an MLX container.
         let session = ChatSession(
             entry.container!,
-            instructions: nil,
+            instructions: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? nil : systemPrompt,
             history: history,
             generateParameters: Self.parameters(from: settings),
             additionalContext: Self.thinkingAdditionalContext(
@@ -865,7 +939,6 @@ final class InferenceEngine {
             localThinkingMaxTokens: settings.localThinkingMaxTokens)
         let userPrompt = Self.userPrompt(
             prompt: prompt,
-            system: systemPrompt,
             thinkingDirective: thinkingDirective)
         return (session, userPrompt)
     }
@@ -886,21 +959,18 @@ final class InferenceEngine {
 
     private static func userPrompt(
         prompt: String,
-        system: String,
         thinkingDirective: String? = nil
     ) -> String {
-        let trimmedSystem = system.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSystem.isEmpty else {
-            return thinkingDirective.map { $0 + "\n\n" + prompt } ?? prompt
-        }
-        let budgetBlock = thinkingDirective.map { "\n\n\($0)" } ?? ""
-        return """
-            System instructions:
-            \(trimmedSystem)\(budgetBlock)
+        thinkingDirective.map { $0 + "\n\n" + prompt } ?? prompt
+    }
 
-            User:
-            \(prompt)
-            """
+    private nonisolated static func mlxImages(from data: [Data]) throws -> [UserInput.Image] {
+        try data.enumerated().map { index, bytes in
+            guard let image = CIImage(data: bytes) else {
+                throw ForgeError.invalidImage(index + 1)
+            }
+            return .ciImage(image)
+        }
     }
 
     /// Heavy MLX container load — always off the main thread so huge checkpoints
@@ -912,6 +982,7 @@ final class InferenceEngine {
         reportProgress: @Sendable @escaping (Double) -> Void
     ) async throws -> ModelContainer {
         try await Task.detached(priority: .userInitiated) {
+            [directory, loadPolicy, useFactoryLoader, reportProgress] in
             try Task.checkCancellation()
             let configuration = ModelConfiguration(directory: directory)
             let downloader = ModelStore.makeDownloader()
@@ -963,10 +1034,8 @@ final class InferenceEngine {
         loadedModels[index] = Loaded(
             model: model,
             container: loadedModels[index].container,
-            loadedAt: loadedModels[index].loadedAt,
             weightLoadPolicy: loadedModels[index].weightLoadPolicy,
             gguf: loadedModels[index].gguf,
-            supportsChatSystemRole: loadedModels[index].supportsChatSystemRole,
             templateCaps: caps)
     }
 
@@ -1007,9 +1076,8 @@ final class InferenceEngine {
     private func streamMLXResponse(
         session: ChatSession,
         userPrompt: String,
-        conversation: Conversation,
         entry: Loaded,
-        settings: GenerationSettings,
+        images: [Data],
         start: Date,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws -> GenerateCompletionInfo? {
@@ -1018,8 +1086,9 @@ final class InferenceEngine {
         // with no opening tag — surface one so the UI can render a live reasoning block.
         var emittedSyntheticThinkOpen = false
 
+        let mlxImages = try Self.mlxImages(from: images)
         for try await item in session.streamDetails(
-            to: userPrompt, role: .user, images: [], videos: [])
+            to: userPrompt, role: .user, images: mlxImages, videos: [])
         {
             if Task.isCancelled { break }
             switch item {
@@ -1062,22 +1131,33 @@ final class InferenceEngine {
         entry: Loaded,
         conversation: Conversation,
         userPrompt: String,
+        systemInstructions: String,
+        images: [Data],
         settings: GenerationSettings,
         budgetTarget: Int?,
         noThinkPrefill: Bool,
         start: Date,
         onChunk: @escaping @MainActor (String) -> Void
     ) async throws -> GenerateCompletionInfo? {
-        var turns: [(role: String, content: String)] = conversation.messages.compactMap {
-            message in
-            switch message.role {
-            case .user: return ("user", message.content)
-            case .assistant:
-                return message.isErrorMessage ? nil : ("assistant", message.content)
-            case .system: return ("system", message.content)
-            }
+        var turns: [BudgetTurn] = []
+        let trimmedSystem = systemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSystem.isEmpty {
+            turns.append(BudgetTurn(role: "system", content: systemInstructions))
         }
-        turns.append(("user", userPrompt))
+        turns.append(contentsOf: conversation.messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return BudgetTurn(
+                    role: "user", content: message.content,
+                    images: message.attachedImageData)
+            case .assistant:
+                return message.isErrorMessage || message.content.isEmpty
+                    ? nil : BudgetTurn(role: "assistant", content: message.content)
+            case .system:
+                return BudgetTurn(role: "system", content: message.content)
+            }
+        })
+        turns.append(BudgetTurn(role: "user", content: userPrompt, images: images))
 
         let thinkingFromStart =
             !noThinkPrefill
@@ -1133,7 +1213,7 @@ final class InferenceEngine {
     /// template's pre-opened `<think>` for thinking-off). `hardLimit` nil = no budget.
     nonisolated private static func budgetedGenerationStream(
         container: ModelContainer,
-        turns: [(role: String, content: String)],
+        turns: [BudgetTurn],
         additionalContext: [String: any Sendable]?,
         parameters: GenerateParameters,
         hardLimit: Int?,
@@ -1142,13 +1222,18 @@ final class InferenceEngine {
     ) -> AsyncThrowingStream<Generation, Error> {
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
         let task = Task {
+            [container, turns, additionalContext, parameters, hardLimit,
+                thinkingFromStart, prefillText, continuation] in
             do {
                 try await container.perform { context in
-                    let messages: [Chat.Message] = turns.map { turn in
+                    let messages: [Chat.Message] = try turns.map { turn in
                         switch turn.role {
                         case "system": return .system(turn.content)
                         case "assistant": return .assistant(turn.content)
-                        default: return .user(turn.content)
+                        default:
+                            return .user(
+                                turn.content,
+                                images: try Self.mlxImages(from: turn.images))
                         }
                     }
                     let userInput = UserInput(
@@ -1157,6 +1242,13 @@ final class InferenceEngine {
                     do {
                         lmInput = try await context.processor.prepare(input: userInput)
                     } catch {
+                        // A text-only fallback would silently discard VLM media.
+                        // Preserve the processor's image error instead so the
+                        // caller gets an honest failure rather than an answer
+                        // produced without seeing the attachment.
+                        guard turns.allSatisfy({ $0.images.isEmpty }) else {
+                            throw error
+                        }
                         // Chat-template failure (e.g. Jinja.TemplateException on an
                         // exotic community template): fall back to a hand-built
                         // ChatML prompt so the turn still generates.
@@ -1343,12 +1435,15 @@ final class GGUFLoadProgressThrottle: @unchecked Sendable {
 enum ForgeError: LocalizedError {
     case loadFailed(String)
     case modelNotFound(String)
+    case invalidImage(Int)
 
     var errorDescription: String? {
         switch self {
         case .loadFailed(let message): return message
         case .modelNotFound(let name):
             return "Model '\(name)' is not loaded and not found in the local library."
+        case .invalidImage(let position):
+            return "Attached image \(position) is not a readable JPEG, PNG, HEIC, or other Core Image format."
         }
     }
 }

@@ -13,10 +13,16 @@ import MLXNN
 
 enum WeightLoadError: Error, LocalizedError {
     case noSafetensors
+    case unreadableModelDirectory(URL)
+    case duplicateTensor(String, URL)
 
     var errorDescription: String? {
         switch self {
         case .noSafetensors: "No .safetensors shards found in the model folder."
+        case .unreadableModelDirectory(let url):
+            "Unable to enumerate model folder: \(url.path)"
+        case .duplicateTensor(let name, let url):
+            "Duplicate tensor '\(name)' found while loading \(url.lastPathComponent)."
         }
     }
 }
@@ -24,8 +30,9 @@ enum WeightLoadError: Error, LocalizedError {
 /// Sorted shard URLs under `modelDirectory` (deterministic load order).
 func safetensorsShardURLs(in modelDirectory: URL) throws -> [URL] {
     var shardURLs: [URL] = []
-    let enumerator = FileManager.default.enumerator(
-        at: modelDirectory, includingPropertiesForKeys: nil)!
+    guard let enumerator = FileManager.default.enumerator(
+        at: modelDirectory, includingPropertiesForKeys: nil)
+    else { throw WeightLoadError.unreadableModelDirectory(modelDirectory) }
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
             shardURLs.append(url)
@@ -54,6 +61,9 @@ func loadWeights(
         try Task.checkCancellation()
         let (shardWeights, shardMetadata) = try loadArraysAndMetadata(url: url)
         for (key, value) in shardWeights {
+            guard weights[key] == nil else {
+                throw WeightLoadError.duplicateTensor(key, url)
+            }
             weights[key] = value
         }
         if metadata.isEmpty {
@@ -67,6 +77,7 @@ func loadWeights(
         progress?(Double(index + 1) / shardCount)
     }
 
+    try Task.checkCancellation()
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     if quantization != nil || perLayerQuantization != nil {
@@ -85,6 +96,7 @@ func loadWeights(
 
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
+    try Task.checkCancellation()
 
     switch policy {
     case .eager, .boundedEager:
@@ -101,7 +113,7 @@ func loadLLMContainerWithPolicy(
     tokenizerLoader: any TokenizerLoader,
     progress: (@Sendable (Double) -> Void)? = nil
 ) async throws -> (ModelContainer, WeightLoadPolicy) {
-    var configuration = ResolvedModelConfiguration(directory: modelDirectory)
+    let configuration = ResolvedModelConfiguration(directory: modelDirectory)
     let configurationURL = modelDirectory.appending(component: "config.json")
     let configData: Data
     do {
@@ -132,20 +144,24 @@ func loadLLMContainerWithPolicy(
 
     var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
     let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-    if let generationData = try? Data(contentsOf: generationConfigURL),
-        let generationConfig = try? JSONDecoder.json5().decode(
-            GenerationConfigFile.self, from: generationData),
-        let genEosIds = generationConfig.eosTokenIds?.values
-    {
+    let generationConfig: GenerationConfigFile? =
+        if let generationData = try? Data(contentsOf: generationConfigURL) {
+            try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
+        } else {
+            nil
+        }
+    if let genEosIds = generationConfig?.eosTokenIds?.values {
         eosTokenIds = Set(genEosIds)
     }
 
-    let toolCallFormat =
-        configuration.toolCallFormat
-        ?? ToolCallFormat.infer(from: baseConfig.modelType, configData: configData)
-    let defaultPrompt = configuration.defaultPrompt
-    let extraEOSTokens = configuration.extraEOSTokens
-    let tokenizerDirectory = configuration.tokenizerDirectory
+    var mutableConfiguration = configuration
+    mutableConfiguration.eosTokenIds = eosTokenIds
+    mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+    if mutableConfiguration.toolCallFormat == nil {
+        mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+            from: baseConfig.modelType, configData: configData)
+    }
+    let tokenizerDirectory = mutableConfiguration.tokenizerDirectory
 
     async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
@@ -165,15 +181,19 @@ func loadLLMContainerWithPolicy(
             DefaultMessageGenerator()
         }
 
+    let tokenizerSource: TokenizerSource? =
+        tokenizerDirectory == modelDirectory ? nil : .directory(tokenizerDirectory)
     let modelConfig = ModelConfiguration(
         directory: modelDirectory,
-        defaultPrompt: defaultPrompt,
-        extraEOSTokens: extraEOSTokens,
-        eosTokenIds: eosTokenIds,
-        toolCallFormat: toolCallFormat)
+        tokenizerSource: tokenizerSource,
+        defaultPrompt: mutableConfiguration.defaultPrompt,
+        extraEOSTokens: mutableConfiguration.extraEOSTokens,
+        stopStrings: mutableConfiguration.stopStrings,
+        eosTokenIds: mutableConfiguration.eosTokenIds,
+        toolCallFormat: mutableConfiguration.toolCallFormat)
 
     let processor = ForgeLLMInputProcessor(
-        tokenizer: tokenizer, configuration: modelConfig,
+        tokenizer: tokenizer,
         messageGenerator: messageGenerator)
 
     let context = ModelContext(

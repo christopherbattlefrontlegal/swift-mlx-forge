@@ -41,11 +41,6 @@ enum ChatTemplateSniffer {
         return caps
     }
 
-    /// True when the model is likely to emit `` blocks (toggle, built-in prompt, or reasoning fields).
-    nonisolated static func expectsReasoningOutput(_ caps: Capabilities) -> Bool {
-        caps.supportsThinkingToggle || caps.thinkingBuiltIntoTemplate
-    }
-
     nonisolated private static func loadChatTemplateText(from directory: URL) -> String? {
         for root in searchRoots(in: directory) {
             if let jinja = readUTF8(root.appendingPathComponent("chat_template.jinja")) {
@@ -75,7 +70,7 @@ enum ChatTemplateSniffer {
         else { return }
         for child in children {
             let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard values?.isDirectory == true else { continue }
+            guard values?.isDirectory == true, values?.isSymbolicLink != true else { continue }
             roots.append(child)
             collectSubdirectories(under: child, depth: depth + 1, maxDepth: maxDepth, into: &roots)
         }
@@ -88,14 +83,40 @@ enum ChatTemplateSniffer {
     /// `enable_thinking=false`. Counting it as always-on reasoning made Forge treat plain
     /// answers as thinking — mislabeling the UI and burning the thinking budget on them.
     nonisolated private static func detectsBuiltInThinkingPrompt(in template: String) -> Bool {
-        guard template.contains("add_generation_prompt") else { return false }
-        var searchRange = template.startIndex..<template.endIndex
-        while let open = template.range(of: "<think>", range: searchRange) {
+        let lower = template.lowercased()
+        var searchStart = lower.startIndex
+        while let marker = lower.range(
+            of: "add_generation_prompt", range: searchStart..<lower.endIndex)
+        {
+            searchStart = marker.upperBound
+
+            // Only inspect a Jinja `if`/`elif add_generation_prompt` branch.
+            // Merely having that variable somewhere in a template must not make
+            // unrelated assistant-history `<think>` handling look like a prefill.
+            guard let directiveStart = lower[..<marker.lowerBound].range(of: "{%", options: .backwards),
+                let directiveEnd = lower[marker.upperBound...].range(of: "%}")
+            else { continue }
+            let directive = lower[directiveStart.lowerBound..<directiveEnd.upperBound]
+            guard directive.contains("if") else { continue }
+            guard let blockEnd = lower[directiveEnd.upperBound...].range(of: "{% endif") else {
+                continue
+            }
+            let block = lower[directiveEnd.upperBound..<blockEnd.lowerBound]
+            if containsNonEmptyThinkPrompt(in: block) { return true }
+        }
+        return false
+    }
+
+    nonisolated private static func containsNonEmptyThinkPrompt(
+        in text: Substring
+    ) -> Bool {
+        var searchRange = text.startIndex..<text.endIndex
+        while let open = text.range(of: "<think>", range: searchRange) {
             // The empty prefill is at most `\n\n</think>` away (escaped `\n` in the
             // template source is two characters, so a short window covers both forms).
-            let window = template[open.upperBound...].prefix(12)
+            let window = text[open.upperBound...].prefix(12)
             if !window.contains("</think>") { return true }
-            searchRange = open.upperBound..<template.endIndex
+            searchRange = open.upperBound..<text.endIndex
         }
         return false
     }

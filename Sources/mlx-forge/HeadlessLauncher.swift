@@ -411,7 +411,6 @@ final class HeadlessLauncher {
         chromeMode = ChromeMode(rawValue: defaults.string(forKey: "hl.chromeMode") ?? "") ?? .none
         effortLevel = EffortLevel(rawValue: defaults.string(forKey: "hl.effortLevel") ?? "") ?? .none
         advisorModel = defaults.string(forKey: "hl.advisorModel") ?? ""
-        refreshMCP()
     }
 
     // MARK: - Presets
@@ -423,8 +422,14 @@ final class HeadlessLauncher {
             break
         case .readOnlyReview:
             permissionMode = .plan
+            allowDangerouslySkipPermissions = false
+            dangerouslySkipPermissions = false
             toolRestriction = .allowedTools
             toolList = "Read Grep Glob"
+            selectedMCP.removeAll()
+            manualMCPConfig = ""
+            strictMCP = false
+            permissionPromptTool = ""
         case .safeCodeEdit:
             permissionMode = .acceptEdits
             toolRestriction = .allowedTools
@@ -458,18 +463,23 @@ final class HeadlessLauncher {
         }
 
         let home = NSHomeDirectory()
+        let selectedProject = URL(filePath: workingDirectory)
+            .standardizedFileURL.resolvingSymlinksInPath().path
         if let data = try? Data(contentsOf: URL(filePath: home + "/.claude.json")),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             ingest(root["mcpServers"])
             if let projects = root["projects"] as? [String: Any] {
-                for (_, project) in projects {
+                for (path, project) in projects {
+                    let normalized = URL(filePath: path)
+                        .standardizedFileURL.resolvingSymlinksInPath().path
+                    guard normalized == selectedProject else { continue }
                     ingest((project as? [String: Any])?["mcpServers"])
                 }
             }
         }
 
-        let projectMCP = workingDirectory + "/.mcp.json"
-        if let data = try? Data(contentsOf: URL(filePath: projectMCP)),
+        let projectMCP = URL(filePath: selectedProject).appendingPathComponent(".mcp.json")
+        if let data = try? Data(contentsOf: projectMCP),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             ingest(root["mcpServers"])
         }

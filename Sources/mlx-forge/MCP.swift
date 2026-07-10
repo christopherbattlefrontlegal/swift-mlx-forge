@@ -6,6 +6,7 @@
 
 import Foundation
 import Observation
+import CryptoKit
 
 // MARK: - Config file
 
@@ -140,6 +141,19 @@ final class MCPManager {
     private var hasStarted = false
     /// Live stdio MCP processes keyed by mcp.json server id (e.g. desktop-commander).
     private var stdioSessions: [String: MCPStdioSession] = [:]
+    /// An external server is trusted only while its complete configuration still
+    /// matches the fingerprint the user approved. Editing command, arguments,
+    /// environment, URL, or headers requires an explicit re-enable.
+    private var trustedFingerprints: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "mcp.trustedFingerprints") as? [String: String]
+        ?? [:]
+    {
+        didSet {
+            UserDefaults.standard.set(trustedFingerprints, forKey: "mcp.trustedFingerprints")
+        }
+    }
+    /// Invalidates asynchronous connection results after disable/reload/config changes.
+    private var connectionGenerations: [String: UInt64] = [:]
     private var disabledServerIDs = Set(
         UserDefaults.standard.stringArray(forKey: "mcp.disabledServers") ?? []
     ) {
@@ -308,7 +322,9 @@ final class MCPManager {
     /// First launch: write an empty config so there's a file to edit.
     private func ensureTemplate() {
         let url = Self.projectConfigFile
-        if loadConfig(at: url) != nil { return }
+        // A malformed config is evidence the operator needs to see and repair;
+        // never replace it with an empty file. Seed only when no file exists.
+        if FileManager.default.fileExists(atPath: url.path) { return }
         let template = "{\n  \"mcpServers\": {\n  }\n}\n"
         try? template.data(using: .utf8)?.write(to: url)
     }
@@ -330,14 +346,17 @@ final class MCPManager {
                 Entry(
                     id: Self.commanderID,
                     config: MCPServerConfig(url: nil, headers: nil, command: nil, args: nil, env: nil),
-                    status: isServerEnabled(Self.commanderID) ? .connected(tools: BuiltinCommander.tools) : .disabled,
+                    status: !disabledServerIDs.contains(Self.commanderID)
+                        ? .connected(tools: BuiltinCommander.tools) : .disabled,
                     builtIn: true))
         }
         nextEntries += allServers.keys.sorted().map {
-            Entry(
+            let config = allServers[$0]!
+            let enabled = !disabledServerIDs.contains($0) && isTrusted($0, config: config)
+            return Entry(
                 id: $0,
-                config: allServers[$0]!,
-                status: isServerEnabled($0)
+                config: config,
+                status: enabled
                     ? (connectExternalServers ? .connecting : .available)
                     : .disabled,
                 builtIn: false)
@@ -375,8 +394,11 @@ final class MCPManager {
         }
 
         var file = loadPrimaryConfig()
-        file.mcpServers[trimmedName] = MCPServerConfig(
+        let config = MCPServerConfig(
             url: trimmedURL, headers: nil, command: nil, args: nil, env: nil)
+        file.mcpServers[trimmedName] = config
+        trust(trimmedName, config: config)
+        disabledServerIDs.remove(trimmedName)
         savePrimaryConfig(file)
         reload()
         return nil
@@ -387,12 +409,17 @@ final class MCPManager {
         file.mcpServers.removeValue(forKey: name)
         savePrimaryConfig(file)
         disabledServerIDs.remove(name)
+        trustedFingerprints[name] = nil
         selectedToolsByServer[name] = nil
+        invalidateConnection(name)
+        stopStdioSession(entryID: name)
         reload()
     }
 
     func isServerEnabled(_ id: String) -> Bool {
-        !disabledServerIDs.contains(id)
+        guard !disabledServerIDs.contains(id) else { return false }
+        guard let entry = entries.first(where: { $0.id == id }) else { return false }
+        return entry.isBuiltIn || isTrusted(id, config: entry.config)
     }
 
     func setServerEnabled(_ id: String, enabled: Bool) {
@@ -407,6 +434,7 @@ final class MCPManager {
         }
         let entry = entries[index]
         if enabled {
+            if !entry.isBuiltIn { trust(id, config: entry.config) }
             entries[index].status = .connecting
             if !entry.isBuiltIn {
                 if let urlString = entry.config.url {
@@ -420,8 +448,27 @@ final class MCPManager {
                 entries[index].status = .connected(tools: BuiltinCommander.tools)
             }
         } else {
+            invalidateConnection(id)
+            stopStdioSession(entryID: id)
             entries[index].status = .disabled
         }
+    }
+
+    private func trust(_ id: String, config: MCPServerConfig) {
+        trustedFingerprints[id] = Self.fingerprint(id: id, config: config)
+    }
+
+    private func isTrusted(_ id: String, config: MCPServerConfig) -> Bool {
+        trustedFingerprints[id] == Self.fingerprint(id: id, config: config)
+    }
+
+    private static func fingerprint(id: String, config: MCPServerConfig) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var data = Data(id.utf8)
+        data.append(0)
+        if let encoded = try? encoder.encode(config) { data.append(encoded) }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     func tools(for entryID: String) -> [MCPTool] {
@@ -430,49 +477,47 @@ final class MCPManager {
         return []
     }
 
-    func selectedTool(for entryID: String) -> String? {
-        selectedToolsByServer[entryID]?.first
-    }
-
     func selectedTools(for entryID: String) -> [String] {
         selectedToolsByServer[entryID] ?? []
     }
 
-    /// Persisted selection when set; otherwise all tools on a connected server.
-    func effectiveSelectedTools(for entryID: String) -> [String] {
-        let persisted = selectedToolsByServer[entryID] ?? []
-        if !persisted.isEmpty { return persisted }
-        return tools(for: entryID).map(\.name)
+    func usesImplicitAllTools(for entryID: String) -> Bool {
+        selectedToolsByServer[entryID] == nil
     }
 
-    func setSelectedTool(_ toolName: String, for entryID: String) {
-        let value = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
-        selectedToolsByServer[entryID] = value.isEmpty ? nil : [value]
+    /// Persisted selection when set; otherwise all tools on a connected server.
+    func effectiveSelectedTools(for entryID: String) -> [String] {
+        let catalog = tools(for: entryID).map(\.name)
+        guard let persisted = selectedToolsByServer[entryID] else { return catalog }
+        let selected = Set(persisted)
+        return catalog.filter { selected.contains($0) }
     }
 
     func setTool(_ toolName: String, enabled: Bool, for entryID: String) {
         let value = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        var selected = Set(selectedToolsByServer[entryID] ?? [])
+        var selected = Set(effectiveSelectedTools(for: entryID))
         if enabled {
             selected.insert(value)
         } else {
             selected.remove(value)
         }
-        selectedToolsByServer[entryID] = selected.isEmpty ? nil : selected.sorted()
+        let catalog = tools(for: entryID).map(\.name)
+        selectedToolsByServer[entryID] = catalog.filter { selected.contains($0) }
     }
 
     func setAllTools(_ enabled: Bool, for entryID: String) {
         if enabled {
-            let names = tools(for: entryID).map(\.name)
-            selectedToolsByServer[entryID] = names.isEmpty ? nil : names
-        } else {
+            // Missing key means all current and future tools are selected.
             selectedToolsByServer[entryID] = nil
+        } else {
+            // An explicit empty array means no tools are selected.
+            selectedToolsByServer[entryID] = []
         }
     }
 
     func isToolSelected(_ toolName: String, for entryID: String) -> Bool {
-        selectedToolsByServer[entryID]?.contains(toolName) == true
+        effectiveSelectedTools(for: entryID).contains(toolName)
     }
 
     func selectedConnectedTools() -> [MCPToolBinding] {
@@ -481,7 +526,7 @@ final class MCPManager {
                   isServerEnabled(entry.id),
                   case .connected(let tools) = entry.status
             else { return [] }
-            let selected = Set(selectedToolsByServer[entry.id] ?? [])
+            let selected = Set(effectiveSelectedTools(for: entry.id))
             return tools
                 .filter { selected.contains($0.name) }
                 .map { MCPToolBinding(serverID: entry.id, tool: $0) }
@@ -493,19 +538,16 @@ final class MCPManager {
     func selectedPromptTools() -> [MCPToolBinding] {
         entries.flatMap { entry -> [MCPToolBinding] in
             guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return [] }
-            let persisted = selectedToolsByServer[entry.id] ?? []
+            let persisted = selectedToolsByServer[entry.id]
             if case .connected(let tools) = entry.status, !tools.isEmpty {
                 let catalog = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
-                let names = persisted.isEmpty ? tools.map(\.name) : persisted
+                let names = effectiveSelectedTools(for: entry.id)
                 return names.compactMap { name in
-                    guard let tool = catalog[name] else {
-                        return persisted.isEmpty ? nil : MCPToolBinding(
-                            serverID: entry.id, tool: MCPTool(name: name, description: ""))
-                    }
+                    guard let tool = catalog[name] else { return nil }
                     return MCPToolBinding(serverID: entry.id, tool: tool)
                 }
             }
-            guard !persisted.isEmpty else { return [] }
+            guard let persisted, !persisted.isEmpty else { return [] }
             return persisted.map { name in
                 MCPToolBinding(
                     serverID: entry.id, tool: MCPTool(name: name, description: ""))
@@ -555,13 +597,16 @@ final class MCPManager {
             setStatus(entryID, .failed("URL must be https, or plain http on loopback only"))
             return
         }
+        let generation = beginConnection(entryID)
         Task {
             do {
                 let tools = try await MCPHTTPClient(endpoint: url, extraHeaders: headers)
                     .listTools()
+                guard self.connectionIsCurrent(entryID, generation: generation) else { return }
                 self.configureDefaultTool(for: entryID, tools: tools)
                 self.setStatus(entryID, .connected(tools: tools))
             } catch {
+                guard self.connectionIsCurrent(entryID, generation: generation) else { return }
                 self.setStatus(entryID, .failed(error.localizedDescription))
             }
         }
@@ -570,18 +615,39 @@ final class MCPManager {
     private func connectStdio(
         entryID: String, command: String, args: [String], env: [String: String]
     ) {
+        let generation = beginConnection(entryID)
         Task {
             do {
                 self.stopStdioSession(entryID: entryID)
-                let tools = try await self.openStdioSession(
+                let launched = try await self.openStdioSession(
                     entryID: entryID, command: command, args: args, env: env)
-                self.configureDefaultTool(for: entryID, tools: tools)
-                self.setStatus(entryID, .connected(tools: tools))
+                guard self.connectionIsCurrent(entryID, generation: generation) else {
+                    launched.0.stop()
+                    return
+                }
+                self.stdioSessions[entryID] = launched.0
+                self.configureDefaultTool(for: entryID, tools: launched.1)
+                self.setStatus(entryID, .connected(tools: launched.1))
             } catch {
                 self.stopStdioSession(entryID: entryID)
+                guard self.connectionIsCurrent(entryID, generation: generation) else { return }
                 self.setStatus(entryID, .failed(error.localizedDescription))
             }
         }
+    }
+
+    private func beginConnection(_ entryID: String) -> UInt64 {
+        let generation = (connectionGenerations[entryID] ?? 0) &+ 1
+        connectionGenerations[entryID] = generation
+        return generation
+    }
+
+    private func invalidateConnection(_ entryID: String) {
+        _ = beginConnection(entryID)
+    }
+
+    private func connectionIsCurrent(_ entryID: String, generation: UInt64) -> Bool {
+        connectionGenerations[entryID] == generation && isServerEnabled(entryID)
     }
 
     private func stopStdioSession(entryID: String) {
@@ -590,6 +656,7 @@ final class MCPManager {
     }
 
     private func stopAllStdioSessions() {
+        for id in entries.map(\.id) { invalidateConnection(id) }
         for id in stdioSessions.keys {
             stopStdioSession(entryID: id)
         }
@@ -597,7 +664,7 @@ final class MCPManager {
 
     private func openStdioSession(
         entryID: String, command: String, args: [String], env: [String: String]
-    ) async throws -> [MCPTool] {
+    ) async throws -> (MCPStdioSession, [MCPTool]) {
         let commandCopy = command
         let argsCopy = args
         let envCopy = env
@@ -623,24 +690,17 @@ final class MCPManager {
             }
             return (session, tools)
         }.value
-        stdioSessions[entryID] = launched.0
-        return launched.1
+        return launched
     }
 
     private func configureDefaultTool(for entryID: String, tools: [MCPTool]) {
         let toolNames = tools.map(\.name)
-        guard !toolNames.isEmpty else {
-            selectedToolsByServer[entryID] = nil
-            return
-        }
+        // No persisted key is the intentional "all, including future tools"
+        // state. Preserve it. An explicit empty array is intentional "none".
         if let selected = selectedToolsByServer[entryID] {
-            let valid = selected.filter { toolNames.contains($0) }
-            if valid.count == selected.count, !valid.isEmpty {
-                selectedToolsByServer[entryID] = valid
-                return
-            }
+            let selectedSet = Set(selected)
+            selectedToolsByServer[entryID] = toolNames.filter { selectedSet.contains($0) }
         }
-        selectedToolsByServer[entryID] = toolNames
     }
 
     private static func loadSelectedTools() -> [String: [String]] {
@@ -650,7 +710,7 @@ final class MCPManager {
             if let tools = value as? [String] {
                 let cleaned = tools.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
-                if !cleaned.isEmpty { result[server] = Array(Set(cleaned)).sorted() }
+                result[server] = Array(Set(cleaned)).sorted()
             } else if let tool = value as? String {
                 let cleaned = tool.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !cleaned.isEmpty { result[server] = [cleaned] }
@@ -754,14 +814,9 @@ final class MCPManager {
     }
 
     private var effectiveCommanderRoots: [URL] {
-        var roots = [
-            FileManager.default.homeDirectoryForCurrentUser,
-            URL(filePath: "/Volumes"),
-            URL(filePath: "/Applications"),
-            URL(filePath: "/tmp"),
-            URL(filePath: "/private/tmp"),
-            ForgePaths.appSupport
-        ]
+        // App support is Forge-owned. Every other reachable folder must have
+        // been added explicitly in Settings (and is persisted as a bookmark).
+        var roots = [ForgePaths.appSupport]
         for root in commanderRoots where !roots.contains(root) {
             roots.append(root)
         }
@@ -1143,7 +1198,7 @@ final class MCPStdioSession: @unchecked Sendable {
     /// Serializes whole request/response exchanges. Concurrent callers (two
     /// parallel agents hitting the same stdio server) would otherwise
     /// interleave stdin writes and steal/drop each other's replies, since the
-    /// read loop discards every payload whose id isn't its own (EVAL.md #6).
+    /// read loop discards every payload whose id isn't its own.
     private let requestLock = NSLock()
     private var outputBuffer = Data()
     private var errorBuffer = Data()

@@ -5,14 +5,12 @@ import SwiftUI
 import WebKit
 
 enum DesignPromptLocator {
-    /// Ordered fallbacks: app bundle → repo dist → Downloads copy.
+    /// Ordered fallbacks: app bundle → repository dist for source builds.
     static func siteRoot() -> URL? {
         let fm = FileManager.default
         let candidates: [URL] = [
             Bundle.main.resourceURL?.appendingPathComponent("DesignPrompt", isDirectory: true),
             repoDistRoot(),
-            URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Downloads/ai-design-prompt-main/dist", isDirectory: true),
         ].compactMap { $0 }
 
         for root in candidates where fm.fileExists(atPath: root.appendingPathComponent("index.html").path) {
@@ -50,7 +48,9 @@ private final class DesignSiteSchemeHandler: NSObject, WKURLSchemeHandler {
     static let scheme = "forge-design"
     private let root: URL
 
-    init(root: URL) { self.root = root }
+    init(root: URL) {
+        self.root = root.standardizedFileURL.resolvingSymlinksInPath()
+    }
 
     private static let mimeTypes: [String: String] = [
         "html": "text/html", "js": "text/javascript", "mjs": "text/javascript",
@@ -62,11 +62,20 @@ private final class DesignSiteSchemeHandler: NSObject, WKURLSchemeHandler {
     ]
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        guard let url = task.request.url else { return }
+        guard let url = task.request.url,
+            url.scheme == Self.scheme,
+            url.host == "site"
+        else {
+            task.didFailWithError(URLError(.unsupportedURL))
+            return
+        }
         var relative = url.path.isEmpty || url.path == "/" ? "/index.html" : url.path
         relative.removeFirst()  // leading "/"
         let file = root.appendingPathComponent(relative)
-        guard file.path.hasPrefix(root.path),  // no traversal
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let rootPath = root.path
+        guard (file.path == rootPath || file.path.hasPrefix(rootPath + "/")),
             let data = try? Data(contentsOf: file)
         else {
             task.didFailWithError(URLError(.fileDoesNotExist))
@@ -78,7 +87,7 @@ private final class DesignSiteSchemeHandler: NSObject, WKURLSchemeHandler {
             headerFields: [
                 "Content-Type": mime,
                 "Content-Length": "\(data.count)",
-                "Access-Control-Allow-Origin": "*",
+                "Content-Security-Policy": "default-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
             ])!
         task.didReceive(response)
         task.didReceive(data)
@@ -125,8 +134,6 @@ struct DesignPromptView: View {
                         Label("Prompt Generator Unavailable", systemImage: "exclamationmark.triangle")
                     } description: {
                         Text(loadError)
-                    } actions: {
-                        Button("Open in Browser") { openInBrowser() }
                     }
                 }
             }
@@ -142,8 +149,9 @@ struct DesignPromptView: View {
             Spacer()
             Button("Paste into Chat") { pasteGeneratedPromptIntoComposer() }
                 .help("Copy the generated prompt from the page into the Forge composer")
-            Button("Open in Browser") { openInBrowser() }
-                .help("Open the same page in your default browser (Safari, Chrome, etc.)")
+            Button("Reveal Build") { revealBuild() }
+                .disabled(DesignPromptLocator.siteRoot() == nil)
+                .help("Reveal the bundled prompt-generator build in Finder")
             Button("Done") { dismiss() }
                 .keyboardShortcut(.cancelAction)
         }
@@ -161,12 +169,9 @@ struct DesignPromptView: View {
             URLRequest(url: URL(string: "\(DesignSiteSchemeHandler.scheme)://site/index.html")!))
     }
 
-    private func openInBrowser() {
-        if let root = DesignPromptLocator.siteRoot() {
-            NSWorkspace.shared.open(root.appendingPathComponent("index.html"))
-        } else if let url = URL(string: "http://localhost:5173") {
-            NSWorkspace.shared.open(url)
-        }
+    private func revealBuild() {
+        guard let root = DesignPromptLocator.siteRoot() else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([root.appendingPathComponent("index.html")])
     }
 
     private func pasteGeneratedPromptIntoComposer() {
@@ -214,6 +219,14 @@ private struct DesignPromptWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             onLoadFinished()
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction
+        ) async -> WKNavigationActionPolicy {
+            navigationAction.request.url?.scheme == DesignSiteSchemeHandler.scheme
+                ? .allow : .cancel
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

@@ -36,6 +36,21 @@ enum ForgePaths {
 struct PersistedState: Codable {
     var conversations: [Conversation] = []
     var selectedConversationID: UUID?
+
+    private enum CodingKeys: String, CodingKey {
+        case conversations, selectedConversationID
+    }
+
+    init(conversations: [Conversation] = [], selectedConversationID: UUID? = nil) {
+        self.conversations = conversations
+        self.selectedConversationID = selectedConversationID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        conversations = try c.decodeIfPresent([Conversation].self, forKey: .conversations) ?? []
+        selectedConversationID = try c.decodeIfPresent(UUID.self, forKey: .selectedConversationID)
+    }
 }
 
 /// A named, reusable system prompt shown in the inspector's preset menu.
@@ -67,8 +82,6 @@ struct PersistedSettings: Codable {
     var activePromptPresetID: UUID?
     /// Display label when the prompt came from a file/library pick (not a saved preset).
     var activePromptExternalLabel: String?
-    var lastLoadedModelPath: String?
-    var loadedModelPaths: [String] = []
     var serverEnabled = false
     var serverPort = 3737
     /// Serve the API on all interfaces (LAN) instead of loopback only.
@@ -86,8 +99,6 @@ struct PersistedSettings: Codable {
         lastPromptContent: String = "",
         activePromptPresetID: UUID? = nil,
         activePromptExternalLabel: String? = nil,
-        lastLoadedModelPath: String? = nil,
-        loadedModelPaths: [String] = [],
         serverEnabled: Bool = false,
         serverPort: Int = 3737,
         serverExposeToNetwork: Bool = false
@@ -103,8 +114,6 @@ struct PersistedSettings: Codable {
         self.lastPromptContent = lastPromptContent
         self.activePromptPresetID = activePromptPresetID
         self.activePromptExternalLabel = activePromptExternalLabel
-        self.lastLoadedModelPath = lastLoadedModelPath
-        self.loadedModelPaths = loadedModelPaths
         self.serverEnabled = serverEnabled
         self.serverPort = serverPort
         self.serverExposeToNetwork = serverExposeToNetwork
@@ -142,10 +151,6 @@ struct PersistedSettings: Codable {
         activePromptPresetID = try? c.decodeIfPresent(UUID.self, forKey: .activePromptPresetID)
         activePromptExternalLabel =
             (try? c.decodeIfPresent(String.self, forKey: .activePromptExternalLabel)).flatMap { $0 }
-        lastLoadedModelPath = try? c.decodeIfPresent(String.self, forKey: .lastLoadedModelPath)
-        loadedModelPaths =
-            (try? c.decodeIfPresent([String].self, forKey: .loadedModelPaths))
-            .flatMap { $0 } ?? []
         serverEnabled =
             (try? c.decodeIfPresent(Bool.self, forKey: .serverEnabled)).flatMap { $0 } ?? false
         serverPort =
@@ -170,10 +175,17 @@ enum Persistence {
     }()
 
     static func loadState() -> PersistedState {
-        guard let data = try? Data(contentsOf: ForgePaths.conversationsFile),
-            let state = try? decoder.decode(PersistedState.self, from: data)
-        else { return PersistedState() }
-        return state
+        let url = ForgePaths.conversationsFile
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return PersistedState()
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            return try decoder.decode(PersistedState.self, from: data)
+        } catch {
+            preserveCorruptFile(at: url)
+            return PersistedState()
+        }
     }
 
     static func save(state: PersistedState) {
@@ -182,14 +194,34 @@ enum Persistence {
     }
 
     static func loadSettings() -> PersistedSettings {
-        guard let data = try? Data(contentsOf: ForgePaths.settingsFile),
-            let settings = try? decoder.decode(PersistedSettings.self, from: data)
-        else { return PersistedSettings() }
-        return settings
+        let url = ForgePaths.settingsFile
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return PersistedSettings()
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            return try decoder.decode(PersistedSettings.self, from: data)
+        } catch {
+            preserveCorruptFile(at: url)
+            return PersistedSettings()
+        }
     }
 
     static func save(settings: PersistedSettings) {
         guard let data = try? encoder.encode(settings) else { return }
         try? data.write(to: ForgePaths.settingsFile, options: .atomic)
+    }
+
+    /// App startup may immediately save default state after a decode failure.
+    /// Preserve the unreadable source first so that recovery remains possible.
+    private static func preserveCorruptFile(at url: URL) {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let ext = url.pathExtension
+        let suffix = "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)"
+        let filename = ext.isEmpty
+            ? "\(stem).corrupt-\(suffix)"
+            : "\(stem).corrupt-\(suffix).\(ext)"
+        let backup = url.deletingLastPathComponent().appendingPathComponent(filename)
+        try? FileManager.default.copyItem(at: url, to: backup)
     }
 }

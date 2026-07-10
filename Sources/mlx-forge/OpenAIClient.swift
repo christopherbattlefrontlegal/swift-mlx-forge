@@ -104,7 +104,7 @@ struct OpenAIClient {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var input: [[String: Any]] = turns.map(Self.turnPayload)
+        let input: [[String: Any]] = turns.map(Self.turnPayload)
 
         var body: [String: Any] = [
             "model": model,
@@ -157,7 +157,13 @@ struct OpenAIClient {
             if let chunk = assembler.ingest(eventType: type, payload: obj) {
                 await onChunk(chunk)
             }
-            if type == "response.completed" || type == "response.failed" {
+            if type == "response.failed" {
+                throw OpenAIError.stream(Self.responseFailureMessage(obj))
+            }
+            if type == "response.incomplete" {
+                throw OpenAIError.stream(Self.responseIncompleteMessage(obj))
+            }
+            if type == "response.completed" {
                 if let tail = assembler.finish() {
                     await onChunk(tail)
                 }
@@ -167,6 +173,21 @@ struct OpenAIClient {
         if let tail = assembler.finish() {
             await onChunk(tail)
         }
+        throw OpenAIError.stream("response stream ended before completion")
+    }
+
+    private static func responseFailureMessage(_ event: [String: Any]) -> String {
+        let response = event["response"] as? [String: Any]
+        let error = (response?["error"] as? [String: Any])
+            ?? (event["error"] as? [String: Any])
+        return (error?["message"] as? String) ?? "response failed"
+    }
+
+    private static func responseIncompleteMessage(_ event: [String: Any]) -> String {
+        let response = event["response"] as? [String: Any]
+        let details = response?["incomplete_details"] as? [String: Any]
+        let reason = details?["reason"] as? String
+        return reason.map { "response incomplete: \($0)" } ?? "response incomplete"
     }
 
     private static func extractError(from data: Data) -> String? {

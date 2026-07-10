@@ -9,6 +9,7 @@ struct LargeTextView: View {
     var onDismiss: () -> Void
 
     @State private var copied = false
+    @State private var copiedResetTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,15 +69,22 @@ struct LargeTextView: View {
         }
         .frame(minWidth: 560, minHeight: 420)
         .background(Theme.backgroundGradient)
+        .onDisappear {
+            copiedResetTask?.cancel()
+            copiedResetTask = nil
+        }
     }
 
     private func copyToClipboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         copied = true
-        Task {
+        copiedResetTask?.cancel()
+        copiedResetTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.6))
+            guard !Task.isCancelled else { return }
             copied = false
+            copiedResetTask = nil
         }
     }
 }

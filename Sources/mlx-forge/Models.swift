@@ -24,6 +24,9 @@ struct ChatMessage: Identifiable, Codable, Equatable {
 
     // Filled in when an assistant message finishes generating.
     var modelName: String?
+    /// Stable provider/model identifier used for routing and replay. `modelName`
+    /// remains a presentation label and may change between app versions.
+    var producerModelID: String?
     var tokensPerSecond: Double?
     var generationTokenCount: Int?
     var promptTokenCount: Int?
@@ -39,6 +42,61 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// cleanly. Excluded from the history replayed to any provider.
     var isError: Bool?
     var isErrorMessage: Bool { isError == true }
+
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        content: String,
+        timestamp: Date = Date(),
+        attachedImageData: [Data] = [],
+        modelName: String? = nil,
+        producerModelID: String? = nil,
+        tokensPerSecond: Double? = nil,
+        generationTokenCount: Int? = nil,
+        promptTokenCount: Int? = nil,
+        promptTime: TimeInterval? = nil,
+        slotNumber: Int? = nil,
+        isError: Bool? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.timestamp = timestamp
+        self.attachedImageData = attachedImageData
+        self.modelName = modelName
+        self.producerModelID = producerModelID
+        self.tokensPerSecond = tokensPerSecond
+        self.generationTokenCount = generationTokenCount
+        self.promptTokenCount = promptTokenCount
+        self.promptTime = promptTime
+        self.slotNumber = slotNumber
+        self.isError = isError
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, role, content, timestamp, attachedImageData, modelName, producerModelID
+        case tokensPerSecond, generationTokenCount, promptTokenCount, promptTime
+        case slotNumber, isError
+    }
+
+    /// Defaults fields added by newer Forge builds while keeping role/content
+    /// strict enough that a genuinely corrupt record still triggers backup.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        role = try c.decode(Role.self, forKey: .role)
+        content = try c.decode(String.self, forKey: .content)
+        timestamp = try c.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
+        attachedImageData = try c.decodeIfPresent([Data].self, forKey: .attachedImageData) ?? []
+        modelName = try c.decodeIfPresent(String.self, forKey: .modelName)
+        producerModelID = try c.decodeIfPresent(String.self, forKey: .producerModelID)
+        tokensPerSecond = try c.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        generationTokenCount = try c.decodeIfPresent(Int.self, forKey: .generationTokenCount)
+        promptTokenCount = try c.decodeIfPresent(Int.self, forKey: .promptTokenCount)
+        promptTime = try c.decodeIfPresent(TimeInterval.self, forKey: .promptTime)
+        slotNumber = try c.decodeIfPresent(Int.self, forKey: .slotNumber)
+        isError = try c.decodeIfPresent(Bool.self, forKey: .isError)
+    }
 
     /// Splits assistant content into reasoning ("<think>…</think>") and answer parts,
     /// in document order. Handles a still-streaming unterminated think block, and
@@ -90,6 +148,12 @@ struct ChatMessage: Identifiable, Codable, Equatable {
                 return nil
             }
             if !answers.isEmpty { return answers.joined(separator: "\n\n") }
+            if segments.contains(where: { segment in
+                if case .thinking = segment.kind { return true }
+                return false
+            }) {
+                return ""
+            }
             return content
         }
     }
@@ -114,6 +178,39 @@ struct Conversation: Identifiable, Codable, Equatable {
     var updatedAt: Date = Date()
     /// Model id last used in this conversation (so reopening can suggest it).
     var lastModelID: String?
+
+    init(
+        id: UUID = UUID(),
+        title: String = "New Chat",
+        messages: [ChatMessage] = [],
+        systemPrompt: String = "",
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        lastModelID: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.messages = messages
+        self.systemPrompt = systemPrompt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.lastModelID = lastModelID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, messages, systemPrompt, createdAt, updatedAt, lastModelID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? "New Chat"
+        messages = try c.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+        systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        lastModelID = try c.decodeIfPresent(String.self, forKey: .lastModelID)
+    }
 
     var isEmpty: Bool { messages.isEmpty }
 

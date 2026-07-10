@@ -177,7 +177,7 @@ struct OpenRouterClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Forge", forHTTPHeaderField: "X-OpenRouter-Title")
 
-        var body = Self.baseBody(
+        let body = Self.baseBody(
             model: model, messages: payloadMessages, config: config, stream: false)
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -186,13 +186,23 @@ struct OpenRouterClient {
         guard status == 200 else {
             throw OpenRouterError.http(status, Self.extractError(from: data) ?? "request failed")
         }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw OpenRouterError.stream("malformed completion response")
+        }
+        if let error = obj["error"] as? [String: Any] {
+            throw OpenRouterError.stream((error["message"] as? String) ?? "completion failed")
+        }
         guard
-            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let choices = obj["choices"] as? [[String: Any]],
             let first = choices.first,
             let message = first["message"] as? [String: Any]
         else {
             throw OpenRouterError.stream("empty completion response")
+        }
+        if let reason = first["finish_reason"] as? String, reason == "error" {
+            throw OpenRouterError.stream(
+                (first["error"] as? [String: Any])?["message"] as? String
+                    ?? "provider ended the completion with an error")
         }
         if let content = message["content"] as? String, !content.isEmpty {
             return content
@@ -236,6 +246,7 @@ struct OpenRouterClient {
             body["session_id"] = sessionID
         }
         if !tools.isEmpty {
+            body["parallel_tool_calls"] = false
             body["tools"] = tools.map { binding in
                 [
                     "type": "function",

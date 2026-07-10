@@ -27,11 +27,22 @@ struct ForgeApp: App {
             RootView()
                 .environment(appState)
                 .preferredColorScheme(.dark)
-                .frame(minWidth: 1140, minHeight: 640)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onDisappear { appState.saveNow() }
         }
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
+        .restorationBehavior(.disabled)
+        .defaultWindowPlacement { _, context in
+            WindowPlacement(
+                .center,
+                size: context.defaultDisplay.visibleRect.size)
+        }
+        .windowIdealPlacement { _, context in
+            WindowPlacement(
+                .center,
+                size: context.defaultDisplay.visibleRect.size)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
@@ -94,24 +105,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct RootView: View {
     @Environment(AppState.self) private var app
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var initializedPanelVisibility = false
 
     var body: some View {
         @Bindable var app = app
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+                .navigationSplitViewColumnWidth(
+                    min: 220,
+                    ideal: 260,
+                    max: 340)
         } detail: {
             ChatView()
-                .frame(minWidth: 560)
                 .inspector(isPresented: $app.showInspector) {
                     TuningInspector()
                         .inspectorColumnWidth(
                             min: 300,
-                            ideal: Theme.inspectorWidth,
+                            ideal: 340,
                             max: 420)
                 }
         }
+        .navigationSplitViewStyle(.balanced)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(nil, value: columnVisibility)
         .animation(nil, value: app.showInspector)
         .background(Theme.backgroundGradient)
         .sheet(isPresented: $app.showModelBrowser) {
@@ -156,6 +173,12 @@ struct RootView: View {
         .onDisappear {
             app.saveNow()
         }
+        .onAppear {
+            guard !initializedPanelVisibility else { return }
+            initializedPanelVisibility = true
+            columnVisibility = .all
+            app.showInspector = true
+        }
     }
 
     private func toggleInspectorPanel() {
@@ -165,4 +188,5 @@ struct RootView: View {
             app.showInspector.toggle()
         }
     }
+
 }

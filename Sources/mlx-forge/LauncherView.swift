@@ -15,6 +15,7 @@ struct LauncherView: View {
     @State private var pendingDangerPermission: HeadlessLauncher.PermissionMode?
     @State private var confirmDangerPreset = false
     @State private var confirmDangerPermission = false
+    @State private var didRefreshMCP = false
 
     private let columns = [GridItem(.adaptive(minimum: 250), spacing: Theme.s3)]
 
@@ -74,6 +75,11 @@ struct LauncherView: View {
             }
         } message: {
             Text("This is the highest-risk permission mode. Use it only for trusted local automation.")
+        }
+        .task {
+            guard !didRefreshMCP else { return }
+            didRefreshMCP = true
+            app.launcher.refreshMCP()
         }
     }
 
@@ -464,12 +470,15 @@ struct LauncherView: View {
                             hl.systemPromptText = preset.text
                             if hl.systemPromptMode == .none { hl.systemPromptMode = .append }
                         }
+                        .disabled(hl.systemPromptMode.usesFile)
                     }
                     ForEach(app.availablePrompts(), id: \.category) { category, items in
                         Section(category) {
                             ForEach(items, id: \.url) { name, url in
                                 Button(name) {
-                                    if let content = app.loadPromptContent(from: url) {
+                                    if hl.systemPromptMode.usesFile {
+                                        hl.systemPromptText = url.path
+                                    } else if let content = app.loadPromptContent(from: url) {
                                         hl.systemPromptText = content
                                         if hl.systemPromptMode == .none { hl.systemPromptMode = .append }
                                     }

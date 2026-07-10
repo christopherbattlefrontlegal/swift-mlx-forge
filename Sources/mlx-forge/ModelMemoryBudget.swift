@@ -86,6 +86,14 @@ enum ModelMemoryBudget {
             projected.append(model.id)
         }
 
+        var seen = Set<String>()
+        projected = projected.filter { seen.insert($0).inserted }
+        if projected.count > slotCount {
+            return LoadDecision(
+                allowed: false,
+                message: "All \(slotCount) resident model slots are in use. Unload a slot before loading \(model.shortName).")
+        }
+
         let budget = allowableModelBytes()
         let committed = estimatedCommittedBytes(modelIDs: projected, models: allModels)
         if committed <= budget {

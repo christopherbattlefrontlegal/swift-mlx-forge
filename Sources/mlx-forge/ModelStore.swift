@@ -93,11 +93,8 @@ final class ModelStore {
 
     // MARK: - Local scanning
 
-    /// Called once after the first scan completes (used to auto-reload the last model).
-    var onFirstScan: (() -> Void)?
     private(set) var isScanning = false
     private var scanGeneration = 0
-    private var hasScannedOnce = false
 
     /// Scans all roots off the main thread; directory walks over large model
     /// trees on external volumes can block for seconds and must never stall app
@@ -109,7 +106,7 @@ final class ModelStore {
         let generation = scanGeneration
         isScanning = true
 
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [roots, generation, weak self] in
             var found: [LocalModel] = []
             for root in roots {
                 found.append(
@@ -121,14 +118,10 @@ final class ModelStore {
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
             await MainActor.run {
+                guard let self else { return }
                 guard generation == self.scanGeneration else { return }  // superseded
                 self.localModels = models
                 self.isScanning = false
-                if !self.hasScannedOnce {
-                    self.hasScannedOnce = true
-                    self.onFirstScan?()
-                    self.onFirstScan = nil
-                }
             }
         }
     }
@@ -143,7 +136,30 @@ final class ModelStore {
     }
 
     private nonisolated static func scan(root: URL, managed: Bool) -> [LocalModel] {
+        if root.pathExtension.lowercased() == "gguf" {
+            return [ggufModel(file: root)]
+        }
+        var visited = Set<String>()
+        return scanDirectory(
+            root, managedHubEntries: managed, depth: 0, visited: &visited)
+    }
+
+    /// Bounded recursive discovery. Nested symlink directories are skipped so a
+    /// user-selected tree cannot escape into an unrelated volume or cycle.
+    private nonisolated static func scanDirectory(
+        _ root: URL,
+        managedHubEntries: Bool,
+        depth: Int,
+        visited: inout Set<String>
+    ) -> [LocalModel] {
+        guard depth <= 6 else { return [] }
         let fm = FileManager.default
+        let identity = root.standardizedFileURL.path
+        guard visited.insert(identity).inserted else { return [] }
+
+        if root.lastPathComponent.hasPrefix("models--") {
+            return scanHubCacheEntry(root, managed: managedHubEntries).map { [$0] } ?? []
+        }
 
         // The root may itself be a model folder (the user picked the model dir
         // directly, not its parent). Register it as one model and stop.
@@ -164,14 +180,17 @@ final class ModelStore {
 
         guard
             let entries = try? fm.contentsOfDirectory(
-                at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles])
         else { return [] }
 
         var models: [LocalModel] = []
         for entry in entries {
-            let isDirectory =
-                (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            let values = try? entry.resourceValues(forKeys: [
+                .isDirectoryKey, .isSymbolicLinkKey,
+            ])
+            let isDirectory = values?.isDirectory == true
 
             if !isDirectory {
                 // Loose GGUF file at the top level (llama.cpp backend).
@@ -181,9 +200,11 @@ final class ModelStore {
                 continue
             }
 
+            guard values?.isSymbolicLink != true else { continue }
+
             if entry.lastPathComponent.hasPrefix("models--") {
                 // HubCache layout: models--org--name/snapshots/<revision>/
-                if let model = scanHubCacheEntry(entry, managed: managed) {
+                if let model = scanHubCacheEntry(entry, managed: managedHubEntries) {
                     models.append(model)
                 }
             } else if fm.fileExists(atPath: entry.appendingPathComponent("config.json").path) {
@@ -198,35 +219,20 @@ final class ModelStore {
                             quantization: quantization(of: entry),
                             isManaged: false,
                             deletableRoot: nil))
+                } else {
+                    models.append(
+                        contentsOf: scanDirectory(
+                            entry, managedHubEntries: managedHubEntries,
+                            depth: depth + 1, visited: &visited))
                 }
             } else {
-                // Folder of GGUF files (e.g. <model>-gguf/), possibly one level
-                // deeper (org/<model>-gguf/): one model per file.
-                models.append(contentsOf: ggufModels(in: entry))
+                models.append(
+                    contentsOf: scanDirectory(
+                        entry, managedHubEntries: managedHubEntries,
+                        depth: depth + 1, visited: &visited))
             }
         }
         return models
-    }
-
-    /// GGUF files in `dir`, descending one extra directory level (covers the
-    /// common org/<model>-gguf/ layout).
-    private nonisolated static func ggufModels(in dir: URL, depth: Int = 0) -> [LocalModel] {
-        guard depth <= 4,
-            let items = try? FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles])
-        else { return [] }
-        var found: [LocalModel] = []
-        for item in items {
-            let isDirectory =
-                (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            if isDirectory {
-                found.append(contentsOf: ggufModels(in: item, depth: depth + 1))
-            } else if item.pathExtension.lowercased() == "gguf" {
-                found.append(ggufModel(file: item))
-            }
-        }
-        return found
     }
 
     /// A GGUF file as a model entry — runs on the llama.cpp backend.
@@ -420,7 +426,7 @@ final class ModelStore {
         let tracker = DownloadTask(id: repoID)
         downloads.append(tracker)
 
-        tracker.task = Task {
+        tracker.task = Task { [weak self, tracker, repoID] in
             do {
                 let downloader = Self.makeDownloader()
                 _ = try await downloader.download(
@@ -429,7 +435,7 @@ final class ModelStore {
                     matching: ["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model"],
                     useLatest: false
                 ) { progress in
-                    Task { @MainActor in
+                    Task { @MainActor [tracker] in
                         tracker.fraction = progress.fractionCompleted
                         tracker.completedBytes = progress.completedUnitCount
                         tracker.totalBytes = progress.totalUnitCount
@@ -437,7 +443,7 @@ final class ModelStore {
                 }
                 tracker.fraction = 1
                 tracker.finished = true
-                self.refreshLocal()
+                self?.refreshLocal()
             } catch {
                 tracker.failed = error.localizedDescription
             }
@@ -459,7 +465,7 @@ final class ModelStore {
         // Only ever remove trees inside Forge's managed cache, and do the multi-GB
         // filesystem walk off the main actor so the UI doesn't beachball.
         guard model.isManaged, let root = model.deletableRoot else { return }
-        Task.detached(priority: .utility) { [weak self] in
+        Task.detached(priority: .utility) { [root, weak self] in
             try? FileManager.default.removeItem(at: root)
             await MainActor.run { self?.refreshLocal() }
         }

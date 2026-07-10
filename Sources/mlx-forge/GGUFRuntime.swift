@@ -87,22 +87,54 @@ final class GGUFRuntime: @unchecked Sendable {
     /// which injects an empty thinking block so the model skips reasoning entirely.
     func respond(
         to prompt: String, thinkingEnabled: Bool = true,
+        maxOutputTokens: Int? = nil,
         onDelta: @escaping @Sendable (String) async -> Void
     ) async -> String {
+        let capture = GGUFResponseCapture()
         await llm.respond(to: prompt, thinking: thinkingEnabled ? .none : .suppressed) {
             stream in
             var text = ""
-            for await delta in stream {
-                if Task.isCancelled { break }
-                text += delta
-                await onDelta(delta)
+            var generatedChunks = 0
+            if maxOutputTokens == 0 {
+                self.llm.stop()
             }
+            for await delta in stream {
+                if Task.isCancelled || maxOutputTokens == 0 { break }
+                text += delta
+                generatedChunks += 1
+                await onDelta(delta)
+                if let maxOutputTokens, generatedChunks >= maxOutputTokens {
+                    self.llm.stop()
+                    break
+                }
+            }
+            capture.set(text)
             return text
         }
-        return llm.output
+        // LLM.swift's callback-based `respond` overload does not update its
+        // published `output` property. Return the text collected by this exact
+        // invocation instead of a stale/empty property value.
+        return capture.get()
     }
 
     func stop() {
         llm.stop()
+    }
+}
+
+private final class GGUFResponseCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var text = ""
+
+    func set(_ value: String) {
+        lock.lock()
+        text = value
+        lock.unlock()
+    }
+
+    func get() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
     }
 }

@@ -32,7 +32,7 @@ struct ModelBrowserView: View {
 
     private var header: some View {
         HStack(spacing: Theme.s3) {
-            ForgeMark(size: 16)
+            ForgeMark(size: 16, animated: false)
             Text("Model Library")
                 .font(.headline)
             Picker("", selection: $tab) {
@@ -131,7 +131,6 @@ private struct HuggingFaceTokenPopover: View {
 
 private struct InstalledList: View {
     @Environment(AppState.self) private var app
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         Group {
@@ -141,10 +140,7 @@ private struct InstalledList: View {
                 ScrollView {
                     LazyVStack(spacing: Theme.s2) {
                         ForEach(app.store.localModels) { model in
-                            InstalledRow(model: model) {
-                                app.engine.loadAndActivate(model)
-                                app.scheduleSave()
-                            }
+                            InstalledRow(model: model)
                         }
                     }
                     .padding(Theme.s4)
@@ -210,7 +206,7 @@ private struct InstalledList: View {
 private struct InstalledRow: View {
     @Environment(AppState.self) private var app
     let model: LocalModel
-    let onLoad: () -> Void
+    @State private var confirmDelete = false
 
     private var isLoaded: Bool { app.engine.isLoaded(model.id) }
     private var isActive: Bool { app.engine.activeModelID == model.id }
@@ -349,9 +345,9 @@ private struct InstalledRow: View {
                 }
                 if model.isManaged {
                     Button("Delete from Disk", role: .destructive) {
-                        if isLoaded { app.engine.unload(model.id) }
-                        app.store.delete(model)
+                        confirmDelete = true
                     }
+                    .disabled(isLoading || (isLoaded && app.isBusy))
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -362,6 +358,19 @@ private struct InstalledRow: View {
         }
         .padding(Theme.s3)
         .glassCard()
+        .confirmationDialog(
+            "Delete \(model.name) from disk?",
+            isPresented: $confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Model", role: .destructive) {
+                if isLoaded { app.engine.unload(model.id) }
+                app.store.delete(model)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently removes the managed model at \(model.directory.path). This can’t be undone.")
+        }
     }
 }
 

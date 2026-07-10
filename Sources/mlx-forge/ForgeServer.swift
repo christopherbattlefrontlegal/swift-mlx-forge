@@ -43,6 +43,8 @@ final class ForgeServer {
     weak var store: ModelStore?
     /// Supplies default generation settings for requests that omit parameters.
     var defaultSettings: () -> GenerationSettings = { GenerationSettings() }
+    /// Bearer token required for every non-OPTIONS request while listening on LAN.
+    var apiKey: () -> String = { "" }
 
     private var listener: NWListener?
     private var startGeneration = 0
@@ -76,9 +78,9 @@ final class ForgeServer {
     /// the cancelled socket is fully released (immediate rebind can hit
     /// EADDRINUSE even with address reuse enabled).
     func start(port: UInt16, exposeToNetwork: Bool = false) {
-        startGeneration += 1
-        let generation = startGeneration
         stop()
+        startGeneration &+= 1
+        let generation = startGeneration
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard generation == self.startGeneration else { return }
@@ -134,6 +136,8 @@ final class ForgeServer {
     }
 
     func stop() {
+        // Also invalidate a delayed bind that has not created its listener yet.
+        startGeneration &+= 1
         listener?.cancel()
         listener = nil
         boundPort = nil
@@ -213,6 +217,19 @@ final class ForgeServer {
         // Match on the path only — `/v1/models?foo=1` must route like `/v1/models`.
         let path = request.path.split(separator: "?", maxSplits: 1).first.map(String.init)
             ?? request.path
+        if exposedToNetwork && request.method != "OPTIONS" {
+            let expected = apiKey()
+            let authorization = request.headers["authorization"] ?? ""
+            let supplied = authorization.hasPrefix("Bearer ")
+                ? String(authorization.dropFirst("Bearer ".count)) : ""
+            guard !expected.isEmpty, Self.constantTimeEqual(supplied, expected) else {
+                await HTTPResponse.sendError(
+                    on: connection, status: "401 Unauthorized",
+                    message: "A valid Forge bearer token is required.",
+                    allowOrigin: allowOrigin)
+                return
+            }
+        }
         switch (request.method, path) {
         case ("OPTIONS", _):
             await HTTPResponse.send(
@@ -229,6 +246,17 @@ final class ForgeServer {
                 on: connection, status: "404 Not Found",
                 message: "Unknown endpoint.", allowOrigin: allowOrigin)
         }
+    }
+
+    nonisolated private static func constantTimeEqual(_ lhs: String, _ rhs: String) -> Bool {
+        let left = Array(lhs.utf8)
+        let right = Array(rhs.utf8)
+        var difference = left.count ^ right.count
+        for index in 0..<max(left.count, right.count) {
+            difference |= Int(index < left.count ? left[index] : 0)
+                ^ Int(index < right.count ? right[index] : 0)
+        }
+        return difference == 0
     }
 
     // MARK: - Endpoints
@@ -288,7 +316,10 @@ final class ForgeServer {
         if let temperature = chat.temperature { parameters.temperature = Float(temperature) }
         if let topP = chat.top_p { parameters.topP = Float(topP) }
         if let maxTokens = chat.max_tokens ?? chat.max_completion_tokens {
-            parameters.maxTokens = maxTokens > 0 ? maxTokens : nil
+            parameters.maxTokens = maxTokens > 0 ? min(maxTokens, 32_768) : nil
+        }
+        if let configured = parameters.maxTokens {
+            parameters.maxTokens = min(configured, 32_768)
         }
 
         let messages: [Chat.Message] = chat.messages.map { message in
@@ -320,6 +351,7 @@ final class ForgeServer {
             await ggufChat(
                 gguf, messages: messages, systemText: systemText,
                 temperature: chat.temperature, topP: chat.top_p,
+                maxOutputTokens: parameters.maxTokens ?? 8_192,
                 stream: chat.stream == true, model: chat.model,
                 responseID: responseIDForEntry, created: createdForEntry,
                 on: connection, allowOrigin: allowOrigin)
@@ -390,7 +422,7 @@ final class ForgeServer {
         // serializes GPU work — only one turn runs at a time.
         let sessionBox = SendableBox(value: session)
         let messagesBox = SendableBox(value: messages)
-        await gate.withTurnDetached { [sessionBox, messagesBox] in
+        _ = try? await gate.withTurnDetached { [sessionBox, messagesBox] in
             let session = sessionBox.value
             let messages = messagesBox.value
             do {
@@ -527,6 +559,7 @@ final class ForgeServer {
         messages: [Chat.Message],
         systemText: String,
         temperature: Double?, topP: Double?,
+        maxOutputTokens: Int,
         stream: Bool,
         model: String, responseID: String, created: Int,
         on connection: NWConnection, allowOrigin: String?
@@ -568,14 +601,14 @@ final class ForgeServer {
             await HTTPResponse.sendRaw(
                 on: connection,
                 "data: \(chunkJSON(delta: ["role": "assistant"], finish: nil))\n\n")
-            await gate.withTurn {
+            _ = try? await gate.withTurn {
                 gguf.configure(
                     temperature: temperature ?? settings.temperature,
                     topP: topP ?? settings.topP,
                     topK: settings.topK,
                     system: systemText.isEmpty ? nil : systemText,
                     history: history)
-                _ = await gguf.respond(to: prompt) { delta in
+                _ = await gguf.respond(to: prompt, maxOutputTokens: maxOutputTokens) { delta in
                     let delivered = await HTTPResponse.sendRaw(
                         on: connection,
                         "data: \(chunkJSON(delta: ["content": delta], finish: nil))\n\n")
@@ -587,15 +620,15 @@ final class ForgeServer {
                 await HTTPResponse.sendRaw(on: connection, "data: [DONE]\n\n")
             }
         } else {
-            let output = await gate.withTurn {
+            let output = (try? await gate.withTurn {
                 gguf.configure(
                     temperature: temperature ?? settings.temperature,
                     topP: topP ?? settings.topP,
                     topK: settings.topK,
                     system: systemText.isEmpty ? nil : systemText,
                     history: history)
-                return await gguf.respond(to: prompt) { _ in }
-            }
+                return await gguf.respond(to: prompt, maxOutputTokens: maxOutputTokens) { _ in }
+            }) ?? ""
             // llama.cpp's wrapper doesn't expose token counts — report zeros rather than guesses.
             let body: [String: Any] = [
                 "id": responseID, "object": "chat.completion",
@@ -637,7 +670,8 @@ enum LocalNetwork {
                     addr, socklen_t(addr.pointee.sa_len), &buffer, socklen_t(buffer.count),
                     nil, 0, NI_NUMERICHOST) == 0
                 {
-                    let host = String(cString: buffer)
+                    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                    let host = String(decoding: bytes, as: UTF8.self)
                     if !host.isEmpty, !hosts.contains(host) { hosts.append(host) }
                 }
             }
@@ -770,7 +804,7 @@ private struct HTTPRequest {
                 // before the timeout can propagate. Cancel the transport so
                 // that callback fires (with an error) and the group can drain;
                 // without this, an idle socket leaks the task + connection
-                // forever (EVAL.md #3).
+                // forever.
                 connection.cancel()
                 throw URLError(.timedOut)
             }

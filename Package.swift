@@ -1,32 +1,24 @@
 // swift-tools-version: 6.2
-// Swift-native, headless MLX runtime.
-//
-// This package builds the existing mlx-swift-examples `llm-tool` sources as a
-// standalone command-line executable. It performs direct, in-process MLX
-// inference on Apple Silicon: no Python, no server, no daemon, no REST API.
+// Swift-native Forge app with in-process MLX and GGUF inference.
 //
 // Architecture note: in mlx-swift-lm 3.x the LLM/VLM libraries and the
 // tokenizer/downloader integration were decoupled. This manifest re-assembles
-// the pieces the CLI needs:
+// the pieces Forge needs:
 //   - MLXLLM / MLXVLM / MLXLMCommon / MLXHuggingFace : public mlx-swift-lm package
 //   - HuggingFace (HubClient/HubCache/Repo)          : huggingface/swift-huggingface
 //   - Tokenizers / Hub (AutoTokenizer)               : huggingface/swift-transformers
-//   - ArgumentParser                                 : apple/swift-argument-parser
 
 import PackageDescription
 
 let package = Package(
     name: "forge_swift_open_source",
     platforms: [
-        // Deploy to macOS 26 so the app still runs on the prior OS; the Foundation Models
-        // LLM-provider API is macOS 27.0+, so that code is gated with `if #available`.
+        // Forge currently targets the macOS 26 SDK surface used by the native app.
         .macOS(.v26)
     ],
     // swift-tools-version 6.2 already selects Swift 6 language mode (data-race safety
     // by default); confirmed building with -swift-version 6 on the Swift 6.4 toolchain.
     products: [
-        .executable(name: "mlx-runtime", targets: ["mlx-runtime"]),
-        .executable(name: "mlx-studio", targets: ["mlx-studio"]),
         .executable(name: "mlx-forge", targets: ["mlx-forge"])
     ],
     dependencies: [
@@ -50,11 +42,6 @@ let package = Package(
             url: "https://github.com/huggingface/swift-transformers",
             exact: "1.3.0"),
 
-        // CLI argument parsing.
-        .package(
-            url: "https://github.com/apple/swift-argument-parser.git",
-            from: "1.6.2"),
-
         // llama.cpp (GGUF) backend for the Forge app — Metal-accelerated,
         // compiled in-process (sandbox-safe). Second engine next to MLX.
         // Vendored fork of eastriverlee/LLM.swift 2.1.0 with the bundled
@@ -63,25 +50,6 @@ let package = Package(
         .package(path: "Vendor/LLM.swift"),
     ],
     targets: [
-        .executableTarget(
-            name: "mlx-runtime",
-            dependencies: [
-                .product(name: "MLXLLM", package: "mlx-swift-lm"),
-                .product(name: "MLXVLM", package: "mlx-swift-lm"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
-                .product(name: "HuggingFace", package: "swift-huggingface"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
-                .product(name: "Hub", package: "swift-transformers"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-            ],
-            path: "Sources/mlx-runtime"
-        ),
-        .executableTarget(
-            name: "mlx-studio",
-            dependencies: [],
-            path: "Sources/mlx-studio"
-        ),
         .executableTarget(
             name: "mlx-forge",
             dependencies: [
@@ -93,11 +61,9 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "Hub", package: "swift-transformers"),
                 .product(name: "LLM", package: "LLM.swift"),
+                .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Sources/mlx-forge",
-            linkerSettings: [
-                .linkedFramework("FoundationModels"),
-            ]
+            path: "Sources/mlx-forge"
         )
     ]
 )

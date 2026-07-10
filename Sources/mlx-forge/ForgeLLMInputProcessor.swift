@@ -7,7 +7,6 @@ import Tokenizers
 
 struct ForgeLLMInputProcessor: UserInputProcessor {
     let tokenizer: any MLXLMCommon.Tokenizer
-    let configuration: ModelConfiguration
     let messageGenerator: MessageGenerator
 
     func prepare(input: UserInput) throws -> LMInput {

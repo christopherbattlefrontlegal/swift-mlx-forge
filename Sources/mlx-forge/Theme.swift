@@ -12,9 +12,6 @@ enum Theme {
     static let s5: CGFloat = 24
     static let s6: CGFloat = 32
 
-    /// System-managed inspector target width.
-    static let inspectorWidth: CGFloat = 340
-
     // Radius
     static let radiusSmall: CGFloat = 8
     static let radiusMedium: CGFloat = 12

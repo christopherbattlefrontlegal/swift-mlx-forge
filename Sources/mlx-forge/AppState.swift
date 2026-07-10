@@ -250,7 +250,7 @@ final class AppState {
         let slot: Int
         let modelID: String
         let label: String
-        var id: Int { slot }
+        var id: String { modelID }
     }
 
     /// Room mode: the transcript becomes a shared channel between up to four
@@ -284,7 +284,11 @@ final class AppState {
         guard !raw.isEmpty else { return }
         composerText = ""
 
-        let targets = Self.roomTargets(in: raw, models: roomModels)
+        // Freeze the roster for the whole round. Loading or unloading another model
+        // must not silently renumber speakers while a response is in flight.
+        let roster = roomModels
+        let targets = Self.roomTargets(in: raw, models: roster)
+        let generation = cancellationGeneration
         var userMessage = ChatMessage(role: .user, content: raw)
         userMessage.attachedImageData = images
         conversation.messages.append(userMessage)
@@ -303,9 +307,14 @@ final class AppState {
                 self.scheduleSave()
             }
             for target in targets {
-                if Task.isCancelled { break }
+                if Task.isCancelled || generation != self.cancellationGeneration { break }
                 guard self.engine.isLoaded(target.modelID) else { continue }
-                await self.runRoomTurn(target: target, images: images, conversationID: conversationID)
+                await self.runRoomTurn(
+                    target: target,
+                    roster: roster,
+                    images: images,
+                    conversationID: conversationID,
+                    cancellationGeneration: generation)
             }
         }
     }
@@ -315,12 +324,18 @@ final class AppState {
     /// agents' replies relayed as user-role "[n.Name]:" lines — the model sees
     /// everyone but can only ever speak as itself.
     private func runRoomTurn(
-        target: RoomModel, images: [Data], conversationID: UUID
+        target: RoomModel,
+        roster: [RoomModel],
+        images: [Data],
+        conversationID: UUID,
+        cancellationGeneration generation: UInt64
     ) async {
+        guard generation == cancellationGeneration else { return }
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
         var bubble = ChatMessage(role: .assistant, content: "")
         bubble.modelName = "\(target.slot).\(target.label)"
         bubble.slotNumber = target.slot
+        bubble.producerModelID = target.modelID
         var conversation = conversations[ci]
         conversation.messages.append(bubble)
         conversation.updatedAt = Date()
@@ -329,7 +344,8 @@ final class AppState {
         beginStreaming(messageID: messageID)
 
         let history = roomTransformedHistory(conversations[ci], for: target, excluding: messageID)
-        let systemInstructions = roomSystemPrompt(for: target, history: conversations[ci])
+        let systemInstructions = roomSystemPrompt(
+            for: target, roster: roster, history: conversations[ci])
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             engine.generate(
@@ -340,12 +356,13 @@ final class AppState {
                 systemInstructions: systemInstructions,
                 targetModelID: target.modelID,
                 onChunk: { [weak self] delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(
                         delta, conversationID: conversationID, messageID: messageID)
                 },
                 onComplete: { [weak self] info, errorMessage in
                     defer { continuation.resume() }
-                    guard let self else { return }
+                    guard let self, self.cancellationGeneration == generation else { return }
                     self.finishStreamBuffer(messageID)
                     self.appendToMessage(conversationID: conversationID, messageID: messageID) {
                         if let info {
@@ -371,9 +388,11 @@ final class AppState {
 
     /// "@all" or no tag → everyone; "@1 @3" → those slots, in slot order.
     nonisolated static func roomTargets(in text: String, models: [RoomModel]) -> [RoomModel] {
-        let lower = text.lowercased()
-        if lower.contains("@all") { return models }
-        let picked = models.filter { lower.contains("@\($0.slot)") }
+        let tokens = Set(text.lowercased().split(whereSeparator: { character in
+            !(character.isLetter || character.isNumber || character == "@" || character == "_")
+        }).map(String.init))
+        if tokens.contains("@all") { return models }
+        let picked = models.filter { tokens.contains("@\($0.slot)") }
         return picked.isEmpty ? models : picked
     }
 
@@ -393,7 +412,9 @@ final class AppState {
                 return nil
             case .assistant:
                 if message.content.isEmpty || message.isErrorMessage { return nil }
-                if message.slotNumber == target.slot { return message }
+                let isOwnReply = message.producerModelID.map { $0 == target.modelID }
+                    ?? (message.slotNumber == target.slot)
+                if isOwnReply { return message }
                 let speaker = message.modelName ?? "another agent"
                 return ChatMessage(role: .user, content: "[\(speaker)]:\n\(message.content)")
             }
@@ -401,13 +422,15 @@ final class AppState {
         return copy
     }
 
-    private func roomSystemPrompt(for target: RoomModel, history: Conversation) -> String {
-        let roster = roomModels
+    private func roomSystemPrompt(
+        for target: RoomModel, roster: [RoomModel], history: Conversation
+    ) -> String {
+        let rosterText = roster
             .map { "\($0.slot). \($0.label)\($0.slot == target.slot ? " (you)" : "")" }
             .joined(separator: "\n")
         let preamble = """
             You are agent \(target.slot) ("\(target.label)") in a shared room with other AI agents:
-            \(roster)
+            \(rosterText)
 
             Room rules:
             - Messages from other agents appear as lines starting with "[n.Name]:". The plain messages are from the human user.
@@ -642,6 +665,8 @@ final class AppState {
             scheduleSave()
         }
     }
+    /// Stable bearer token used when the local API is exposed beyond loopback.
+    var serverAPIKey: String { SecretsStore.localServerAPIKey ?? "" }
     var serverPort = 3737 {
         didSet {
             guard oldValue != serverPort else { return }
@@ -667,7 +692,6 @@ final class AppState {
     }
 
     var showModelBrowser = false
-    var showLauncher = false
     var showInspector = true
     var showHeadlessHelper = false
     var showDesignPrompt = false
@@ -696,6 +720,9 @@ final class AppState {
     private var streamBufferConversationIDs: [UUID: UUID] = [:]
     private var streamFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var activeMCPCallCount = 0
+    /// Monotonic cancellation token shared by generation and MCP follow-up work.
+    /// Stopping invalidates every callback/task that captured the previous value.
+    private var cancellationGeneration: UInt64 = 0
 
     private var isMCPRunning: Bool { activeMCPCallCount > 0 }
 
@@ -757,6 +784,7 @@ final class AppState {
         server.engine = engine
         server.store = store
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
+        server.apiKey = { SecretsStore.localServerAPIKey ?? "" }
         engine.weightLoadPolicy = { [weak self] in self?.settings.weightLoadPolicy ?? .eager }
         engine.generationSettings = { [weak self] in self?.settings ?? GenerationSettings() }
 
@@ -796,7 +824,6 @@ final class AppState {
         guard !didBeginMCP else { return }
         didBeginMCP = true
         mcp.start()
-        mcp.connectAvailableServers()
         runtimeUpdates.checkDailyIfNeeded()
     }
 
@@ -1268,6 +1295,7 @@ final class AppState {
     func send(images: [Data] = []) {
         guard canSend, var conversation = selectedConversation else { return }
         let prompt = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generation = cancellationGeneration
         composerText = ""
 
         // Snapshot history BEFORE appending the new user message — the provider
@@ -1324,19 +1352,19 @@ final class AppState {
                 streamClaude(
                     model: claudeTarget.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: claudeTarget.messageID,
-                    images: images)
+                    images: images, cancellationGeneration: generation)
             }
             for target in openRouterTargets {
                 streamOpenRouter(
                     model: target.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: target.messageID,
-                    images: images)
+                    images: images, cancellationGeneration: generation)
             }
             if let openAITarget {
                 streamOpenAI(
                     model: openAITarget.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: openAITarget.messageID,
-                    images: images)
+                    images: images, cancellationGeneration: generation)
             }
             if let braveTarget {
                 streamBraveSearch(
@@ -1365,8 +1393,9 @@ final class AppState {
             let conversationID = conversation.id
             for target in targets { beginStreaming(messageID: target.messageID) }
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.cancellationGeneration == generation else { return }
                 let systemInstructions = await self.mcpEnrichedSystemPrompt(for: historySnapshot)
+                guard self.cancellationGeneration == generation else { return }
                 let generationHistory = self.historyWithMCPInstructions(
                     historySnapshot, mcpSystemPrompt: systemInstructions)
                 for target in targets {
@@ -1378,12 +1407,13 @@ final class AppState {
                         systemInstructions: systemInstructions,
                         targetModelID: target.modelID,
                         onChunk: { [weak self] delta in
+                            guard self?.cancellationGeneration == generation else { return }
                             self?.enqueueStreamDelta(
                                 delta, conversationID: conversationID,
                                 messageID: target.messageID)
                         },
                         onComplete: { [weak self] info, errorMessage in
-                            guard let self else { return }
+                            guard let self, self.cancellationGeneration == generation else { return }
                             self.finishStreamBuffer(target.messageID)
                             self.appendToMessage(
                                 conversationID: conversationID, messageID: target.messageID
@@ -1411,7 +1441,8 @@ final class AppState {
                                     originalPrompt: prompt,
                                     images: images,
                                     conversationID: conversationID,
-                                    messageID: target.messageID)
+                                    messageID: target.messageID,
+                                    cancellationGeneration: generation)
                             }
                         })
                 }
@@ -1442,7 +1473,7 @@ final class AppState {
             streamClaude(
                 model: claudeID, history: historySnapshot, prompt: prompt,
                 conversationID: conversationID, messageID: messageID,
-                images: images)
+                images: images, cancellationGeneration: generation)
             scheduleSave()
             return
         }
@@ -1450,8 +1481,9 @@ final class AppState {
         let activeModelID = engine.activeModel?.id
         let activeModelLabel = engine.activeModel.map { localModelLabel($0.model) } ?? "Local"
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, self.cancellationGeneration == generation else { return }
             let systemInstructions = await self.mcpEnrichedSystemPrompt(for: historySnapshot)
+            guard self.cancellationGeneration == generation else { return }
             let generationHistory = self.historyWithMCPInstructions(
                 historySnapshot, mcpSystemPrompt: systemInstructions)
             self.engine.generate(
@@ -1461,10 +1493,11 @@ final class AppState {
                 settings: self.settings,
                 systemInstructions: systemInstructions,
                 onChunk: { [weak self] delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 },
                 onComplete: { [weak self] info, errorMessage in
-                    guard let self else { return }
+                    guard let self, self.cancellationGeneration == generation else { return }
                     self.finishStreamBuffer(messageID)
                     self.appendToMessage(conversationID: conversationID, messageID: messageID) {
                         if let info {
@@ -1493,7 +1526,8 @@ final class AppState {
                                 originalPrompt: prompt,
                                 images: images,
                                 conversationID: conversationID,
-                                messageID: messageID)
+                                messageID: messageID,
+                                cancellationGeneration: generation)
                         }
                     }
                 })
@@ -1511,6 +1545,7 @@ final class AppState {
         guard var conversation = selectedConversation else { return }
         let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !p.isEmpty else { return }
+        let generation = cancellationGeneration
 
         // Snapshot before any user append for this dispatch batch. All agent backends use this + p.
         let preSnapshot = conversation
@@ -1538,6 +1573,7 @@ final class AppState {
             openRouterID = nil
             localID = mid
             assistant.modelName = label
+            assistant.producerModelID = mid
         case .claude(let mid, let lab):
             label = lab
             claudeID = mid
@@ -1563,12 +1599,12 @@ final class AppState {
 
         // Fire the backend work. Claudes run concurrently; locals serialize inside the engine gate.
         let work = Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.cancellationGeneration == generation else { return }
             defer {
                 Task { @MainActor in
                     self.finishStreamBuffer(messageID)
                     // Close the streaming state machine — without this the bubble
-                    // spins forever and the live-buffer entries leak (EVAL.md #1).
+                    // spins forever and the live-buffer entries leak.
                     self.endStreaming(messageID: messageID)
                     self.inFlightAgentLabels.removeValue(forKey: messageID)
                     self.agentTasks.removeValue(forKey: messageID)
@@ -1581,7 +1617,9 @@ final class AppState {
                     history: preSnapshot,
                     prompt: p,
                     conversationID: convID,
-                    messageID: messageID
+                    messageID: messageID,
+                    images: images,
+                    cancellationGeneration: generation
                 )
             } else if let oid = openRouterID {
                 await self.runOpenRouterAgentStream(
@@ -1589,42 +1627,57 @@ final class AppState {
                     history: preSnapshot,
                     prompt: p,
                     conversationID: convID,
-                    messageID: messageID
+                    messageID: messageID,
+                    images: images,
+                    cancellationGeneration: generation
                 )
             } else if let mid = localID {
                 let systemInstructions = await self.mcpEnrichedSystemPrompt(for: preSnapshot)
-                self.engine.generate(
-                    conversation: self.historyWithMCPInstructions(
-                        preSnapshot, mcpSystemPrompt: systemInstructions),
-                    prompt: p,
-                    images: images,
-                    settings: self.settings,
-                    systemInstructions: systemInstructions,
-                    targetModelID: mid,
-                    onChunk: { [weak self] delta in
-                        self?.enqueueStreamDelta(delta, conversationID: convID, messageID: messageID)
-                    },
-                    onComplete: { [weak self] info, errMsg in
-                        guard let self else { return }
-                        self.finishStreamBuffer(messageID)
-                        self.appendToMessage(conversationID: convID, messageID: messageID) {
-                            if let info {
-                                $0.tokensPerSecond = info.tokensPerSecond
-                                $0.generationTokenCount = info.generationTokenCount
-                                $0.promptTokenCount = info.promptTokenCount
-                                $0.promptTime = info.promptTime
-                            }
-                            if let errMsg {
-                                if $0.content.isEmpty {
-                                    $0.content = "⚠️ \(errMsg)"
-                                    $0.isError = true
-                                } else {
-                                    $0.content += "\n\n⚠️ agent interrupted: \(errMsg)"
+                guard self.cancellationGeneration == generation else { return }
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    self.engine.generate(
+                        conversation: self.historyWithMCPInstructions(
+                            preSnapshot, mcpSystemPrompt: systemInstructions),
+                        prompt: p,
+                        images: images,
+                        settings: self.settings,
+                        systemInstructions: systemInstructions,
+                        targetModelID: mid,
+                        onChunk: { [weak self] delta in
+                            guard self?.cancellationGeneration == generation else { return }
+                            self?.enqueueStreamDelta(
+                                delta, conversationID: convID, messageID: messageID)
+                        },
+                        onComplete: { [weak self] info, errMsg in
+                            defer { continuation.resume() }
+                            guard let self, self.cancellationGeneration == generation else { return }
+                            self.finishStreamBuffer(messageID)
+                            self.appendToMessage(conversationID: convID, messageID: messageID) {
+                                if let info {
+                                    $0.tokensPerSecond = info.tokensPerSecond
+                                    $0.generationTokenCount = info.generationTokenCount
+                                    $0.promptTokenCount = info.promptTokenCount
+                                    $0.promptTime = info.promptTime
+                                }
+                                if let errMsg {
+                                    if $0.content.isEmpty {
+                                        $0.content = "⚠️ \(errMsg)"
+                                        $0.isError = true
+                                    } else {
+                                        $0.content += "\n\n⚠️ agent interrupted: \(errMsg)"
+                                    }
                                 }
                             }
-                        }
-                    }
-                )
+                        })
+                }
+                guard self.cancellationGeneration == generation else { return }
+                _ = await self.handleMCPToolRequestIfNeeded(
+                    backend: .local(modelID: mid, label: label),
+                    originalPrompt: p,
+                    images: images,
+                    conversationID: convID,
+                    messageID: messageID,
+                    cancellationGeneration: generation)
             }
         }
         agentTasks[messageID] = work
@@ -1637,8 +1690,11 @@ final class AppState {
         history: Conversation,
         prompt: String,
         conversationID: UUID,
-        messageID: UUID
+        messageID: UUID,
+        images: [Data],
+        cancellationGeneration generation: UInt64
     ) async {
+        guard generation == cancellationGeneration else { return }
         guard let key = SecretsStore.anthropicAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = "⚠️ No Anthropic API key — add one in Settings (⌘,)."
@@ -1653,8 +1709,9 @@ final class AppState {
             case .system: return nil
             }
         }
-        msgs.append(.init(role: "user", text: prompt))
+        msgs.append(.init(role: "user", text: prompt, images: images))
         let context = await mcpPromptContext(for: history)
+        guard generation == cancellationGeneration else { return }
         let client = AnthropicClient(apiKey: key)
         do {
             try await client.stream(
@@ -1662,6 +1719,7 @@ final class AppState {
                 config: anthropicStreamConfig,
                 tools: context.tools
             ) { [weak self] delta in
+                guard self?.cancellationGeneration == generation else { return }
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             }
         } catch is CancellationError {
@@ -1677,6 +1735,7 @@ final class AppState {
                 }
             }
         }
+        guard generation == cancellationGeneration else { return }
         finishStreamBuffer(messageID)
         _ = await handleMCPToolRequestIfNeeded(
             backend: .claude(modelID: model),
@@ -1684,7 +1743,8 @@ final class AppState {
             images: [],
             conversationID: conversationID,
             messageID: messageID,
-            mcpDepth: 0)
+            mcpDepth: 0,
+            cancellationGeneration: generation)
     }
 
     private func runOpenRouterAgentStream(
@@ -1692,8 +1752,11 @@ final class AppState {
         history: Conversation,
         prompt: String,
         conversationID: UUID,
-        messageID: UUID
+        messageID: UUID,
+        images: [Data],
+        cancellationGeneration generation: UInt64
     ) async {
+        guard generation == cancellationGeneration else { return }
         guard let key = SecretsStore.openRouterAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = "⚠️ No OpenRouter API key — add one in Settings (⌘,)."
@@ -1712,8 +1775,9 @@ final class AppState {
                 return nil
             }
         }
-        msgs.append(.init(role: "user", text: prompt))
+        msgs.append(.init(role: "user", text: prompt, images: images))
         let context = await mcpPromptContext(for: history)
+        guard generation == cancellationGeneration else { return }
         let client = OpenRouterClient(apiKey: key)
         do {
             try await client.stream(
@@ -1724,6 +1788,7 @@ final class AppState {
                 sessionID: conversationID.uuidString,
                 tools: context.tools
             ) { [weak self] delta in
+                guard self?.cancellationGeneration == generation else { return }
                 self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
             }
         } catch is CancellationError {
@@ -1739,6 +1804,7 @@ final class AppState {
                 }
             }
         }
+        guard generation == cancellationGeneration else { return }
         finishStreamBuffer(messageID)
         _ = await handleMCPToolRequestIfNeeded(
             backend: .openRouter(modelID: model),
@@ -1746,7 +1812,8 @@ final class AppState {
             images: [],
             conversationID: conversationID,
             messageID: messageID,
-            mcpDepth: 0)
+            mcpDepth: 0,
+            cancellationGeneration: generation)
     }
 
     /// Routes a chat turn to the Anthropic API and streams deltas into the message.
@@ -1754,9 +1821,11 @@ final class AppState {
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
         images: [Data] = [],
+        cancellationGeneration generation: UInt64,
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
+        guard generation == cancellationGeneration else { return }
         guard let key = SecretsStore.anthropicAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = "⚠️ No Anthropic API key set — add one in Settings (⌘,)."
@@ -1786,6 +1855,7 @@ final class AppState {
             // Tools stay available on every turn (including MCP follow-ups) so the model can
             // chain calls. The depth cap in handleMCPToolRequestIfNeeded ends the loop.
             let context = await self?.mcpPromptContext(for: history)
+            guard self?.cancellationGeneration == generation else { return }
             let system =
                 context?.system
                 ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
@@ -1795,6 +1865,7 @@ final class AppState {
                     config: self?.anthropicStreamConfig ?? AnthropicStreamConfig(),
                     tools: context?.tools ?? []
                 ) { delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
             } catch is CancellationError {
@@ -1810,6 +1881,7 @@ final class AppState {
                     }
                 }
             }
+            guard self?.cancellationGeneration == generation else { return }
             self?.finishStreamBuffer(messageID)
             self?.isClaudeGenerating = false
             self?.endStreaming(messageID: messageID)
@@ -1819,7 +1891,8 @@ final class AppState {
                 images: [],
                 conversationID: conversationID,
                 messageID: messageID,
-                mcpDepth: mcpDepth)
+                mcpDepth: mcpDepth,
+                cancellationGeneration: generation)
             self?.scheduleSave()
         }
     }
@@ -1829,9 +1902,11 @@ final class AppState {
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
         images: [Data] = [],
+        cancellationGeneration generation: UInt64,
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
+        guard generation == cancellationGeneration else { return }
         guard let key = SecretsStore.openRouterAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = "⚠️ No OpenRouter API key set — add one in Settings (⌘,)."
@@ -1859,6 +1934,7 @@ final class AppState {
         isOpenRouterGenerating = true
         openRouterTasks[messageID] = Task { [weak self] in
             let context = await self?.mcpPromptContext(for: history)
+            guard self?.cancellationGeneration == generation else { return }
             let system =
                 context?.system
                 ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
@@ -1871,6 +1947,7 @@ final class AppState {
                     sessionID: conversationID.uuidString,
                     tools: context?.tools ?? []
                 ) { delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
             } catch is CancellationError {
@@ -1886,6 +1963,7 @@ final class AppState {
                     }
                 }
             }
+            guard self?.cancellationGeneration == generation else { return }
             self?.finishStreamBuffer(messageID)
             self?.openRouterTasks.removeValue(forKey: messageID)
             self?.isOpenRouterGenerating = self?.openRouterTasks.isEmpty == false
@@ -1896,7 +1974,8 @@ final class AppState {
                 images: [],
                 conversationID: conversationID,
                 messageID: messageID,
-                mcpDepth: mcpDepth)
+                mcpDepth: mcpDepth,
+                cancellationGeneration: generation)
             self?.scheduleSave()
         }
     }
@@ -1906,9 +1985,11 @@ final class AppState {
         model: String, history: Conversation, prompt: String,
         conversationID: UUID, messageID: UUID,
         images: [Data] = [],
+        cancellationGeneration generation: UInt64,
         mcpDepth: Int = 0,
         mcpOriginalPrompt: String? = nil
     ) {
+        guard generation == cancellationGeneration else { return }
         guard let key = SecretsStore.openAIAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = "⚠️ No OpenAI API key set — add one in Settings (⌘,)."
@@ -1938,6 +2019,7 @@ final class AppState {
             let system =
                 await self?.mcpEnrichedSystemPrompt(for: history)
                 ?? self?.systemPrompt(for: history, includeMCP: false) ?? ""
+            guard self?.cancellationGeneration == generation else { return }
             do {
                 try await client.stream(
                     model: model,
@@ -1945,6 +2027,7 @@ final class AppState {
                     turns: turns,
                     config: self?.openAIStreamConfig ?? OpenAIStreamConfig()
                 ) { delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
                 }
             } catch is CancellationError {
@@ -1960,6 +2043,7 @@ final class AppState {
                     }
                 }
             }
+            guard self?.cancellationGeneration == generation else { return }
             self?.finishStreamBuffer(messageID)
             self?.isOpenAIGenerating = false
             self?.endStreaming(messageID: messageID)
@@ -1969,7 +2053,8 @@ final class AppState {
                 images: [],
                 conversationID: conversationID,
                 messageID: messageID,
-                mcpDepth: mcpDepth)
+                mcpDepth: mcpDepth,
+                cancellationGeneration: generation)
             self?.scheduleSave()
         }
     }
@@ -2058,8 +2143,10 @@ final class AppState {
         images: [Data],
         conversationID: UUID,
         messageID: UUID,
-        mcpDepth: Int = 0
+        mcpDepth: Int = 0,
+        cancellationGeneration generation: UInt64
     ) async -> Bool {
+        guard generation == cancellationGeneration else { return false }
         // Agent-loop bound. Tools stay available on every follow-up turn (so the model can
         // chain calls — e.g. sequential-thinking's repeated nextThoughtNeeded), so this cap
         // is the only backstop against a model that never stops calling tools. Reached only
@@ -2104,10 +2191,10 @@ final class AppState {
             )
             return true
         }
+        guard generation == cancellationGeneration else { return false }
 
         guard isMCPToolEnabled(request) else {
-            let enabled = mcp.selectedTools(for: request.serverID)
-                .sorted()
+            let enabled = mcp.effectiveSelectedTools(for: request.serverID)
                 .joined(separator: ", ")
             appendToMessage(conversationID: conversationID, messageID: messageID) {
                 $0.content = """
@@ -2141,10 +2228,12 @@ final class AppState {
         )
 
         do {
+            guard generation == cancellationGeneration else { return false }
             let data = try await mcp.callTool(
                 entryID: request.serverID,
                 name: request.toolName,
                 arguments: request.arguments)
+            guard generation == cancellationGeneration else { return false }
             let resultText = Self.readableMCPResult(from: data)
             appendSystemMessage(
                 conversationID: conversationID,
@@ -2161,7 +2250,8 @@ final class AppState {
                 requestLabel: requestLabel,
                 resultText: resultText,
                 conversationID: conversationID,
-                mcpDepth: mcpDepth + 1)
+                mcpDepth: mcpDepth + 1,
+                cancellationGeneration: generation)
             return true
         } catch {
             appendSystemMessage(
@@ -2179,8 +2269,10 @@ final class AppState {
         requestLabel: String,
         resultText: String,
         conversationID: UUID,
-        mcpDepth: Int
+        mcpDepth: Int,
+        cancellationGeneration generation: UInt64
     ) {
+        guard generation == cancellationGeneration else { return }
         guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
         // Snapshot the live transcript BEFORE appending the new (empty) assistant bubble.
         // This carries the full chain — prior tool calls, results, and follow-ups — so a
@@ -2208,8 +2300,9 @@ final class AppState {
         switch backend {
         case .local(let modelID, _):
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.cancellationGeneration == generation else { return }
                 let systemInstructions = await self.mcpEnrichedSystemPrompt(for: liveHistory)
+                guard self.cancellationGeneration == generation else { return }
                 self.engine.generate(
                     conversation: self.historyWithMCPInstructions(
                         liveHistory, mcpSystemPrompt: systemInstructions),
@@ -2219,11 +2312,12 @@ final class AppState {
                     systemInstructions: systemInstructions,
                     targetModelID: modelID,
                 onChunk: { [weak self] delta in
+                    guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(
                         delta, conversationID: conversationID, messageID: messageID)
                 },
                 onComplete: { [weak self] info, errorMessage in
-                    guard let self else { return }
+                    guard let self, self.cancellationGeneration == generation else { return }
                     self.finishStreamBuffer(messageID)
                     self.appendToMessage(conversationID: conversationID, messageID: messageID) {
                         if let info {
@@ -2252,7 +2346,8 @@ final class AppState {
                             images: images,
                             conversationID: conversationID,
                             messageID: messageID,
-                            mcpDepth: mcpDepth)
+                            mcpDepth: mcpDepth,
+                            cancellationGeneration: generation)
                     }
                 })
             }
@@ -2264,6 +2359,7 @@ final class AppState {
                 conversationID: conversationID,
                 messageID: messageID,
                 images: images,
+                cancellationGeneration: generation,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
         case .openRouter(let modelID):
@@ -2274,6 +2370,7 @@ final class AppState {
                 conversationID: conversationID,
                 messageID: messageID,
                 images: images,
+                cancellationGeneration: generation,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
         case .openAI(let modelID):
@@ -2283,6 +2380,8 @@ final class AppState {
                 prompt: prompt,
                 conversationID: conversationID,
                 messageID: messageID,
+                images: images,
+                cancellationGeneration: generation,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
         }
@@ -2291,12 +2390,9 @@ final class AppState {
     private func isMCPToolEnabled(_ request: MCPCallRequest) -> Bool {
         let serverID = mcp.resolveEntryID(request.serverID)
         let canonicalTool = Self.canonicalizeMCPToolName(request.toolName, serverID: serverID)
-        if mcp.selectedPromptTools().contains(where: {
+        return mcp.selectedPromptTools().contains(where: {
             $0.serverID == serverID && $0.tool.name == canonicalTool
-        }) {
-            return true
-        }
-        return mcp.tools(for: serverID).contains { $0.name == canonicalTool }
+        })
     }
 
     private func messageContent(conversationID: UUID, messageID: UUID) -> String? {
@@ -2511,14 +2607,24 @@ final class AppState {
     }
 
     private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
-        if let marker = content.range(of: "FORGE_MCP_CALL"),
-           let request = parseMCPCallJSONObject(from: String(content[marker.upperBound...]))
+        // Never treat hidden reasoning as an instruction to execute a process or
+        // network tool. Only explicit Forge call formats in visible answer text
+        // are executable; arbitrary JSON in prose is data, not authority.
+        let visible = content.replacingOccurrences(
+            of: #"(?is)<think\b[^>]*>.*?</think>"#,
+            with: "",
+            options: .regularExpression)
+            .replacingOccurrences(
+                of: #"(?is)<think\b[^>]*>.*$"#,
+                with: "",
+                options: .regularExpression)
+        if let marker = visible.range(of: "FORGE_MCP_CALL"),
+           let request = parseMCPCallJSONObject(from: String(visible[marker.upperBound...]))
         {
             return request
         }
-        if let request = parseMCPInvokeXML(from: content) { return request }
-        if let request = parseMCPDisplayFormat(from: content) { return request }
-        if let request = parseMCPCallJSONObject(from: content) { return request }
+        if let request = parseMCPInvokeXML(from: visible) { return request }
+        if let request = parseMCPDisplayFormat(from: visible) { return request }
         return nil
     }
 
@@ -2722,6 +2828,7 @@ final class AppState {
     }
 
     func stopGenerating() {
+        cancellationGeneration &+= 1
         flushAllStreamBuffers()
         roomRoundTask?.cancel()
         roomRoundTask = nil
@@ -2765,7 +2872,7 @@ final class AppState {
     private func enqueueStreamDelta(
         _ delta: String, conversationID: UUID, messageID: UUID
     ) {
-        guard !delta.isEmpty else { return }
+        guard !delta.isEmpty, streamingMessageIDs.contains(messageID) else { return }
         streamBufferConversationIDs[messageID] = conversationID
         // Split each delta through the incremental parser so reasoning lands in
         // its own live channel — rendering a reasoning block the moment the
@@ -2883,8 +2990,6 @@ final class AppState {
                 lastPromptContent: lastPromptContent,
                 activePromptPresetID: activePromptPresetID,
                 activePromptExternalLabel: activePromptExternalLabel,
-                lastLoadedModelPath: nil,
-                loadedModelPaths: [],
                 serverEnabled: serverEnabled,
                 serverPort: serverPort,
                 serverExposeToNetwork: serverExposeToNetwork))
