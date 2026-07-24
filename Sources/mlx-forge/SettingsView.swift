@@ -127,28 +127,11 @@ private struct ClaudeKeySettings: View {
 
                 Divider()
                 VStack(alignment: .leading, spacing: Theme.s2) {
-                    Text("Code loop (OpenRouter)")
+                    Text("OpenRouter model catalog")
                         .font(.caption.weight(.semibold))
-                    Text("Planner → coder → auditor → fixer → tester. Chat toolbar loop button.")
+                    Text("Fetch the list so OpenRouter models show up in agent graph blocks.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Picker("Model", selection: Binding(
-                        get: { app.codingOrchestratorConfig.modelID },
-                        set: { app.codingOrchestratorConfig.modelID = $0 })) {
-                        ForEach(OpenRouterClient.models, id: \.id) { model in
-                            Text(model.label).tag(model.id)
-                        }
-                        ForEach(app.openRouterCatalog) { entry in
-                            Text(entry.label).tag(entry.id)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    Stepper(
-                        "Max rounds: \(app.codingOrchestratorConfig.maxRounds)",
-                        value: Binding(
-                            get: { app.codingOrchestratorConfig.maxRounds },
-                            set: { app.codingOrchestratorConfig.maxRounds = max(1, min(10, $0)) }),
-                        in: 1...10)
                     Button("Refresh model catalog") { app.refreshOpenRouterCatalog() }
                         .controlSize(.small)
                         .disabled(app.isOpenRouterCatalogLoading)

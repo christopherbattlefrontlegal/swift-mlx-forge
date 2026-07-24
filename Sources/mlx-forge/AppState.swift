@@ -153,9 +153,7 @@ final class AppState {
     var isBusy: Bool {
         engine.isGenerating || engine.isLoadingAnything || engine.materializingModelID != nil
             || isClaudeGenerating || isOpenRouterGenerating || isOpenAIGenerating
-            || !inFlightAgentLabels.isEmpty
-            || isMCPRunning || isCodingOrchestratorRunning || isBraveSearchGenerating
-            || isRoomRoundRunning
+            || isMCPRunning || isBraveSearchGenerating
     }
     /// Whether a chat target is selected.
     var canChat: Bool {
@@ -304,214 +302,64 @@ final class AppState {
         scheduleSave()
     }
 
-    /// One participant in the room: a loaded local model bound to a numbered slot.
-    struct RoomModel: Identifiable, Equatable {
-        let slot: Int
-        let modelID: String
-        let label: String
-        var id: Int { slot }
+    // MARK: - Agent graphs
+    //
+    // Replaces the old Room, the multi-agent dispatch popover, and the fixed
+    // five-role coding loop. All three were special cases of "several models,
+    // wired together"; the graph is that primitive, and each of them is now a
+    // preset you can take apart.
+
+    var agentGraphs: [AgentGraph] = AgentGraphPersistence.load() {
+        didSet { scheduleGraphSave() }
     }
 
-    /// Room mode: the transcript becomes a shared channel between up to nine
-    /// loaded models; each model also gets its own pane. Persisted.
-    var roomModeEnabled: Bool = UserDefaults.standard.bool(forKey: "room.enabled") {
-        didSet { UserDefaults.standard.set(roomModeEnabled, forKey: "room.enabled") }
-    }
-
-    /// Room participants: every assigned, resident slot in slot order. The same
-    /// model may occupy several slots without duplicating its weight container.
-    var roomModels: [RoomModel] {
-        effectiveModelSlotAssignments.enumerated().compactMap { index, modelID in
-            guard let modelID,
-                let entry = engine.loadedModels.first(where: { $0.id == modelID })
-            else { return nil }
-            return RoomModel(slot: index + 1, modelID: modelID, label: entry.model.shortName)
-        }
-    }
-
-    var isRoomActive: Bool { roomModeEnabled && roomModels.count >= 2 }
-
-    /// True while a room round (one send → several sequential model turns) runs.
-    /// Included in `isBusy` so the composer stays locked in the brief gaps
-    /// between one model's completion and the next model's start.
-    private(set) var isRoomRoundRunning = false
-    private var roomRoundTask: Task<Void, Never>?
-
-    /// Sends the composer text to the room. "@all" (or no tag) fans out to every
-    /// participant SEQUENTIALLY in slot order — each later model sees the earlier
-    /// models' answers from the same round. "@2" (any combination) targets only
-    /// those slots. The shared transcript is the room; panes filter it by slot.
-    func sendRoom(images: [Data] = []) {
-        guard isRoomActive, !isBusy, var conversation = selectedConversation else { return }
-        let raw = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return }
-        composerText = ""
-
-        // Freeze the roster for the whole round. Loading or unloading another model
-        // must not silently renumber speakers while a response is in flight.
-        let roster = roomModels
-        let targets = Self.roomTargets(in: raw, models: roster)
-        let generation = cancellationGeneration
-        var userMessage = ChatMessage(role: .user, content: raw)
-        userMessage.attachedImageData = images
-        conversation.messages.append(userMessage)
-        conversation.refreshTitle()
-        conversation.updatedAt = Date()
-        selectedConversation = conversation
-        scheduleSave()
-
-        let conversationID = conversation.id
-        isRoomRoundRunning = true
-        roomRoundTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                self.isRoomRoundRunning = false
-                self.roomRoundTask = nil
-                self.scheduleSave()
-            }
-            for target in targets {
-                if Task.isCancelled || generation != self.cancellationGeneration { break }
-                guard self.engine.isLoaded(target.modelID) else { continue }
-                await self.runRoomTurn(
-                    target: target,
-                    roster: roster,
-                    images: images,
-                    conversationID: conversationID,
-                    cancellationGeneration: generation)
+    var selectedGraphID: UUID? = AgentGraphPersistence.loadSelectedID() {
+        didSet {
+            if let selectedGraphID {
+                UserDefaults.standard.set(selectedGraphID.uuidString, forKey: "graph.selectedID")
             }
         }
     }
 
-    /// One model's turn: append its labeled bubble, stream into it, and finish.
-    /// The generation history is the FULL room transcript so far, with other
-    /// agents' replies relayed as user-role "[n.Name]:" lines — the model sees
-    /// everyone but can only ever speak as itself.
-    private func runRoomTurn(
-        target: RoomModel,
-        roster: [RoomModel],
-        images: [Data],
-        conversationID: UUID,
-        cancellationGeneration generation: UInt64
-    ) async {
-        guard generation == cancellationGeneration else { return }
-        guard let ci = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
-        var bubble = ChatMessage(role: .assistant, content: "")
-        bubble.modelName = "\(target.slot).\(target.label)"
-        bubble.slotNumber = target.slot
-        bubble.producerModelID = target.modelID
-        var conversation = conversations[ci]
-        conversation.messages.append(bubble)
-        conversation.updatedAt = Date()
-        conversations[ci] = conversation
-        let messageID = bubble.id
-        beginStreaming(messageID: messageID)
+    /// The task typed into the run bar.
+    var graphTaskText: String = ""
 
-        let history = roomTransformedHistory(conversations[ci], for: target, excluding: messageID)
-        let systemInstructions = roomSystemPrompt(
-            for: target, roster: roster, history: conversations[ci])
+    /// True when the detail pane shows the graph workbench instead of chat.
+    var showAgentGraph: Bool = UserDefaults.standard.bool(forKey: "graph.visible") {
+        didSet { UserDefaults.standard.set(showAgentGraph, forKey: "graph.visible") }
+    }
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            engine.generate(
-                conversation: history,
-                prompt: Self.roomTurnPrompt,
-                images: images,
-                settings: settings,
-                systemInstructions: systemInstructions,
-                targetModelID: target.modelID,
-                onChunk: { [weak self] delta in
-                    guard self?.cancellationGeneration == generation else { return }
-                    self?.enqueueStreamDelta(
-                        delta, conversationID: conversationID, messageID: messageID)
-                },
-                onComplete: { [weak self] info, errorMessage in
-                    defer { continuation.resume() }
-                    guard let self, self.cancellationGeneration == generation else { return }
-                    self.finishStreamBuffer(messageID)
-                    self.appendToMessage(conversationID: conversationID, messageID: messageID) {
-                        if let info {
-                            $0.tokensPerSecond = info.tokensPerSecond
-                            $0.generationTokenCount = info.generationTokenCount
-                            $0.promptTokenCount = info.promptTokenCount
-                            $0.promptTime = info.promptTime
-                        }
-                        if let errorMessage {
-                            if $0.content.isEmpty {
-                                $0.content = "⚠️ \(errorMessage)"
-                                $0.isError = true
-                            } else {
-                                $0.content += "\n\n⚠️ room turn interrupted: \(errorMessage)"
-                            }
-                        }
-                    }
-                    self.endStreaming(messageID: messageID)
-                    self.scheduleSave()
-                })
+    @ObservationIgnored private var graphRuntimeStorage: AgentGraphRuntime?
+
+    /// Built lazily so it can capture `engine` and `mcp` after they exist.
+    var graphRuntime: AgentGraphRuntime {
+        if let graphRuntimeStorage { return graphRuntimeStorage }
+        let runtime = AgentGraphRuntime(
+            engine: engine, mcp: mcp,
+            baseSettings: { [weak self] in self?.settings ?? GenerationSettings() })
+        graphRuntimeStorage = runtime
+        return runtime
+    }
+
+    @ObservationIgnored private var graphSaveTask: Task<Void, Never>?
+
+    /// Debounced write — dragging a block fires this on every frame.
+    func scheduleGraphSave() {
+        graphSaveTask?.cancel()
+        let snapshot = agentGraphs
+        graphSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, self != nil else { return }
+            AgentGraphPersistence.save(snapshot)
         }
     }
 
-    /// "@all" or no tag → everyone; "@1 @3" → those slots, in slot order.
-    nonisolated static func roomTargets(in text: String, models: [RoomModel]) -> [RoomModel] {
-        let tokens = Set(text.lowercased().split(whereSeparator: { character in
-            !(character.isLetter || character.isNumber || character == "@" || character == "_")
-        }).map(String.init))
-        if tokens.contains("@all") { return models }
-        let picked = models.filter { tokens.contains("@\($0.slot)") }
-        return picked.isEmpty ? models : picked
+    func saveGraphsNow() {
+        graphSaveTask?.cancel()
+        graphSaveTask = nil
+        AgentGraphPersistence.save(agentGraphs)
     }
 
-    /// Rewrites the shared transcript from one participant's point of view:
-    /// its own replies stay `assistant`, other agents' replies become user-role
-    /// relays ("[2.GLM]: …"), Forge system notices are dropped.
-    private func roomTransformedHistory(
-        _ conversation: Conversation, for target: RoomModel, excluding messageID: UUID
-    ) -> Conversation {
-        var copy = conversation
-        copy.messages = conversation.messages.compactMap { message in
-            guard message.id != messageID else { return nil }
-            switch message.role {
-            case .user:
-                return message
-            case .system:
-                return nil
-            case .assistant:
-                if message.content.isEmpty || message.isErrorMessage { return nil }
-                // Slot identity wins because several agents may deliberately share
-                // one resident model/weight container.
-                let isOwnReply = message.slotNumber.map { $0 == target.slot }
-                    ?? message.producerModelID.map { $0 == target.modelID }
-                    ?? false
-                if isOwnReply { return message }
-                let speaker = message.modelName ?? "another agent"
-                return ChatMessage(role: .user, content: "[\(speaker)]:\n\(message.content)")
-            }
-        }
-        return copy
-    }
-
-    private func roomSystemPrompt(
-        for target: RoomModel, roster: [RoomModel], history: Conversation
-    ) -> String {
-        let rosterText = roster
-            .map { "\($0.slot). \($0.label)\($0.slot == target.slot ? " (you)" : "")" }
-            .joined(separator: "\n")
-        let preamble = """
-            You are agent \(target.slot) ("\(target.label)") in a shared room with other AI agents:
-            \(rosterText)
-
-            Room rules:
-            - Messages from other agents appear as lines starting with "[n.Name]:". The plain messages are from the human user.
-            - Speak ONLY as yourself. Never write lines for other agents or the user, and never prefix your reply with your own "[\(target.slot).\(target.label)]:" tag — Forge labels it for you.
-            - The user addresses agents as @1–@9 or @all. When you refer to another agent, use its number.
-            - Be direct and add something of your own; don't just restate what another agent already said.
-            """
-        let base = baseSystemPrompt(for: history).trimmingCharacters(in: .whitespacesAndNewlines)
-        return base.isEmpty ? preamble : base + "\n\n" + preamble
-    }
-
-    /// Uniform per-turn prompt: the transformed history already carries the
-    /// user's latest message and any earlier same-round replies.
-    private static let roomTurnPrompt =
-        "It is your turn to speak in the room. Respond to the latest user message above and, where relevant, to the other agents' replies. Speak only as yourself."
 
     /// Use a single OpenRouter model for chat (clears multi-select).
     func setPrimaryOpenRouterModel(_ id: String) {
@@ -550,89 +398,6 @@ final class AppState {
                 isOpenRouterCatalogLoading = false
             }
         }
-    }
-
-    var codingOrchestratorConfig: CodingOrchestratorConfig = {
-        let modelID =
-            UserDefaults.standard.string(forKey: "codingOrchestrator.modelID")
-            ?? "qwen/qwen3-coder"
-        let rounds = UserDefaults.standard.integer(forKey: "codingOrchestrator.maxRounds")
-        return CodingOrchestratorConfig(
-            modelID: modelID,
-            maxRounds: rounds > 0 ? rounds : 3)
-    }() {
-        didSet {
-            UserDefaults.standard.set(codingOrchestratorConfig.modelID, forKey: "codingOrchestrator.modelID")
-            UserDefaults.standard.set(codingOrchestratorConfig.maxRounds, forKey: "codingOrchestrator.maxRounds")
-        }
-    }
-
-    private(set) var isCodingOrchestratorRunning = false
-    private(set) var codingOrchestratorPhase = ""
-    private var codingOrchestratorTask: Task<Void, Never>?
-
-    func runCodingOrchestrator(task: String) {
-        let trimmed = task.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard hasOpenRouterKey, let key = SecretsStore.openRouterAPIKey else { return }
-        guard var conversation = selectedConversation else { return }
-
-        conversation.messages.append(ChatMessage(role: .user, content: trimmed))
-        var assistant = ChatMessage(role: .assistant, content: "# Code loop\n\nStarting…\n")
-        assistant.modelName = "Code loop · \(OpenRouterClient.label(for: codingOrchestratorConfig.modelID))"
-        conversation.messages.append(assistant)
-        conversation.refreshTitle()
-        conversation.updatedAt = Date()
-        selectedConversation = conversation
-
-        let convID = conversation.id
-        let messageID = assistant.id
-        let config = codingOrchestratorConfig
-        let client = OpenRouterClient(apiKey: key)
-
-        isCodingOrchestratorRunning = true
-        codingOrchestratorPhase = "Starting"
-        codingOrchestratorTask?.cancel()
-        codingOrchestratorTask = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                Task { @MainActor in
-                    self.isCodingOrchestratorRunning = false
-                    self.codingOrchestratorPhase = ""
-                    self.codingOrchestratorTask = nil
-                    self.scheduleSave()
-                }
-            }
-            do {
-                _ = try await CodingOrchestrator.run(
-                    task: trimmed,
-                    config: config,
-                    client: client,
-                    onPhaseStart: { round, phase in
-                        self.codingOrchestratorPhase = "R\(round) · \(phase.title)"
-                    },
-                    onPhaseComplete: { _, _, _ in },
-                    onAppend: { chunk in
-                        self.appendToMessage(conversationID: convID, messageID: messageID) {
-                            $0.content += chunk
-                        }
-                    })
-            } catch is CancellationError {
-                self.appendToMessage(conversationID: convID, messageID: messageID) {
-                    $0.content += "\n\n⏹ Code loop stopped.\n"
-                }
-            } catch {
-                self.appendToMessage(conversationID: convID, messageID: messageID) {
-                    $0.content += "\n\n⚠️ Code loop error: \(error.localizedDescription)\n"
-                    $0.isError = true
-                }
-            }
-        }
-        scheduleSave()
-    }
-
-    func stopCodingOrchestrator() {
-        codingOrchestratorTask?.cancel()
     }
 
     var hasBraveSearchKey: Bool { SecretsStore.hasBraveSearchKey }
@@ -703,20 +468,6 @@ final class AppState {
         }
         return result
     }
-
-    // MARK: - Multi-agent dispatch (bottom advanced space)
-    /// Lightweight target for clicking an agent button in the composer advanced area.
-    /// Numbered locals for "model 1 / agent 1 do X" style orchestration + all Claude options.
-    enum AgentTarget: Equatable, Hashable {
-        case local(modelID: String, number: Int, shortName: String)
-        case claude(modelID: String, label: String)
-        case openRouter(modelID: String, label: String)
-    }
-
-    /// Currently streaming agent replies (messageID -> display label like "1.Qwen 3.6 40B" or "Claude Sonnet 4.6").
-    /// Used for monitoring strip in the bottom composer area and to keep isBusy correct.
-    private(set) var inFlightAgentLabels: [UUID: String] = [:]
-    private var agentTasks: [UUID: Task<Void, Never>] = [:]
 
     var serverEnabled = false {
         didSet {
@@ -1599,287 +1350,6 @@ final class AppState {
                 })
         }
         scheduleSave()
-    }
-
-    /// Dispatch the (already mode-tagged) prompt to one specific agent target.
-    /// Supports clicking multiple agent buttons for parallel (Claude) or batched (local) execution.
-    /// Each gets its own labeled assistant bubble. Uses the pre-dispatch snapshot + prompt
-    /// so all agents on the same task see identical prior context (no cross-agent pollution on first turn).
-    /// Follow-up clicks (empty composer) re-use the last user task prompt and current transcript
-    /// (new agent sees prior agent outputs as context — useful for synthesis).
-    func dispatchToAgent(prompt: String, target: AgentTarget, images: [Data] = []) {
-        guard var conversation = selectedConversation else { return }
-        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !p.isEmpty else { return }
-        let generation = cancellationGeneration
-
-        // Snapshot before any user append for this dispatch batch. All agent backends use this + p.
-        let preSnapshot = conversation
-
-        let lastUser = conversation.messages.last(where: { $0.role == .user })?.content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let isFollowUp = (lastUser == p)
-
-        if !isFollowUp {
-            // Originating task for one or more agents: record it once in the transcript.
-            var userMessage = ChatMessage(role: .user, content: p)
-            userMessage.attachedImageData = images
-            conversation.messages.append(userMessage)
-            conversation.refreshTitle()
-            conversation.updatedAt = Date()
-            selectedConversation = conversation
-        }
-
-        // Append this agent's response placeholder (labeled for monitoring and UI).
-        var assistant = ChatMessage(role: .assistant, content: "")
-        let (label, claudeID, openRouterID, localID): (String, String?, String?, String?)
-        switch target {
-        case .local(let mid, let num, let short):
-            label = "\(num).\(short)"
-            claudeID = nil
-            openRouterID = nil
-            localID = mid
-            assistant.modelName = label
-            assistant.producerModelID = mid
-        case .claude(let mid, let lab):
-            label = lab
-            claudeID = mid
-            openRouterID = nil
-            localID = nil
-            assistant.modelName = "Agent • \(lab)"
-        case .openRouter(let mid, let lab):
-            label = lab
-            claudeID = nil
-            openRouterID = mid
-            localID = nil
-            assistant.modelName = "Agent • \(lab)"
-        }
-        conversation.messages.append(assistant)
-        let messageID = assistant.id
-        conversation.lastModelID = localID ?? claudeID ?? openRouterID ?? conversation.lastModelID
-        selectedConversation = conversation
-        beginStreaming(messageID: messageID)
-
-        inFlightAgentLabels[messageID] = label
-
-        let convID = conversation.id
-
-        // Fire the backend work. Claudes run concurrently; locals serialize inside the engine gate.
-        let work = Task { [weak self] in
-            guard let self, self.cancellationGeneration == generation else { return }
-            defer {
-                Task { @MainActor in
-                    self.finishStreamBuffer(messageID)
-                    // Close the streaming state machine — without this the bubble
-                    // spins forever and the live-buffer entries leak.
-                    self.endStreaming(messageID: messageID)
-                    self.inFlightAgentLabels.removeValue(forKey: messageID)
-                    self.agentTasks.removeValue(forKey: messageID)
-                    self.scheduleSave()
-                }
-            }
-            if let cid = claudeID {
-                await self.runClaudeAgentStream(
-                    model: cid,
-                    history: preSnapshot,
-                    prompt: p,
-                    conversationID: convID,
-                    messageID: messageID,
-                    images: images,
-                    cancellationGeneration: generation
-                )
-            } else if let oid = openRouterID {
-                await self.runOpenRouterAgentStream(
-                    model: oid,
-                    history: preSnapshot,
-                    prompt: p,
-                    conversationID: convID,
-                    messageID: messageID,
-                    images: images,
-                    cancellationGeneration: generation
-                )
-            } else if let mid = localID {
-                let systemInstructions = await self.mcpEnrichedSystemPrompt(for: preSnapshot)
-                guard self.cancellationGeneration == generation else { return }
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    self.engine.generate(
-                        conversation: self.historyWithMCPInstructions(
-                            preSnapshot, mcpSystemPrompt: systemInstructions),
-                        prompt: p,
-                        images: images,
-                        settings: self.settings,
-                        systemInstructions: systemInstructions,
-                        targetModelID: mid,
-                        onChunk: { [weak self] delta in
-                            guard self?.cancellationGeneration == generation else { return }
-                            self?.enqueueStreamDelta(
-                                delta, conversationID: convID, messageID: messageID)
-                        },
-                        onComplete: { [weak self] info, errMsg in
-                            defer { continuation.resume() }
-                            guard let self, self.cancellationGeneration == generation else { return }
-                            self.finishStreamBuffer(messageID)
-                            self.appendToMessage(conversationID: convID, messageID: messageID) {
-                                if let info {
-                                    $0.tokensPerSecond = info.tokensPerSecond
-                                    $0.generationTokenCount = info.generationTokenCount
-                                    $0.promptTokenCount = info.promptTokenCount
-                                    $0.promptTime = info.promptTime
-                                }
-                                if let errMsg {
-                                    if $0.content.isEmpty {
-                                        $0.content = "⚠️ \(errMsg)"
-                                        $0.isError = true
-                                    } else {
-                                        $0.content += "\n\n⚠️ agent interrupted: \(errMsg)"
-                                    }
-                                }
-                            }
-                        })
-                }
-                guard self.cancellationGeneration == generation else { return }
-                _ = await self.handleMCPToolRequestIfNeeded(
-                    backend: .local(modelID: mid, label: label),
-                    originalPrompt: p,
-                    images: images,
-                    conversationID: convID,
-                    messageID: messageID,
-                    cancellationGeneration: generation)
-            }
-        }
-        agentTasks[messageID] = work
-        scheduleSave()
-    }
-
-    /// Thin wrapper around the Anthropic client for an agent-specific stream (no singular claude flags).
-    private func runClaudeAgentStream(
-        model: String,
-        history: Conversation,
-        prompt: String,
-        conversationID: UUID,
-        messageID: UUID,
-        images: [Data],
-        cancellationGeneration generation: UInt64
-    ) async {
-        guard generation == cancellationGeneration else { return }
-        guard let key = SecretsStore.anthropicAPIKey, !key.isEmpty else {
-            appendToMessage(conversationID: conversationID, messageID: messageID) {
-                $0.content = "⚠️ No Anthropic API key — add one in Settings (⌘,)."
-                $0.isError = true
-            }
-            return
-        }
-        var msgs: [AnthropicClient.Message] = history.messages.compactMap { m in
-            switch m.role {
-            case .user: return .init(role: "user", text: m.content)
-            case .assistant: return (m.content.isEmpty || m.isErrorMessage) ? nil : .init(role: "assistant", text: m.content)
-            case .system: return nil
-            }
-        }
-        msgs.append(.init(role: "user", text: prompt, images: images))
-        let context = await mcpPromptContext(for: history)
-        guard generation == cancellationGeneration else { return }
-        let client = AnthropicClient(apiKey: key)
-        do {
-            try await client.stream(
-                model: model, system: context.system, messages: msgs,
-                config: anthropicStreamConfig,
-                tools: context.tools
-            ) { [weak self] delta in
-                guard self?.cancellationGeneration == generation else { return }
-                self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
-            }
-        } catch is CancellationError {
-            // user stopped
-        } catch {
-            finishStreamBuffer(messageID)
-            appendToMessage(conversationID: conversationID, messageID: messageID) {
-                if $0.content.isEmpty {
-                    $0.content = "⚠️ \(error.localizedDescription)"
-                    $0.isError = true
-                } else {
-                    $0.content += "\n\n⚠️ agent stream interrupted: \(error.localizedDescription)"
-                }
-            }
-        }
-        guard generation == cancellationGeneration else { return }
-        finishStreamBuffer(messageID)
-        _ = await handleMCPToolRequestIfNeeded(
-            backend: .claude(modelID: model),
-            originalPrompt: prompt,
-            images: [],
-            conversationID: conversationID,
-            messageID: messageID,
-            mcpDepth: 0,
-            cancellationGeneration: generation)
-    }
-
-    private func runOpenRouterAgentStream(
-        model: String,
-        history: Conversation,
-        prompt: String,
-        conversationID: UUID,
-        messageID: UUID,
-        images: [Data],
-        cancellationGeneration generation: UInt64
-    ) async {
-        guard generation == cancellationGeneration else { return }
-        guard let key = SecretsStore.openRouterAPIKey, !key.isEmpty else {
-            appendToMessage(conversationID: conversationID, messageID: messageID) {
-                $0.content = "⚠️ No OpenRouter API key — add one in Settings (⌘,)."
-                $0.isError = true
-            }
-            return
-        }
-        var msgs: [OpenRouterClient.Message] = history.messages.compactMap { message in
-            switch message.role {
-            case .user:
-                return .init(role: "user", text: message.content)
-            case .assistant:
-                return (message.content.isEmpty || message.isErrorMessage)
-                    ? nil : .init(role: "assistant", text: message.content)
-            case .system:
-                return nil
-            }
-        }
-        msgs.append(.init(role: "user", text: prompt, images: images))
-        let context = await mcpPromptContext(for: history)
-        guard generation == cancellationGeneration else { return }
-        let client = OpenRouterClient(apiKey: key)
-        do {
-            try await client.stream(
-                model: model,
-                system: context.system,
-                messages: msgs,
-                config: openRouterStreamConfig,
-                sessionID: conversationID.uuidString,
-                tools: context.tools
-            ) { [weak self] delta in
-                guard self?.cancellationGeneration == generation else { return }
-                self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
-            }
-        } catch is CancellationError {
-            // user stopped
-        } catch {
-            finishStreamBuffer(messageID)
-            appendToMessage(conversationID: conversationID, messageID: messageID) {
-                if $0.content.isEmpty {
-                    $0.content = "⚠️ \(error.localizedDescription)"
-                    $0.isError = true
-                } else {
-                    $0.content += "\n\n⚠️ OpenRouter agent interrupted: \(error.localizedDescription)"
-                }
-            }
-        }
-        guard generation == cancellationGeneration else { return }
-        finishStreamBuffer(messageID)
-        _ = await handleMCPToolRequestIfNeeded(
-            backend: .openRouter(modelID: model),
-            originalPrompt: prompt,
-            images: [],
-            conversationID: conversationID,
-            messageID: messageID,
-            mcpDepth: 0,
-            cancellationGeneration: generation)
     }
 
     /// Routes a chat turn to the Anthropic API and streams deltas into the message.
@@ -2896,9 +2366,6 @@ final class AppState {
     func stopGenerating() {
         cancellationGeneration &+= 1
         flushAllStreamBuffers()
-        roomRoundTask?.cancel()
-        roomRoundTask = nil
-        isRoomRoundRunning = false
         engine.stop()
         claudeTask?.cancel()
         openRouterTasks.values.forEach { $0.cancel() }
@@ -2916,11 +2383,6 @@ final class AppState {
         streamingReasoningByMessageID.removeAll()
         streamReasoningBuffers.removeAll()
         streamReasoningParsers.removeAll()
-        stopCodingOrchestrator()
-        // Cancel any parallel agent dispatches (locals are also covered by engine.stop via gate).
-        for t in agentTasks.values { t.cancel() }
-        agentTasks.removeAll()
-        inFlightAgentLabels.removeAll()
         scheduleSave()
     }
 

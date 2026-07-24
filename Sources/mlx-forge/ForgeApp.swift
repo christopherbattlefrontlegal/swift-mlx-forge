@@ -59,6 +59,11 @@ struct ForgeApp: App {
                     appState.showHeadlessHelper = true
                 }
                 .keyboardShortcut("h")
+                Divider()
+                Button(appState.showAgentGraph ? "Show Chat" : "Show Agent Graph") {
+                    appState.showAgentGraph.toggle()
+                }
+                .keyboardShortcut("g")
                 Button("Unload All Models") {
                     appState.stopGenerating()
                     appState.engine.unloadAll()
@@ -95,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isShuttingDown else { return .terminateNow }
         isShuttingDown = true
         dockFlame.stop()
+        AppState.shared.saveGraphsNow()
         Task { @MainActor in
             await AppState.shared.shutdownForQuit()
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -117,14 +123,21 @@ struct RootView: View {
                     ideal: 260,
                     max: 340)
         } detail: {
-            ChatView()
-                .inspector(isPresented: $app.showInspector) {
-                    TuningInspector()
-                        .inspectorColumnWidth(
-                            min: 300,
-                            ideal: 340,
-                            max: 420)
-                }
+            // Two workbenches share the detail column: the chat surface and the
+            // agent graph. The tuning inspector belongs to chat only — the graph
+            // has its own per-block inspector.
+            if app.showAgentGraph {
+                AgentGraphView()
+            } else {
+                ChatView()
+                    .inspector(isPresented: $app.showInspector) {
+                        TuningInspector()
+                            .inspectorColumnWidth(
+                                min: 300,
+                                ideal: 340,
+                                max: 420)
+                    }
+            }
         }
         .navigationSplitViewStyle(.balanced)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -152,6 +165,16 @@ struct RootView: View {
                 UnloadModelsToolbarButton()
             }
             ToolbarItemGroup(placement: .primaryAction) {
+                Picker("Workbench", selection: $app.showAgentGraph) {
+                    Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(false)
+                    Label("Graph", systemImage: "point.3.filled.connected.trianglepath.dotted")
+                        .tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 150)
+                .help("Switch between the chat surface and the agent graph")
+
                 if case .running = app.server.state {
                     Label("API", systemImage: "network")
                         .font(.caption.weight(.semibold))
@@ -164,6 +187,7 @@ struct RootView: View {
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
+                .disabled(app.showAgentGraph)
                 .help("Show or hide the tuning panel")
             }
         }

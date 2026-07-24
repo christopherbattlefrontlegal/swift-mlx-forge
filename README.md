@@ -21,8 +21,12 @@ The local installer creates an ad-hoc-signed app for the Mac that built it. A bi
 - Recursive, bounded discovery of MLX model directories and loose `.gguf` files in folders you explicitly add.
 - Explicit load, activate, unload, unload-all, and stop controls, with up to six reserved resident model slots.
 - Local MLX chat, supported MLX VLM image input, and a text-only GGUF chat path.
-- A four-model Room view with stable per-model speaker identity and `@1` through `@4` or `@all` targeting.
-- Selected-model local fan-out and confirmed multi-agent dispatch to loaded locals, the selected Claude model, and selected OpenRouter models.
+- An agent graph workbench: drag blocks onto a canvas, wire one model's output into another's input, and watch the work move through the graph as it runs.
+- Graph blocks for a task input, a model agent, a text template, a yes/no fork, text extraction, an MCP tool call, a workspace file read or write, and a collected result.
+- Any block may run a loaded local model, Anthropic, OpenAI, or OpenRouter, so a single graph can mix local and cloud models.
+- Per-block tool grants and a per-graph scoped folder, so only the blocks you choose can read or write files.
+- Starting shapes for a single agent, a code loop, a debate with a judge, a supervisor with workers, and an all-to-all round table.
+- Selected-model local fan-out for asking several loaded models the same thing at once.
 - Sampling, reasoning, thinking-budget, KV-cache, weight-loading, and system-prompt controls.
 - Saved system-prompt presets, prompt-library folders, and an optional Smart Select workflow.
 - Optional Anthropic, OpenAI, OpenRouter, Brave Search, and Hugging Face credentials stored in macOS Keychain.

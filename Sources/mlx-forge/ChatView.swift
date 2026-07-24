@@ -18,12 +18,7 @@ struct ChatView: View {
             ModelSlotBar()
             Group {
                 if let conversation = app.selectedConversation {
-                    if app.isRoomActive {
-                        RoomSplitView(conversation: conversation, onShowLargeText: { content in
-                            largeTextPopupContent = content
-                            showLargeTextPopup = true
-                        })
-                    } else if conversation.isEmpty && !app.canChat {
+                    if conversation.isEmpty && !app.canChat {
                         WelcomeView()
                     } else {
                         TranscriptView(conversation: conversation, onShowLargeText: { content in
@@ -51,10 +46,10 @@ struct ChatView: View {
     }
 }
 
-// MARK: - Model slots + Room
+// MARK: - Model slots
 
 /// Top strip: one chip per engine slot showing what's loaded where, plus the
-/// Room toggle (split-view multi-model chat) once 2+ models are resident.
+/// one chip per engine slot showing what's loaded where.
 struct ModelSlotBar: View {
     @Environment(AppState.self) private var app
 
@@ -75,28 +70,6 @@ struct ModelSlotBar: View {
                 }
                 .buttonStyle(.plain)
                 Spacer(minLength: Theme.s2)
-                if app.roomModels.count >= 2 || app.roomModeEnabled {
-                Button {
-                    app.roomModeEnabled.toggle()
-                } label: {
-                    Label("Room", systemImage: "rectangle.split.2x2")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(
-                            app.roomModeEnabled
-                                ? AnyShapeStyle(Theme.emberGradient) : AnyShapeStyle(.secondary))
-                        .padding(.horizontal, Theme.s2)
-                        .frame(height: 24)
-                        .background(
-                            app.roomModeEnabled ? .white.opacity(0.10) : .white.opacity(0.05),
-                            in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .disabled(app.isBusy)
-                .help(
-                    app.roomModeEnabled
-                        ? "Room on — split panes + shared channel. Click to return to single chat."
-                        : "Room — one pane per assigned slot (up to 9) plus a shared channel every agent sees.")
-                }
             }
         }
         .padding(.horizontal, Theme.s3)
@@ -166,132 +139,6 @@ struct ModelSlotBar: View {
             .menuStyle(.borderlessButton)
             .help("Slot \(index + 1) — empty. Click to open the model library.")
         }
-    }
-}
-
-/// Room mode: one pane per participating slot in an adaptive 1×2, 1×3,
-/// 2-column, or 3-column grid above the shared Room channel.
-private struct RoomSplitView: View {
-    @Environment(AppState.self) private var app
-    let conversation: Conversation
-    var onShowLargeText: (String) -> Void = { _ in }
-
-    var body: some View {
-        GeometryReader { proxy in
-            VStack(spacing: 0) {
-                panes
-                    .frame(height: max(240, proxy.size.height * 0.60))
-                Divider()
-                roomChannel
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var panes: some View {
-        let models = app.roomModels
-        if models.count > 3 {
-            let columns = Array(repeating: GridItem(.flexible(), spacing: 1), count: models.count >= 7 ? 3 : 2)
-            LazyVGrid(columns: columns, spacing: 1) {
-                ForEach(models) { model in
-                    ModelPaneView(model: model, conversation: conversation, onShowLargeText: onShowLargeText)
-                        .frame(minHeight: 150)
-                }
-            }
-        } else {
-            HStack(spacing: 1) {
-                ForEach(models) { model in
-                    ModelPaneView(model: model, conversation: conversation, onShowLargeText: onShowLargeText)
-                }
-            }
-        }
-    }
-
-    private var roomChannel: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: Theme.s2) {
-                Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(.caption)
-                    .foregroundStyle(Theme.emberGlow)
-                Text("Room — shared channel · @all (default) or any assigned slot @1–@9")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, Theme.s4)
-            .padding(.vertical, Theme.s1)
-            .background(.white.opacity(0.03))
-            TranscriptView(conversation: conversation, onShowLargeText: onShowLargeText)
-        }
-    }
-}
-
-/// One model's pane in the room: its replies only, filtered by stable model
-/// identity. The slot fallback keeps older saved conversations readable.
-private struct ModelPaneView: View {
-    @Environment(AppState.self) private var app
-    let model: AppState.RoomModel
-    let conversation: Conversation
-    var onShowLargeText: (String) -> Void = { _ in }
-
-    private var messages: [ChatMessage] {
-        conversation.messages.filter { message in
-            message.slotNumber == model.slot
-        }
-    }
-
-    private var isStreaming: Bool {
-        messages.contains { app.isMessageStreaming($0.id) }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: Theme.s2) {
-                Text("\(model.slot)")
-                    .font(.caption.weight(.bold).monospacedDigit())
-                    .foregroundStyle(Theme.emberGradient)
-                Text(model.label)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if isStreaming {
-                    ProgressView()
-                        .controlSize(.mini)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, Theme.s3)
-            .padding(.vertical, Theme.s1)
-            .background(.white.opacity(0.04))
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.s3) {
-                    if messages.isEmpty {
-                        Text("Waiting for @\(model.slot) or @all…")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .padding(.top, Theme.s3)
-                    }
-                    ForEach(messages) { message in
-                        MessageView(
-                            message: message,
-                            isStreaming: app.isMessageStreaming(message.id),
-                            streamingText: app.streamingTextByMessageID[message.id],
-                            streamingReasoning: app.streamingReasoningByMessageID[message.id],
-                            onShowLargeText: onShowLargeText)
-                    }
-                }
-                .padding(Theme.s3)
-            }
-            // Token generation must never seize the user's scroll position.
-            .defaultScrollAnchor(.top)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.white.opacity(0.015))
-        .overlay(
-            Rectangle().strokeBorder(.white.opacity(0.05), lineWidth: 1)
-        )
     }
 }
 
@@ -818,14 +665,12 @@ struct ComposerView: View {
     @State private var styleMode = "Standard"
     @State private var deliverableMode = "Text"
     @State private var workflowMode = "None"
-    @State private var showAgentDispatch = false
     @State private var showSmartPromptSheet = false
     @State private var showAPIModelPicker = false
     @State private var showOpenRouterModelPicker = false
     @State private var showAnthropicModelPicker = false
     @State private var showOpenAIModelPicker = false
     @State private var customOpenRouterModel = ""
-    @State private var confirmDispatchAll = false
 
     nonisolated private static let maxImageBytes = 25 * 1_024 * 1_024
     nonisolated private static let maxPendingImageBytes = 64 * 1_024 * 1_024
@@ -1121,25 +966,12 @@ struct ComposerView: View {
 
                     HStack(spacing: Theme.s3) {
                         Button {
-                            if app.isCodingOrchestratorRunning {
-                                app.stopCodingOrchestrator()
-                            } else if !app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                app.runCodingOrchestrator(task: app.composerText)
-                            }
+                            app.showAgentGraph = true
                         } label: {
-                            ToolbarIcon(app.isCodingOrchestratorRunning ? "stop.fill" : "arrow.triangle.2.circlepath")
+                            ToolbarIcon("point.3.filled.connected.trianglepath.dotted")
                         }
                         .buttonStyle(.plain)
-                        .disabled(!app.hasOpenRouterKey)
-                        .help(app.isCodingOrchestratorRunning ? "Stop code loop (\(app.codingOrchestratorPhase))" : "Code loop: planner→coder→auditor→fixer→tester via OpenRouter")
-
-                        Button {
-                            showAgentDispatch = true
-                        } label: {
-                            ToolbarIcon("person.2.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Multi-agent dispatch: send current prompt (with top Depth/Style/Deliverable modes) to loaded locals, Anthropic, and OpenRouter. Click several; they run in parallel where possible.")
+                        .help("Agent graph — wire several models together and watch them work")
 
                         Button {
                             app.showHeadlessHelper = true
@@ -1369,21 +1201,6 @@ struct ComposerView: View {
             SmartPromptSheet { task, goals, notes in
                 app.startSmartPromptSelection(task: task, goals: goals, notes: notes)
             }
-        }
-        .popover(isPresented: $showAgentDispatch, arrowEdge: .top) {
-            agentDispatchPopover
-        }
-        .confirmationDialog(
-            "Dispatch \(dispatchAllTargets.count) separate requests?",
-            isPresented: $confirmDispatchAll,
-            titleVisibility: .visible
-        ) {
-            Button("Dispatch \(dispatchAllTargets.count) Requests", role: .destructive) {
-                dispatchToAll()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(dispatchAllConfirmationMessage)
         }
         .background(.clear)
         .onAppear { focused = true }
@@ -1714,14 +1531,6 @@ struct ComposerView: View {
 
     private func performSend() {
         guard !isPreparingAttachments else { return }
-        // Room mode: route through the room round (sequential turns, shared
-        // channel). Mode tags are skipped — the room preamble does that job.
-        if app.isRoomActive {
-            let imagesToSend = pendingImages
-            pendingImages = []
-            app.sendRoom(images: imagesToSend)
-            return
-        }
         let tags = modeTags
         if !app.composerText.hasPrefix("[Depth:") {
             app.composerText = tags + app.composerText
@@ -1731,113 +1540,7 @@ struct ComposerView: View {
         app.send(images: imagesToSend)
     }
 
-    // Helpers for the AGENTS bottom space dispatch (cloud providers + numbered local MLX agents).
-    // Captures the current top config (modes) and prompt, then delegates to AppState for parallel launch + monitoring.
-    private func shortNameForButton(_ model: LocalModel) -> String {
-        var s = model.shortName
-        s = s.replacingOccurrences(of: "-Heretic-Thinking-8bit", with: "")
-        s = s.replacingOccurrences(of: "-Heretic-Thinking", with: "")
-        if s.contains("Qwen") { s = s.replacingOccurrences(of: "Qwen", with: "Qwen ") }
-        let parts = s.split(separator: "-").prefix(3).map(String.init).joined(separator: " ")
-        return parts.count > 18 ? String(parts.prefix(18)) + "…" : parts
-    }
-
-    private func dispatchTo(target: AppState.AgentTarget) {
-        switch target {
-        case .claude where !app.hasAnthropicKey:
-            attachmentError = "Add an Anthropic API key before dispatching to Claude."
-            return
-        case .openRouter where !app.hasOpenRouterKey:
-            attachmentError = "Add an OpenRouter API key before dispatching to OpenRouter."
-            return
-        default:
-            break
-        }
-
-        let text = modeTaggedDispatchPrompt
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let imgs = pendingImages
-        pendingImages = []
-        app.dispatchToAgent(prompt: text, target: target, images: imgs)
-        app.composerText = ""
-    }
-
-    private func dispatchToAll() {
-        let text = modeTaggedDispatchPrompt
-        let targets = dispatchAllTargets
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            !targets.isEmpty,
-            !isPreparingAttachments
-        else { return }
-
-        let imgs = pendingImages
-        pendingImages = []
-        app.composerText = ""
-        for target in targets {
-            app.dispatchToAgent(prompt: text, target: target, images: imgs)
-        }
-    }
-
-    /// The task currently in the composer, or the last user task when the
-    /// popover remains open after dispatching to one agent.
-    private var dispatchPromptCandidate: String {
-        let current = app.composerText
-        if !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return current
-        }
-        return app.selectedConversation?.messages.last(where: { $0.role == .user })?.content ?? ""
-    }
-
-    private var modeTaggedDispatchPrompt: String {
-        let prompt = dispatchPromptCandidate
-        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
-        return prompt.hasPrefix("[Depth:") ? prompt : modeTags + prompt
-    }
-
-    /// "All" is deliberately bounded to targets the user has actually loaded
-    /// or selected and whose provider key is available. It never fans out over
-    /// every model advertised by a provider.
-    private var dispatchAllTargets: [AppState.AgentTarget] {
-        var targets: [AppState.AgentTarget] = []
-        for (index, entry) in app.engine.loadedModels.enumerated() {
-            targets.append(
-                .local(
-                    modelID: entry.id,
-                    number: index + 1,
-                    shortName: shortNameForButton(entry.model)))
-        }
-        if app.hasAnthropicKey, let modelID = app.claudeModelID, !modelID.isEmpty {
-            targets.append(.claude(modelID: modelID, label: AnthropicClient.label(for: modelID)))
-        }
-        if app.hasOpenRouterKey {
-            for modelID in app.openRouterModelIDs where !modelID.isEmpty {
-                targets.append(
-                    .openRouter(modelID: modelID, label: OpenRouterClient.label(for: modelID)))
-            }
-        }
-        return targets
-    }
-
-    private var dispatchAllConfirmationMessage: String {
-        let attachmentNotice: String
-        if pendingImages.isEmpty {
-            attachmentNotice = "No image attachments will be sent."
-        } else {
-            attachmentNotice = "The same \(pendingImages.count) image attachment\(pendingImages.count == 1 ? "" : "s") will be sent to every target."
-        }
-        return "This will start \(dispatchAllTargets.count) separate model requests. \(attachmentNotice)"
-    }
-
-    private var canDispatchAll: Bool {
-        !dispatchAllTargets.isEmpty
-            && !modeTaggedDispatchPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !isPreparingAttachments
-    }
-
     private var placeholder: String {
-        if app.isRoomActive {
-            return "Message the room — @all (default) or any assigned slot @1–@9, e.g. \"@9 critique @1\"…"
-        }
         if app.braveSearchEnabled {
             return "Ask Brave \(app.braveSearchConfig.enableResearch ? "Research" : "Answers")…"
         }
@@ -1894,25 +1597,6 @@ struct ComposerView: View {
             }
             return "Loading \(name)…"
         }
-        if !app.inFlightAgentLabels.isEmpty {
-            let labels = app.inFlightAgentLabels.values.joined(separator: ", ")
-            if app.isBraveSearchGenerating {
-                return "Agents: \(labels) · Brave researching…"
-            }
-            if app.isClaudeGenerating {
-                return "Agents: \(labels) · Claude responding…"
-            }
-            if app.isOpenRouterGenerating {
-                return "Agents: \(labels) · OpenRouter responding…"
-            }
-            let count = app.engine.liveTokenCount
-            let tps = app.engine.liveTokensPerSecond
-            if tps > 0 {
-                return
-                    "Agents: \(labels) · \(count) tokens · \(tps.formatted(.number.precision(.fractionLength(1)))) tok/s"
-            }
-            return "Agents: \(labels) · \(count) tokens"
-        }
         if app.isBraveSearchGenerating {
             return app.braveSearchConfig.enableResearch
                 ? "Brave is researching…" : "Brave is answering…"
@@ -1931,119 +1615,6 @@ struct ComposerView: View {
         return "\(count) tokens"
     }
 
-    // Compact popover triggered from the agents icon in the bottom composer bar.
-    // Lists cloud provider options + numbered locals so user can click any button(s)
-    // to dispatch the prompt (top modes from the bar above are applied). This keeps the main
-    // composer compact (no more huge always-on block that destroyed the layout).
-    private var agentDispatchPopover: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Multi-agent dispatch")
-                .font(.headline)
-            Text("Prompt + top bar (Depth/Style/Deliverable) + system prompt will be sent. Click multiple buttons to run cloud providers in parallel or locals through the engine gate. Monitoring shows in the live bar.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !app.inFlightAgentLabels.isEmpty {
-                HStack {
-                    ProgressView().controlSize(.mini)
-                    Text("Monitoring: \(app.inFlightAgentLabels.values.joined(separator: " • "))")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(Theme.emberGlow)
-                    Spacer()
-                    Button("Stop all") { app.stopGenerating() }
-                        .font(.caption2)
-                        .buttonStyle(.bordered)
-                }
-                .padding(.vertical, 2)
-            }
-
-            if !app.engine.loadedModels.isEmpty {
-                Text("Loaded locals (use numbers for refs like \"agent 1 do X\")")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        let loaded = Array(app.engine.loadedModels.enumerated())
-                        ForEach(loaded, id: \.1.id) { idx, entry in
-                            let num = idx + 1
-                            let sname = shortNameForButton(entry.model)
-                            Button {
-                                dispatchTo(target: .local(modelID: entry.id, number: num, shortName: sname))
-                                // leave open so user can click more agents
-                            } label: {
-                                Text("\(num).\(sname) ▶")
-                                    .font(.caption2.weight(.medium))
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(Theme.ember)
-                        }
-                    }
-                }
-            }
-
-            Text("Anthropic (Claude) — click any")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(AnthropicClient.models, id: \.id) { clm in
-                        Button {
-                            dispatchTo(target: .claude(modelID: clm.id, label: clm.label))
-                        } label: {
-                            Text("\(clm.label) ▶")
-                                .font(.caption2.weight(.medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!app.hasAnthropicKey)
-                    }
-                }
-            }
-
-            Text("OpenRouter — click any")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(OpenRouterClient.models, id: \.id) { model in
-                        Button {
-                            dispatchTo(target: .openRouter(modelID: model.id, label: model.label))
-                        } label: {
-                            Text("\(model.label) ▶")
-                                .font(.caption2.weight(.medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!app.hasOpenRouterKey)
-                    }
-                }
-            }
-
-            HStack {
-                Button {
-                    confirmDispatchAll = true
-                } label: {
-                    Label(
-                        "All configured (\(dispatchAllTargets.count)) ▶",
-                        systemImage: "paperplane.fill")
-                        .font(.caption2.bold())
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.ember)
-                .disabled(!canDispatchAll)
-
-                Spacer()
-
-                Button("Close") {
-                    showAgentDispatch = false
-                }
-                .font(.caption)
-            }
-            .padding(.top, 4)
-        }
-        .padding(12)
-        .frame(minWidth: 420, maxWidth: 520)
-        .background(Theme.backgroundGradient)
-    }
 }
 
 private struct CloudModelPicker: View {
