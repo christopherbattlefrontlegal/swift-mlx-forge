@@ -142,18 +142,48 @@ $ICON_PLIST
 </plist>
 PLIST
 
-echo "── sign (ad-hoc, local testing only) ────────────────"
+# Pick a signing identity. A real certificate gives the app a STABLE code
+# signature, which is what makes Keychain "Always Allow" actually stick: the
+# ACL is bound to the signature, so an ad-hoc build gets a new identity on
+# every compile and macOS re-prompts for the password every single time.
+#
+# Preference order: explicit override, Developer ID (distributable), Apple
+# Development (local), then ad-hoc as a last resort.
+resolve_sign_id() {
+  if [[ -n "${FORGE_SIGN_ID:-}" ]]; then
+    printf '%s' "$FORGE_SIGN_ID"
+    return
+  fi
+  local identities
+  identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  local found
+  found="$(printf '%s\n' "$identities" | grep -o '"Developer ID Application:[^"]*"' | head -1 | tr -d '"')"
+  if [[ -z "$found" ]]; then
+    found="$(printf '%s\n' "$identities" | grep -o '"Apple Development:[^"]*"' | head -1 | tr -d '"')"
+  fi
+  printf '%s' "${found:--}"
+}
+
+SIGN_ID="$(resolve_sign_id)"
+if [[ "$SIGN_ID" == "-" ]]; then
+  echo "── sign (ad-hoc — no certificate found) ─────────────"
+  echo "   No signing certificate in your keychain, so this build is ad-hoc."
+  echo "   macOS will re-ask for your keychain password after every rebuild."
+else
+  echo "── sign ($SIGN_ID) ──"
+fi
+
 # Sign inside-out: nested Mach-O (Metal library + llama.framework) first, then
 # the bundle. The framework must be signed before the outer bundle or the
 # enclosing signature won't seal it and Gatekeeper/dyld will reject it.
 [[ -f "$APP/Contents/MacOS/mlx.metallib" ]] && \
-  codesign --force --sign - "$APP/Contents/MacOS/mlx.metallib"
+  codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/mlx.metallib"
 [[ -d "$APP/Contents/Frameworks/llama.framework" ]] && \
-  codesign --force --sign - "$APP/Contents/Frameworks/llama.framework"
+  codesign --force --sign "$SIGN_ID" "$APP/Contents/Frameworks/llama.framework"
 if [[ "$SANDBOX" -eq 1 ]]; then
-  codesign --force --sign - --entitlements "$ENT" "$APP"
+  codesign --force --sign "$SIGN_ID" --entitlements "$ENT" "$APP"
 else
-  codesign --force --sign - "$APP"
+  codesign --force --sign "$SIGN_ID" "$APP"
 fi
 
 echo "── verify ────────────────────────────────────────────"
@@ -181,5 +211,19 @@ fi
 
 echo "── done ──────────────────────────────────────────────"
 echo "Run it:   open '$APP'"
-echo "NOTE: ad-hoc signed = runs on THIS Mac. For TestFlight/other testers,"
-echo "      sign with your Apple cert (see MacAppStore/SUBMISSION_CHECKLIST.md)."
+case "$SIGN_ID" in
+  -)
+    echo "NOTE: ad-hoc signed = runs on THIS Mac, and macOS re-asks for your"
+    echo "      keychain password after every rebuild."
+    ;;
+  "Developer ID Application:"*)
+    echo "NOTE: Developer ID signed. Notarize before sending to other Macs"
+    echo "      (see MacAppStore/SUBMISSION_CHECKLIST.md)."
+    ;;
+  *)
+    echo "NOTE: signed with a development certificate — stable identity, so"
+    echo "      Keychain 'Always Allow' now persists across rebuilds. Other Macs"
+    echo "      still need a Developer ID cert + notarization."
+    ;;
+esac
+echo "      Override the identity with: FORGE_SIGN_ID='...' ./scripts/build-app.sh"
