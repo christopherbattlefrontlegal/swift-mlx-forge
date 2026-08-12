@@ -94,10 +94,38 @@ struct ModelPickerControl: View {
                             }
                         }
                     }
+                    if !app.openRouterCustomModels.isEmpty {
+                        Divider()
+                        ForEach(app.openRouterCustomModels, id: \.self) { modelID in
+                            Button {
+                                if app.isOpenRouterModelSelected(modelID) {
+                                    app.setPrimaryOpenRouterModel(modelID)
+                                } else {
+                                    app.setOpenRouterModel(modelID, selected: true)
+                                }
+                            } label: {
+                                if app.openRouterModelID == modelID {
+                                    Label(
+                                        OpenRouterClient.label(for: modelID),
+                                        systemImage: "checkmark.circle.fill")
+                                } else if app.isOpenRouterModelSelected(modelID) {
+                                    Label(
+                                        OpenRouterClient.label(for: modelID),
+                                        systemImage: "circle.fill")
+                                } else {
+                                    Label(
+                                        OpenRouterClient.label(for: modelID),
+                                        systemImage: "circle")
+                                }
+                            }
+                        }
+                    }
                     if !app.openRouterCatalog.isEmpty {
                         Divider()
                         ForEach(app.openRouterCatalog) { entry in
-                            if !OpenRouterClient.models.contains(where: { $0.id == entry.id }) {
+                            if !OpenRouterClient.models.contains(where: { $0.id == entry.id }),
+                                !app.openRouterCustomModels.contains(entry.id)
+                            {
                                 Button {
                                     app.setOpenRouterModel(entry.id, selected: true)
                                 } label: {

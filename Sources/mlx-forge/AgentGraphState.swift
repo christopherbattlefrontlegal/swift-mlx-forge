@@ -55,6 +55,11 @@ extension AppState {
                 result.append((id, OpenRouterClient.label(for: id)))
             }
         }
+        for id in openRouterCustomModels where !id.isEmpty {
+            if seen.insert(id).inserted {
+                result.append((id, OpenRouterClient.label(for: id)))
+            }
+        }
         for entry in openRouterCatalog.prefix(60) {
             if seen.insert(entry.id).inserted {
                 result.append((entry.id, OpenRouterClient.label(for: entry.id)))

@@ -72,15 +72,26 @@ private struct ClaudeKeySettings: View {
                                 .toggleStyle(.checkbox)
                             }
 
-                            ForEach(customOpenRouterSelections, id: \.self) { modelID in
-                                Toggle(isOn: Binding(
-                                    get: { app.isOpenRouterModelSelected(modelID) },
-                                    set: { app.setOpenRouterModel(modelID, selected: $0) }
-                                )) {
-                                    Text(OpenRouterClient.label(for: modelID))
-                                        .lineLimit(1)
+                            ForEach(app.openRouterCustomModels, id: \.self) { modelID in
+                                HStack(spacing: Theme.s1) {
+                                    Toggle(isOn: Binding(
+                                        get: { app.isOpenRouterModelSelected(modelID) },
+                                        set: { app.setOpenRouterModel(modelID, selected: $0) }
+                                    )) {
+                                        Text(OpenRouterClient.label(for: modelID))
+                                            .lineLimit(1)
+                                    }
+                                    .toggleStyle(.checkbox)
+                                    Spacer(minLength: 0)
+                                    Button {
+                                        app.removeOpenRouterCustomModel(modelID)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Remove this model from the list")
                                 }
-                                .toggleStyle(.checkbox)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -95,7 +106,7 @@ private struct ClaudeKeySettings: View {
                     Button("Add") {
                         let value = customOpenRouterModel.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !value.isEmpty {
-                            app.setOpenRouterModel(value, selected: true)
+                            app.addOpenRouterCustomModel(value)
                             customOpenRouterModel = ""
                         }
                     }
@@ -300,7 +311,11 @@ private struct ClaudeKeySettings: View {
         let key = openRouterDraft.trimmingCharacters(in: .whitespaces)
         guard !key.isEmpty else { return }
         app.setOpenRouterKey(key)
-        app.openRouterModelID = app.openRouterModelID ?? OpenRouterClient.defaultModelID
+        // Seed a default only when nothing is selected — assigning openRouterModelID
+        // unconditionally would collapse a multi-model selection to its first entry.
+        if app.openRouterModelID == nil {
+            app.openRouterModelID = OpenRouterClient.defaultModelID
+        }
         openRouterDraft = ""
     }
 
@@ -314,11 +329,6 @@ private struct ClaudeKeySettings: View {
         openAIDraft = ""
     }
 
-    private var customOpenRouterSelections: [String] {
-        app.openRouterModelIDs.filter { selected in
-            !OpenRouterClient.models.contains { $0.id == selected }
-        }
-    }
 }
 
 // MARK: - MCP servers

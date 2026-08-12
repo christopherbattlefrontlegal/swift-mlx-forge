@@ -1266,16 +1266,18 @@ struct ComposerView: View {
                             ? "checkmark.circle.fill" : "circle")
                 }
             }
-            let customIDs = app.openRouterModelIDs.filter { selected in
-                !OpenRouterClient.models.contains { $0.id == selected }
-            }
-            if !customIDs.isEmpty {
+            if !app.openRouterCustomModels.isEmpty {
                 Divider()
-                ForEach(customIDs, id: \.self) { modelID in
+                ForEach(app.openRouterCustomModels, id: \.self) { modelID in
                     Button {
-                        app.setOpenRouterModel(modelID, selected: false)
+                        app.setOpenRouterModel(
+                            modelID,
+                            selected: !app.isOpenRouterModelSelected(modelID))
                     } label: {
-                        Label(OpenRouterClient.label(for: modelID), systemImage: "checkmark.circle.fill")
+                        Label(
+                            OpenRouterClient.label(for: modelID),
+                            systemImage: app.isOpenRouterModelSelected(modelID)
+                                ? "checkmark.circle.fill" : "circle")
                     }
                 }
             }
@@ -1711,6 +1713,27 @@ private struct OpenRouterModelPicker: View {
                         }
                         .toggleStyle(.checkbox)
                     }
+                    ForEach(app.openRouterCustomModels, id: \.self) { modelID in
+                        HStack(spacing: Theme.s1) {
+                            Toggle(isOn: Binding(
+                                get: { app.isOpenRouterModelSelected(modelID) },
+                                set: { app.setOpenRouterModel(modelID, selected: $0) }
+                            )) {
+                                Text(OpenRouterClient.label(for: modelID))
+                                    .lineLimit(1)
+                            }
+                            .toggleStyle(.checkbox)
+                            Spacer(minLength: 0)
+                            Button {
+                                app.removeOpenRouterCustomModel(modelID)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove this model from the list")
+                        }
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1736,7 +1759,7 @@ private struct OpenRouterModelPicker: View {
     private func applyCustomModel() {
         let value = customModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
-        app.setOpenRouterModel(value, selected: true)
+        app.addOpenRouterCustomModel(value)
         customModel = ""
     }
 }

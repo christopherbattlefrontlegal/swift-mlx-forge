@@ -111,6 +111,18 @@ final class AppState {
             }
         }
     }
+    /// User-added OpenRouter model slugs. Kept separate from the live selection so
+    /// picking a primary model, clearing the selection, or saving the API key never
+    /// deletes a model the user added — this list only changes on explicit add/remove.
+    var openRouterCustomModels: [String] =
+        UserDefaults.standard.stringArray(forKey: "openrouter.customModels") ?? []
+    {
+        didSet {
+            guard oldValue != openRouterCustomModels else { return }
+            UserDefaults.standard.set(openRouterCustomModels, forKey: "openrouter.customModels")
+        }
+    }
+
     private(set) var isOpenRouterGenerating = false
     private var openRouterTasks: [UUID: Task<Void, Never>] = [:]
 
@@ -186,8 +198,34 @@ final class AppState {
         }
     }
 
+    /// Adds a model slug to the custom list and selects it. Idempotent.
+    func addOpenRouterCustomModel(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if !openRouterCustomModels.contains(trimmed),
+            !OpenRouterClient.models.contains(where: { $0.id == trimmed })
+        {
+            openRouterCustomModels.append(trimmed)
+        }
+        setOpenRouterModel(trimmed, selected: true)
+    }
+
+    /// Removes a model from the custom list and deselects it.
+    func removeOpenRouterCustomModel(_ id: String) {
+        openRouterCustomModels.removeAll { $0 == id }
+        setOpenRouterModel(id, selected: false)
+    }
+
     private func assignOpenRouterModelIDs(_ ids: [String]) {
         let normalized = Self.uniqueModelIDs(ids)
+        // Any selected model that isn't a preset joins the custom list, so a
+        // selection made anywhere (catalog menu, custom slug, older builds)
+        // survives restarts and primary-model switches as a removable entry.
+        let newCustom = normalized.filter { id in
+            !OpenRouterClient.models.contains(where: { $0.id == id })
+                && !openRouterCustomModels.contains(id)
+        }
+        if !newCustom.isEmpty { openRouterCustomModels.append(contentsOf: newCustom) }
         guard normalized != openRouterModelIDs else { return }
         openRouterModelIDs = normalized
     }
@@ -1672,6 +1710,11 @@ final class AppState {
         return lines.joined(separator: "\n")
     }
 
+    /// Consecutive tool calls that arrived unparseable (truncated stream, call
+    /// inside <think>, malformed JSON). Bounds the silent re-ask loop so a model
+    /// that never manages a clean call can't spin forever.
+    private var mcpParseRetryCount = 0
+
     @discardableResult
     private func handleMCPToolRequestIfNeeded(
         backend: ResponseBackend,
@@ -1698,15 +1741,37 @@ final class AppState {
         }
         guard let content = messageContent(conversationID: conversationID, messageID: messageID)
         else { return false }
+        if mcpDepth == 0 { mcpParseRetryCount = 0 }
         guard var request = Self.parseMCPCallRequest(from: content) else {
-            // The model tried to call a tool but in a shape no parser understands.
-            // Say so instead of silently ending the run mid-chain.
+            // The model tried to call a tool but in a shape no parser understands —
+            // usually a stream cut off mid-JSON or a call emitted inside <think>.
+            // Don't kill the run: quietly hand the problem back to the model so it
+            // can re-send the call. mcpParseRetryCount bounds the loop.
             if content.contains("FORGE_MCP_CALL") || content.contains("MCP request:") {
+                if mcpParseRetryCount < 3 {
+                    mcpParseRetryCount += 1
+                    continueAfterMCPToolResult(
+                        backend: backend,
+                        originalPrompt: originalPrompt,
+                        images: images,
+                        requestLabel: "tool-call-check",
+                        resultText: """
+                            Your tool call was NOT executed — it arrived malformed, cut off \
+                            mid-stream, or inside <think> (calls inside <think> are ignored). \
+                            Re-send the complete call as one single line in your visible \
+                            answer, exactly in this shape:
+                            FORGE_MCP_CALL {"server":"<server-id>","tool":"<tool-name>","arguments":{...}}
+                            """,
+                        conversationID: conversationID,
+                        mcpDepth: mcpDepth + 1,
+                        cancellationGeneration: generation)
+                    return true
+                }
                 appendSystemMessage(
                     conversationID: conversationID,
                     content: """
-                        Forge saw what looks like an MCP tool call but couldn't parse it, so the \
-                        run stopped here. Tool calls must be a single line: \
+                        The model's MCP tool call stayed unparseable after 3 automatic \
+                        retries, so the run stopped here. Tool calls must be a single line: \
                         `FORGE_MCP_CALL {"server":"<server-id>","tool":"<tool-name>","arguments":{...}}` \
                         — reply "continue" to let the model retry.
                         """
@@ -1714,6 +1779,7 @@ final class AppState {
             }
             return false
         }
+        mcpParseRetryCount = 0
 
         request.serverID = mcp.resolveEntryID(request.serverID)
         let requestLabel = "\(request.serverID).\(request.toolName)"
