@@ -1436,7 +1436,16 @@ final class InferenceEngine {
             topP: Float(settings.topP),
             topK: settings.topK,
             minP: Float(settings.minP))
-        parameters.maxTokens = settings.maxTokens > 0 ? settings.maxTokens : nil
+        // Reasoning and the visible answer (including any FORGE_MCP_CALL) share this one
+        // budget for local models with no explicit thinking cap — a small maxTokens (fine
+        // for non-reasoning models) lets a verbose <think> block starve the answer before
+        // it's written, truncating a tool call mid-JSON. Mirrors the floor already applied
+        // to the Anthropic cloud path (see AppState.anthropicStreamConfig).
+        parameters.maxTokens = settings.maxTokens <= 0
+            ? nil
+            : settings.reasoningEnabled
+                ? max(settings.maxTokens, 16_384)
+                : settings.maxTokens
         if settings.repetitionPenalty > 1.0 {
             parameters.repetitionPenalty = Float(settings.repetitionPenalty)
             parameters.repetitionContextSize = 20

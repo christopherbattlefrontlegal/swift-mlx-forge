@@ -1119,6 +1119,9 @@ final class AppState {
         - Use the exact server id and tool name from the list (e.g. server "sequential-thinking", tool "sequentialthinking").
         - Put tool arguments inside "arguments" as a JSON object matching the tool schema.
         - Example: FORGE_MCP_CALL {"server":"desktop-commander","tool":"read_file","arguments":{"path":"/path/to/file"}}
+        - Never write FORGE_MCP_CALL inside <think>...</think> — Forge ignores everything inside \
+        <think> and the call will silently fail. Close </think> first, then write FORGE_MCP_CALL \
+        as the first line of your visible answer.
         - After Forge returns the MCP result in the chat, answer the user using that result.
         """
         let trimmedInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
