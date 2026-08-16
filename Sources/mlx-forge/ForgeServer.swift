@@ -41,6 +41,9 @@ final class ForgeServer {
 
     weak var engine: InferenceEngine?
     weak var store: ModelStore?
+    /// Compiled Rivet browser app served from `/rivet/` on this same listener.
+    /// Same-origin hosting lets Rivet use the API without weakening CORS.
+    var rivetRoot: URL?
     /// Supplies default generation settings for requests that omit parameters.
     var defaultSettings: () -> GenerationSettings = { GenerationSettings() }
     /// Bearer token required for every non-OPTIONS request while listening on LAN.
@@ -230,6 +233,13 @@ final class ForgeServer {
                 return
             }
         }
+        if request.method == "GET",
+            path == "/rivet" || path.hasPrefix("/rivet/")
+                || path.hasPrefix("/monacoeditorwork/")
+        {
+            await handleRivetAsset(path: path, on: connection, allowOrigin: allowOrigin)
+            return
+        }
         switch (request.method, path) {
         case ("OPTIONS", _):
             await HTTPResponse.send(
@@ -260,6 +270,68 @@ final class ForgeServer {
     }
 
     // MARK: - Endpoints
+
+    private func handleRivetAsset(
+        path: String, on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard let root = rivetRoot?.standardizedFileURL.resolvingSymlinksInPath() else {
+            await HTTPResponse.sendError(
+                on: connection, status: "404 Not Found",
+                message: "Rivet frontend is not bundled.", allowOrigin: allowOrigin)
+            return
+        }
+
+        let encodedRelative: String
+        if path == "/rivet" || path == "/rivet/" {
+            encodedRelative = "index.html"
+        } else if path.hasPrefix("/rivet/") {
+            encodedRelative = String(path.dropFirst("/rivet/".count))
+        } else {
+            // Monaco's Vite plugin emits root-relative worker paths.
+            encodedRelative = String(path.dropFirst())
+        }
+        guard let relative = encodedRelative.removingPercentEncoding,
+            !relative.split(separator: "/").contains("..")
+        else {
+            await HTTPResponse.sendError(
+                on: connection, status: "400 Bad Request",
+                message: "Invalid asset path.", allowOrigin: allowOrigin)
+            return
+        }
+
+        let file = root.appendingPathComponent(relative)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        guard file.path.hasPrefix(root.path + "/"), let data = try? Data(contentsOf: file) else {
+            await HTTPResponse.sendError(
+                on: connection, status: "404 Not Found",
+                message: "Rivet asset not found.", allowOrigin: allowOrigin)
+            return
+        }
+        await HTTPResponse.send(
+            on: connection, status: "200 OK",
+            contentType: Self.rivetMIMEType(for: file.pathExtension), body: data,
+            allowOrigin: allowOrigin)
+    }
+
+    nonisolated private static func rivetMIMEType(for pathExtension: String) -> String {
+        switch pathExtension.lowercased() {
+        case "html": return "text/html; charset=utf-8"
+        case "js", "mjs": return "text/javascript; charset=utf-8"
+        case "css": return "text/css; charset=utf-8"
+        case "json", "map": return "application/json"
+        case "svg": return "image/svg+xml"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "ico": return "image/x-icon"
+        case "woff": return "font/woff"
+        case "woff2": return "font/woff2"
+        case "ttf": return "font/ttf"
+        case "wasm": return "application/wasm"
+        default: return "application/octet-stream"
+        }
+    }
 
     private func handleHealth(on connection: NWConnection, allowOrigin: String?) async {
         let loaded = engine?.loadedModels.map(\.model.name) ?? []

@@ -723,33 +723,6 @@ final class InferenceEngine {
                     // KV cache may be mid-turn; drop the session so the next
                     // generation re-hydrates cleanly from stored history.
                     self.sessions.removeValue(forKey: conversation.id)
-                    // Chat-template failures (Jinja.TemplateException) come from
-                    // ChatSession's templating; retry once through the token-level
-                    // path, which falls back to a hand-built ChatML prompt.
-                    if "\(error)".localizedCaseInsensitiveContains("template")
-                        || "\(error)".contains("Jinja"), entry.container != nil
-                    {
-                        do {
-                            let completionInfo = try await self.streamBudgetedMLXResponse(
-                                entry: entry,
-                                conversation: conversation,
-                                userPrompt: userPrompt,
-                                systemInstructions: resolvedSystem,
-                                images: images,
-                                settings: settings,
-                                budgetTarget: nil,
-                                noThinkPrefill: false,
-                                start: start,
-                                onChunk: onChunk)
-                            self.finishGeneration(generationID)
-                            onComplete(completionInfo, nil)
-                            return
-                        } catch {
-                            self.finishGeneration(generationID)
-                            onComplete(nil, error.localizedDescription)
-                            return
-                        }
-                    }
                     self.finishGeneration(generationID)
                     onComplete(nil, error.localizedDescription)
                 }
@@ -771,13 +744,10 @@ final class InferenceEngine {
     ) {
         let systemPrompt = systemInstructions
         let history: [(role: GGUFRuntime.HistoryRole, content: String)] =
-            conversation.messages.compactMap { message in
-                switch message.role {
-                case .user: return (.user, message.content)
-                case .assistant:
-                    if message.content.isEmpty || message.isErrorMessage { return nil }
-                    return (.assistant, message.content)
-                case .system: return nil  // carried via the template instead
+            conversation.modelReplayTurns.map { turn in
+                switch turn.role {
+                case .user: return (.user, turn.content)
+                case .assistant: return (.assistant, turn.content)
                 }
             }
 
@@ -916,20 +886,15 @@ final class InferenceEngine {
         }
 
         var history: [Chat.Message] = []
-        for message in conversation.messages {
-            switch message.role {
+        for turn in conversation.modelReplayTurns {
+            switch turn.role {
             case .user:
                 history.append(
                     .user(
-                        message.content,
-                        images: try Self.mlxImages(from: message.attachedImageData)))
-            // Don't feed our own "⚠️ …" notices back to the model as prior turns.
+                        turn.content,
+                        images: try Self.mlxImages(from: turn.images)))
             case .assistant:
-                if !message.isErrorMessage, !message.content.isEmpty {
-                    history.append(.assistant(message.content))
-                }
-            case .system:
-                history.append(.system(message.content))
+                history.append(.assistant(turn.content))
             }
         }
 
@@ -1156,17 +1121,14 @@ final class InferenceEngine {
         if !trimmedSystem.isEmpty {
             turns.append(BudgetTurn(role: "system", content: systemInstructions))
         }
-        turns.append(contentsOf: conversation.messages.compactMap { message in
-            switch message.role {
+        turns.append(contentsOf: conversation.modelReplayTurns.map { turn in
+            switch turn.role {
             case .user:
                 return BudgetTurn(
-                    role: "user", content: message.content,
-                    images: message.attachedImageData)
+                    role: "user", content: turn.content,
+                    images: turn.images)
             case .assistant:
-                return message.isErrorMessage || message.content.isEmpty
-                    ? nil : BudgetTurn(role: "assistant", content: message.content)
-            case .system:
-                return BudgetTurn(role: "system", content: message.content)
+                return BudgetTurn(role: "assistant", content: turn.content)
             }
         })
         turns.append(BudgetTurn(role: "user", content: userPrompt, images: images))
@@ -1250,28 +1212,7 @@ final class InferenceEngine {
                     }
                     let userInput = UserInput(
                         chat: messages, additionalContext: additionalContext)
-                    let lmInput: LMInput
-                    do {
-                        lmInput = try await context.processor.prepare(input: userInput)
-                    } catch {
-                        // A text-only fallback would silently discard VLM media.
-                        // Preserve the processor's image error instead so the
-                        // caller gets an honest failure rather than an answer
-                        // produced without seeing the attachment.
-                        guard turns.allSatisfy({ $0.images.isEmpty }) else {
-                            throw error
-                        }
-                        // Chat-template failure (e.g. Jinja.TemplateException on an
-                        // exotic community template): fall back to a hand-built
-                        // ChatML prompt so the turn still generates.
-                        let fallback =
-                            turns.map { "<|im_start|>\($0.role)\n\($0.content)<|im_end|>" }
-                            .joined(separator: "\n") + "\n<|im_start|>assistant\n"
-                        let ids = context.tokenizer.encode(
-                            text: fallback, addSpecialTokens: false)
-                        lmInput = LMInput(
-                            text: .init(tokens: MLXArray(ids.map { Int32($0) })))
-                    }
+                    let lmInput = try await context.processor.prepare(input: userInput)
 
                     var promptTokens = lmInput.text.tokens
                     if let prefillText {

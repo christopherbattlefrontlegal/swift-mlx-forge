@@ -18,6 +18,7 @@ ENT="$ROOT/MacAppStore/Forge.entitlements"
 EXE="$ROOT/.build/release/mlx-forge"
 METALLIB="$ROOT/.build/release/mlx.metallib"
 DESIGN_PROMPT_DIST="$ROOT/BundledTools/ai-design-prompt/dist"
+RIVET_DIST="$ROOT/BundledTools/rivet/dist"
 # llama.cpp (GGUF) backend, packaged as a framework by LLM.swift. The Forge binary
 # links it as @rpath/llama.framework/...; if it's not bundled, dyld aborts the app
 # at launch ("Library not loaded: @rpath/llama.framework"). Must be copied into
@@ -59,6 +60,9 @@ need_tool install_name_tool
 if [[ ! -f "$DESIGN_PROMPT_DIST/index.html" ]]; then
   need_tool npm
 fi
+if [[ ! -f "$RIVET_DIST/index.html" ]]; then
+  need_tool node
+fi
 
 echo "── security gate ─────────────────────────────────────"
 if [[ "$SANDBOX" -eq 1 ]]; then
@@ -94,6 +98,12 @@ if [[ ! -f "$DESIGN_PROMPT_DIST/index.html" ]]; then
 fi
 [[ -f "$DESIGN_PROMPT_DIST/index.html" ]] || { echo "FATAL: Design prompt dist missing ($DESIGN_PROMPT_DIST). Aborting."; exit 1; }
 
+if [[ ! -f "$RIVET_DIST/index.html" ]]; then
+  echo "Rivet bundle missing — building vendored Ironclad Rivet frontend…"
+  "$ROOT/scripts/build-rivet.sh"
+fi
+[[ -f "$RIVET_DIST/index.html" ]] || { echo "FATAL: Rivet dist missing ($RIVET_DIST). Aborting."; exit 1; }
+
 echo "── assemble bundle ───────────────────────────────────"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
@@ -113,6 +123,9 @@ if [[ -f "$ROOT/assets/AppIcon.icns" ]]; then
 fi
 mkdir -p "$APP/Contents/Resources/DesignPrompt"
 cp -R "$DESIGN_PROMPT_DIST/"* "$APP/Contents/Resources/DesignPrompt/"
+mkdir -p "$APP/Contents/Resources/Rivet" "$APP/Contents/Resources/ThirdPartyLicenses"
+cp -R "$RIVET_DIST/"* "$APP/Contents/Resources/Rivet/"
+cp "$ROOT/BundledTools/rivet/LICENSE" "$APP/Contents/Resources/ThirdPartyLicenses/Rivet-MIT.txt"
 cat > "$APP/Contents/Resources/mcp.json" <<'JSON'
 {
   "mcpServers": {

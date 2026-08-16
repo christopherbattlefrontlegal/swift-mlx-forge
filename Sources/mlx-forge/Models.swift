@@ -15,6 +15,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var role: Role
     var content: String
+    var reasoning: String = ""
     var timestamp: Date = Date()
 
     /// Attached images for this message (primarily for user turns with photos).
@@ -47,6 +48,8 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         id: UUID = UUID(),
         role: Role,
         content: String,
+        reasoning: String = "",
+        reasoningStructureValid: Bool = true,
         timestamp: Date = Date(),
         attachedImageData: [Data] = [],
         modelName: String? = nil,
@@ -61,6 +64,8 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         self.id = id
         self.role = role
         self.content = content
+        self.reasoning = reasoning
+        self.reasoningStructureValid = reasoningStructureValid
         self.timestamp = timestamp
         self.attachedImageData = attachedImageData
         self.modelName = modelName
@@ -75,6 +80,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, role, content, timestamp, attachedImageData, modelName, producerModelID
+        case reasoning, reasoningStructureValid
         case tokensPerSecond, generationTokenCount, promptTokenCount, promptTime
         case slotNumber, isError
     }
@@ -86,6 +92,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         role = try c.decode(Role.self, forKey: .role)
         content = try c.decode(String.self, forKey: .content)
+        reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning) ?? ""
         timestamp = try c.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
         attachedImageData = try c.decodeIfPresent([Data].self, forKey: .attachedImageData) ?? []
         modelName = try c.decodeIfPresent(String.self, forKey: .modelName)
@@ -96,44 +103,47 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         promptTime = try c.decodeIfPresent(TimeInterval.self, forKey: .promptTime)
         slotNumber = try c.decodeIfPresent(Int.self, forKey: .slotNumber)
         isError = try c.decodeIfPresent(Bool.self, forKey: .isError)
+        reasoningStructureValid = try c.decodeIfPresent(Bool.self, forKey: .reasoningStructureValid) ?? true
     }
 
     /// Splits assistant content into reasoning ("<think>…</think>") and answer parts,
-    /// in document order. Handles a still-streaming unterminated think block, and
-    /// models whose chat template pre-opens the tag so output starts mid-reasoning
-    /// and only a closing "</think>" appears.
+    /// while preserving stored reasoning from the structured parser so legacy records
+    /// remain backwards-compatible.
     var segments: [Segment] {
         var result: [Segment] = []
-        var normalized = content
-        if let close = normalized.range(of: "</think>") {
-            let head = normalized[..<close.lowerBound]
-            if !head.contains("<think>") {
-                normalized = "<think>" + normalized
-            }
+        let storedReasoning = withoutReasoningControlTags(reasoning)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !storedReasoning.isEmpty {
+            result.append(Segment(id: result.count, kind: .thinking(done: true), text: storedReasoning))
         }
-        var remaining = Substring(normalized)
+
+        var remaining = content
         // ids are positional (0,1,2…) so identity is STABLE across recomputes while
         // streaming — SwiftUI then updates each segment's text in place instead of
         // tearing down and rebuilding every bubble on every token (which also reset
         // the ThinkingBlock's expand state and thrashed the main thread).
         while let open = remaining.range(of: "<think>") {
-            let before = remaining[..<open.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            let before = withoutReasoningControlTags(
+                String(remaining[..<open.lowerBound]))
             if !before.isEmpty { result.append(Segment(id: result.count, kind: .answer, text: before)) }
             let afterOpen = remaining[open.upperBound...]
             if let close = afterOpen.range(of: "</think>") {
-                let thought = afterOpen[..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                let thought = withoutReasoningControlTags(
+                    String(afterOpen[..<close.lowerBound]))
                 if !thought.isEmpty {
                     result.append(Segment(id: result.count, kind: .thinking(done: true), text: thought))
                 }
-                remaining = afterOpen[close.upperBound...]
+                remaining = String(afterOpen[close.upperBound...])
             } else {
-                let thought = afterOpen.trimmingCharacters(in: .whitespacesAndNewlines)
+                let thought = withoutReasoningControlTags(String(afterOpen))
                 result.append(Segment(id: result.count, kind: .thinking(done: false), text: thought))
-                remaining = Substring("")
+                remaining = ""
             }
         }
-        let tail = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { result.append(Segment(id: result.count, kind: .answer, text: tail)) }
+        let tail = withoutReasoningControlTags(remaining)
+        if !tail.isEmpty {
+            result.append(Segment(id: result.count, kind: .answer, text: tail))
+        }
         return result
     }
 
@@ -147,7 +157,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
                 if case .answer = segment.kind, !segment.text.isEmpty { return segment.text }
                 return nil
             }
-            if !answers.isEmpty { return answers.joined(separator: "\n\n") }
+            if !answers.isEmpty { return answers.joined() }
             if segments.contains(where: { segment in
                 if case .thinking = segment.kind { return true }
                 return false
@@ -156,6 +166,73 @@ struct ChatMessage: Identifiable, Codable, Equatable {
             }
             return content
         }
+    }
+
+    var reasoningStructureValid: Bool = true
+
+    var modelVisibleContent: String {
+        switch role {
+        case .user, .system:
+            return content
+        case .assistant:
+            if isErrorMessage { return "" }
+            if !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && (content.contains("<think>") || content.contains("</think>"))
+            {
+                return ""
+            }
+            if reasoningStructureValid == false { return "" }
+            if reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                guard hasBalancedLegacyReasoningTags else { return "" }
+                return copyableText
+            }
+            return content
+        }
+    }
+
+    var isModelReplayable: Bool {
+        !modelVisibleContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var hasBalancedLegacyReasoningTags: Bool {
+        let openTag = "<think>"
+        let closeTag = "</think>"
+        var isThinking = false
+        var cursor = content.startIndex
+
+        while cursor < content.endIndex {
+            let searchRange = cursor..<content.endIndex
+            let openRange = content.range(of: openTag, range: searchRange)
+            let closeRange = content.range(of: closeTag, range: searchRange)
+            let next: (isOpen: Bool, range: Range<String.Index>)?
+            switch (openRange, closeRange) {
+            case (.none, .none):
+                next = nil
+            case (.some(let range), .none):
+                next = (true, range)
+            case (.none, .some(let range)):
+                next = (false, range)
+            case (.some(let open), .some(let close)):
+                next = open.lowerBound <= close.lowerBound
+                    ? (true, open) : (false, close)
+            }
+
+            guard let next else { break }
+            if next.isOpen {
+                guard !isThinking else { return false }
+                isThinking = true
+            } else {
+                guard isThinking else { return false }
+                isThinking = false
+            }
+            cursor = next.range.upperBound
+        }
+        return !isThinking
+    }
+
+    private func withoutReasoningControlTags(_ text: String) -> String {
+        text.replacingOccurrences(of: "<think>", with: "")
+            .replacingOccurrences(of: "</think>", with: "")
     }
 
     struct Segment: Identifiable, Equatable {
@@ -167,6 +244,17 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         var kind: Kind
         var text: String
     }
+}
+
+struct ModelReplayTurn: Equatable {
+    enum Role: Equatable {
+        case user
+        case assistant
+    }
+
+    var role: Role
+    var content: String
+    var images: [Data] = []
 }
 
 struct Conversation: Identifiable, Codable, Equatable {
@@ -213,6 +301,26 @@ struct Conversation: Identifiable, Codable, Equatable {
     }
 
     var isEmpty: Bool { messages.isEmpty }
+
+    /// Canonical model-visible history shared by every local replay backend.
+    var modelReplayTurns: [ModelReplayTurn] {
+        messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return ModelReplayTurn(
+                    role: .user,
+                    content: message.content,
+                    images: message.attachedImageData)
+            case .assistant:
+                guard message.isModelReplayable else { return nil }
+                return ModelReplayTurn(
+                    role: .assistant,
+                    content: message.modelVisibleContent)
+            case .system:
+                return nil
+            }
+        }
+    }
 
     /// User + assistant turns for clipboard (no system, no thinking blocks).
     var copyableTranscript: String {

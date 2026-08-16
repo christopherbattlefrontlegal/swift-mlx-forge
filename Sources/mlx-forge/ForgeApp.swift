@@ -23,7 +23,7 @@ struct ForgeApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("Forge", id: "main") {
             RootView()
                 .environment(appState)
                 .preferredColorScheme(.dark)
@@ -33,16 +33,7 @@ struct ForgeApp: App {
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
         .restorationBehavior(.disabled)
-        .defaultWindowPlacement { _, context in
-            WindowPlacement(
-                .center,
-                size: context.defaultDisplay.visibleRect.size)
-        }
-        .windowIdealPlacement { _, context in
-            WindowPlacement(
-                .center,
-                size: context.defaultDisplay.visibleRect.size)
-        }
+        .defaultSize(width: 1440, height: 900)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
@@ -55,13 +46,13 @@ struct ForgeApp: App {
                     appState.showModelBrowser = true
                 }
                 .keyboardShortcut("m")
-                Button("Headless Helper…") {
+                Button("Claude Code Builder…") {
                     appState.showHeadlessHelper = true
                 }
                 .keyboardShortcut("h")
                 Divider()
-                Button(appState.showAgentGraph ? "Show Chat" : "Show Agent Graph") {
-                    appState.showAgentGraph.toggle()
+                Button(appState.showRivet ? "Show Chat" : "Show Forge Graph") {
+                    appState.showRivet.toggle()
                 }
                 .keyboardShortcut("g")
                 Button("Unload All Models") {
@@ -96,11 +87,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.beginMCP()
     }
 
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        guard !flag else { return true }
+        if let window = sender.windows.first(where: { $0.canBecomeMain }) {
+            window.makeKeyAndOrderFront(nil)
+            sender.activate(ignoringOtherApps: true)
+        }
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !isShuttingDown else { return .terminateNow }
         isShuttingDown = true
         dockFlame.stop()
-        AppState.shared.saveGraphsNow()
         Task { @MainActor in
             await AppState.shared.shutdownForQuit()
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -123,11 +129,9 @@ struct RootView: View {
                     ideal: 260,
                     max: 340)
         } detail: {
-            // Two workbenches share the detail column: the chat surface and the
-            // agent graph. The tuning inspector belongs to chat only — the graph
-            // has its own per-block inspector.
-            if app.showAgentGraph {
-                AgentGraphView()
+            // Chat and Rivet share the detail column and the same Forge model library.
+            if app.showRivet {
+                RivetView()
             } else {
                 ChatView()
                     .inspector(isPresented: $app.showInspector) {
@@ -165,7 +169,7 @@ struct RootView: View {
                 UnloadModelsToolbarButton()
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                Picker("Workbench", selection: $app.showAgentGraph) {
+                Picker("Workbench", selection: $app.showRivet) {
                     Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(false)
                     Label("Graph", systemImage: "point.3.filled.connected.trianglepath.dotted")
                         .tag(true)
@@ -173,7 +177,7 @@ struct RootView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 150)
-                .help("Switch between the chat surface and the agent graph")
+                .help("Switch between Forge chat and Forge Graph")
 
                 if case .running = app.server.state {
                     Label("API", systemImage: "network")
@@ -187,7 +191,7 @@ struct RootView: View {
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
-                .disabled(app.showAgentGraph)
+                .disabled(app.showRivet)
                 .help("Show or hide the tuning panel")
             }
         }

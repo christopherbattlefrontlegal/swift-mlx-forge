@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>self["MonacoEnvironment"] = (function (paths) {
+          return {
+            globalAPI: false,
+            getWorkerUrl : function (moduleId, label) {
+              var result =  paths[label];
+              if (/^((http:)|(https:)|(file:)|(\/\/))/.test(result)) {
+                var currentUrl = String(window.location);
+                var currentOrigin = currentUrl.substr(0, currentUrl.length - window.location.hash.length - window.location.search.length - window.location.pathname.length);
+                if (result.substring(0, currentOrigin.length) !== currentOrigin) {
+                  var js = '/*' + label + '*/importScripts("' + result + '");';
+                  var blob = new Blob([js], { type: 'application/javascript' });
+                  return URL.createObjectURL(blob);
+                }
+              }
+              return result;
+            }
+          };
+        })({
+  "editorWorkerService": "/rivet/monacoeditorwork/editor.worker.bundle.js",
+  "css": "/rivet/monacoeditorwork/css.worker.bundle.js",
+  "html": "/rivet/monacoeditorwork/html.worker.bundle.js",
+  "json": "/rivet/monacoeditorwork/json.worker.bundle.js",
+  "typescript": "/rivet/monacoeditorwork/ts.worker.bundle.js",
+  "javascript": "/rivet/monacoeditorwork/ts.worker.bundle.js",
+  "less": "/rivet/monacoeditorwork/css.worker.bundle.js",
+  "scss": "/rivet/monacoeditorwork/css.worker.bundle.js",
+  "handlebars": "/rivet/monacoeditorwork/html.worker.bundle.js",
+  "razor": "/rivet/monacoeditorwork/html.worker.bundle.js"
+});</script>
+
+    <meta charset="utf-8" />
+    <link rel="icon" href="/rivet/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto+Mono&display=swap" />
+    <meta name="description" content="Forge - local AI graph and agent IDE" />
+    <link rel="apple-touch-icon" href="/rivet/favicon.png" />
+    <link rel="manifest" href="/rivet/manifest.json" />
+    <title>Forge Graph</title>
+    <script type="module" crossorigin src="/rivet/assets/index-DhC-IHuC.js"></script>
+    <link rel="modulepreload" crossorigin href="/rivet/assets/gpt-tokenizer-CLwzNJo5.js">
+    <link rel="modulepreload" crossorigin href="/rivet/assets/vendor-MD5pFk6D.js">
+    <link rel="stylesheet" crossorigin href="/rivet/assets/vendor-RK70pPfR.css">
+    <link rel="stylesheet" crossorigin href="/rivet/assets/index-DhiEd2MB.css">
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>

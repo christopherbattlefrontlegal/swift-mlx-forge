@@ -966,12 +966,12 @@ struct ComposerView: View {
 
                     HStack(spacing: Theme.s3) {
                         Button {
-                            app.showAgentGraph = true
+                            app.showRivet = true
                         } label: {
                             ToolbarIcon("point.3.filled.connected.trianglepath.dotted")
                         }
                         .buttonStyle(.plain)
-                        .help("Agent graph — wire several models together and watch them work")
+                        .help("Forge Graph — build and run AI workflows")
 
                         Button {
                             app.showHeadlessHelper = true
@@ -985,7 +985,7 @@ struct ComposerView: View {
                                 .background(.white.opacity(0.06), in: Capsule())
                         }
                         .buttonStyle(.plain)
-                        .help("Headless Command Cheat Sheet")
+                        .help("Build a Claude Code non-interactive command")
                     }
 
                     Spacer(minLength: Theme.s6)
@@ -1524,17 +1524,27 @@ struct ComposerView: View {
     /// Mode tags prepended to every send/dispatch; the Workflow pick joins the
     /// Depth/Style/Deliverable tags so the model receives it as an instruction.
     private var modeTags: String {
-        var tags = "[Depth: \(depthMode)] [Style: \(styleMode)] [Deliverable: \(deliverableMode)] "
-        if workflowMode != "None" {
-            tags += "[Workflow: \(workflowMode)] "
-        }
-        return tags
+        var tags: [String] = []
+        if depthMode != "Balanced" { tags.append("[Depth: \(depthMode)]") }
+        if styleMode != "Standard" { tags.append("[Style: \(styleMode)]") }
+        if deliverableMode != "Text" { tags.append("[Deliverable: \(deliverableMode)]") }
+        if workflowMode != "None" { tags.append("[Workflow: \(workflowMode)]") }
+        return tags.isEmpty ? "" : tags.joined(separator: " ") + " "
+    }
+
+    private var shouldPrefixModeTags: Bool {
+        let tags = modeTags
+        return !tags.isEmpty
+            && !app.composerText.hasPrefix("[Depth:")
+            && !app.composerText.hasPrefix("[Style:")
+            && !app.composerText.hasPrefix("[Deliverable:")
+            && !app.composerText.hasPrefix("[Workflow:")
     }
 
     private func performSend() {
         guard !isPreparingAttachments else { return }
         let tags = modeTags
-        if !app.composerText.hasPrefix("[Depth:") {
+        if shouldPrefixModeTags {
             app.composerText = tags + app.composerText
         }
         let imagesToSend = pendingImages

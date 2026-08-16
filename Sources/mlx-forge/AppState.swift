@@ -340,62 +340,20 @@ final class AppState {
         scheduleSave()
     }
 
-    // MARK: - Agent graphs
-    //
-    // Replaces the old Room, the multi-agent dispatch popover, and the fixed
-    // five-role coding loop. All three were special cases of "several models,
-    // wired together"; the graph is that primitive, and each of them is now a
-    // preset you can take apart.
+    // MARK: - Rivet workbench
 
-    var agentGraphs: [AgentGraph] = AgentGraphPersistence.load() {
-        didSet { scheduleGraphSave() }
-    }
-
-    var selectedGraphID: UUID? = AgentGraphPersistence.loadSelectedID() {
+    /// True when the detail pane hosts the bundled Rivet graph IDE. The old
+    /// graph visibility key is read once as a migration for existing installs.
+    var showRivet: Bool = {
+        if UserDefaults.standard.object(forKey: "rivet.visible") != nil {
+            return UserDefaults.standard.bool(forKey: "rivet.visible")
+        }
+        return UserDefaults.standard.bool(forKey: "graph.visible")
+    }() {
         didSet {
-            if let selectedGraphID {
-                UserDefaults.standard.set(selectedGraphID.uuidString, forKey: "graph.selectedID")
-            }
+            UserDefaults.standard.set(showRivet, forKey: "rivet.visible")
+            reconcileServerLifecycle()
         }
-    }
-
-    /// The task typed into the run bar.
-    var graphTaskText: String = ""
-
-    /// True when the detail pane shows the graph workbench instead of chat.
-    var showAgentGraph: Bool = UserDefaults.standard.bool(forKey: "graph.visible") {
-        didSet { UserDefaults.standard.set(showAgentGraph, forKey: "graph.visible") }
-    }
-
-    @ObservationIgnored private var graphRuntimeStorage: AgentGraphRuntime?
-
-    /// Built lazily so it can capture `engine` and `mcp` after they exist.
-    var graphRuntime: AgentGraphRuntime {
-        if let graphRuntimeStorage { return graphRuntimeStorage }
-        let runtime = AgentGraphRuntime(
-            engine: engine, mcp: mcp,
-            baseSettings: { [weak self] in self?.settings ?? GenerationSettings() })
-        graphRuntimeStorage = runtime
-        return runtime
-    }
-
-    @ObservationIgnored private var graphSaveTask: Task<Void, Never>?
-
-    /// Debounced write — dragging a block fires this on every frame.
-    func scheduleGraphSave() {
-        graphSaveTask?.cancel()
-        let snapshot = agentGraphs
-        graphSaveTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled, self != nil else { return }
-            AgentGraphPersistence.save(snapshot)
-        }
-    }
-
-    func saveGraphsNow() {
-        graphSaveTask?.cancel()
-        graphSaveTask = nil
-        AgentGraphPersistence.save(agentGraphs)
     }
 
 
@@ -510,13 +468,7 @@ final class AppState {
     var serverEnabled = false {
         didSet {
             guard oldValue != serverEnabled else { return }
-            if serverEnabled {
-                server.start(
-                    port: UInt16(clamping: serverPort),
-                    exposeToNetwork: serverExposeToNetwork)
-            } else {
-                server.stop()
-            }
+            reconcileServerLifecycle()
             scheduleSave()
         }
     }
@@ -525,11 +477,7 @@ final class AppState {
     var serverPort = 3737 {
         didSet {
             guard oldValue != serverPort else { return }
-            if serverEnabled {
-                server.start(
-                    port: UInt16(clamping: serverPort),
-                    exposeToNetwork: serverExposeToNetwork)
-            }
+            reconcileServerLifecycle()
             scheduleSave()
         }
     }
@@ -537,11 +485,7 @@ final class AppState {
     var serverExposeToNetwork = false {
         didSet {
             guard oldValue != serverExposeToNetwork else { return }
-            if serverEnabled {
-                server.start(
-                    port: UInt16(clamping: serverPort),
-                    exposeToNetwork: serverExposeToNetwork)
-            }
+            reconcileServerLifecycle()
             scheduleSave()
         }
     }
@@ -551,6 +495,25 @@ final class AppState {
     var showHeadlessHelper = false
     var showDesignPrompt = false
     var showSystemPromptEditor = false
+
+    /// Rivet uses Forge's existing OpenAI-compatible server as a normal client.
+    /// Keep it alive while either the public API toggle or the Rivet workbench
+    /// needs it; Forge remains the sole owner of model loading and inference.
+    private func reconcileServerLifecycle() {
+        if serverEnabled || showRivet {
+            server.start(
+                port: UInt16(clamping: serverPort),
+                exposeToNetwork: serverExposeToNetwork)
+        } else {
+            server.stop()
+        }
+    }
+
+    func ensureRivetServer() {
+        guard showRivet else { return }
+        if case .running = server.state { return }
+        reconcileServerLifecycle()
+    }
 
     var composerText = ""
 
@@ -638,6 +601,7 @@ final class AppState {
 
         server.engine = engine
         server.store = store
+        server.rivetRoot = RivetLocator.siteRoot()
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
         server.apiKey = { SecretsStore.localServerAPIKey ?? "" }
         engine.weightLoadPolicy = { [weak self] in self?.settings.weightLoadPolicy ?? .eager }
@@ -662,11 +626,7 @@ final class AppState {
         serverPort = persistedSettings.serverPort
         serverExposeToNetwork = persistedSettings.serverExposeToNetwork
         serverEnabled = persistedSettings.serverEnabled
-        if serverEnabled {
-            server.start(
-                port: UInt16(clamping: serverPort),
-                exposeToNetwork: serverExposeToNetwork)
-        }
+        reconcileServerLifecycle()
 
         assignOpenRouterModelIDs(openRouterModelIDs)
         refreshPrompts()
@@ -1419,8 +1379,9 @@ final class AppState {
             case .assistant:
                 // Skip empty placeholders and our own error notices — replaying a
                 // "⚠️ …" bubble as an assistant turn poisons later context.
-                return (m.content.isEmpty || m.isErrorMessage)
-                    ? nil : .init(role: "assistant", text: m.content)
+                let visible = m.modelVisibleContent
+                return (visible.isEmpty || m.isErrorMessage)
+                    ? nil : .init(role: "assistant", text: visible)
             case .system: return nil
             }
         }
@@ -1499,8 +1460,9 @@ final class AppState {
             case .user:
                 return .init(role: "user", text: message.content)
             case .assistant:
-                return (message.content.isEmpty || message.isErrorMessage)
-                    ? nil : .init(role: "assistant", text: message.content)
+                let visible = message.modelVisibleContent
+                return (visible.isEmpty || message.isErrorMessage)
+                    ? nil : .init(role: "assistant", text: visible)
             case .system:
                 return nil
             }
@@ -1582,8 +1544,9 @@ final class AppState {
             case .user:
                 return .init(role: "user", text: message.content)
             case .assistant:
-                return (message.content.isEmpty || message.isErrorMessage)
-                    ? nil : .init(role: "assistant", text: message.content)
+                let visible = message.modelVisibleContent
+                return (visible.isEmpty || message.isErrorMessage)
+                    ? nil : .init(role: "assistant", text: visible)
             case .system:
                 return nil
             }
@@ -2509,8 +2472,10 @@ final class AppState {
     private func finishStreamBuffer(_ messageID: UUID) {
         streamFlushTasks[messageID]?.cancel()
         streamFlushTasks[messageID] = nil
+        var parserStructurallyValid = true
         if var parser = streamReasoningParsers.removeValue(forKey: messageID) {
             let tail = parser.finalize()
+            parserStructurallyValid = parser.isStructurallyValid
             if !tail.reasoning.isEmpty {
                 streamReasoningBuffers[messageID, default: ""] += tail.reasoning
             }
@@ -2534,10 +2499,11 @@ final class AppState {
         let reasoning = streamingReasoningByMessageID[messageID] ?? ""
         let content = streamingTextByMessageID[messageID] ?? ""
         appendToMessage(conversationID: conversationID, messageID: messageID) {
-            // Re-wrap reasoning in <think> so the finished ThinkingBlock
-            // (which parses message.content) still renders the block.
-            $0.content = reasoning.isEmpty
-                ? content : "<think>\(reasoning)</think>\n\n\(content)"
+            // Persist reasoning and visible content separately so malformed tags
+            // remain inspectable without polluting replay history.
+            $0.reasoning = reasoning
+            $0.reasoningStructureValid = parserStructurallyValid
+            $0.content = content
         }
         streamBufferConversationIDs[messageID] = nil
     }

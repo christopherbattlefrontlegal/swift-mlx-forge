@@ -66,6 +66,11 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/mlx-forge"
+        ),
+        .testTarget(
+            name: "mlx-forgeTests",
+            dependencies: ["mlx-forge"],
+            path: "Tests/mlx-forgeTests"
         )
     ]
 )
