@@ -443,7 +443,8 @@ final class ForgeServer {
             history: history,
             generateParameters: parameters,
             additionalContext: InferenceEngine.thinkingAdditionalContext(
-                for: entry, enabled: settings.localThinkingEnabled))
+                for: entry, enabled: settings.localThinkingEnabled,
+                effort: settings.localReasoningEffort))
         let responseID = "chatcmpl-\(UUID().uuidString.prefix(12))"
         let created = Int(Date().timeIntervalSince1970)
 

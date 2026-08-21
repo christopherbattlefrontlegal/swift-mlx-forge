@@ -8,6 +8,8 @@ enum ChatTemplateSniffer {
         var hasChatTemplate = false
         /// Template reads `enable_thinking` from kwargs (Qwen3 README-style).
         var supportsThinkingToggle = false
+        /// Template reads Inkling-style `reasoning_effort` from kwargs.
+        var supportsReasoningEffort = false
         /// No off-branch in template — thinking cannot be disabled via kwargs.
         var thinkingOnly = false
         /// `add_generation_prompt` opens a `` block (always-on reasoning).
@@ -35,6 +37,7 @@ enum ChatTemplateSniffer {
                 || lower.contains("enable_thinking is false")
             caps.thinkingOnly = !hasOffBranch
         }
+        caps.supportsReasoningEffort = template.contains("reasoning_effort")
         if detectsBuiltInThinkingPrompt(in: template) {
             caps.thinkingBuiltIntoTemplate = true
         }

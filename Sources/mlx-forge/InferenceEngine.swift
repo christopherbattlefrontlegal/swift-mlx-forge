@@ -42,6 +42,8 @@ final class InferenceEngine {
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
         let chatTemplateSupportsThinkingToggle: Bool
+        /// Sniffed at load: template defines `reasoning_effort` (Inkling).
+        let chatTemplateSupportsReasoningEffort: Bool
         /// Sniffed at load: template has no off-branch for `enable_thinking`.
         let chatTemplateThinkingOnly: Bool
         /// Sniffed at load: generation prompt always opens a `` block.
@@ -61,6 +63,7 @@ final class InferenceEngine {
             self.qwenMTPEnabled = qwenMTPEnabled
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
+            self.chatTemplateSupportsReasoningEffort = templateCaps.supportsReasoningEffort
             self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
             self.chatTemplateThinkingBuiltIn = templateCaps.thinkingBuiltIntoTemplate
         }
@@ -558,6 +561,7 @@ final class InferenceEngine {
         var messageCount: Int
         var systemPrompt: String
         var localThinkingEnabled: Bool
+        var localReasoningEffort: String
         var localThinkingMaxTokens: Int
     }
 
@@ -874,10 +878,12 @@ final class InferenceEngine {
             box.systemPrompt == systemPrompt,
             box.messageCount == conversation.messages.count,
             box.localThinkingEnabled == settings.localThinkingEnabled,
+            box.localReasoningEffort == settings.localReasoningEffort,
             box.localThinkingMaxTokens == settings.localThinkingMaxTokens
         {
             box.session.additionalContext = Self.thinkingAdditionalContext(
-                for: entry, enabled: settings.localThinkingEnabled)
+                for: entry, enabled: settings.localThinkingEnabled,
+                effort: settings.localReasoningEffort)
             sessions[conversation.id] = box
             let userPrompt = Self.userPrompt(
                 prompt: prompt,
@@ -907,11 +913,13 @@ final class InferenceEngine {
             history: history,
             generateParameters: Self.parameters(from: settings),
             additionalContext: Self.thinkingAdditionalContext(
-                for: entry, enabled: settings.localThinkingEnabled))
+                for: entry, enabled: settings.localThinkingEnabled,
+                effort: settings.localReasoningEffort))
         sessions[conversation.id] = SessionBox(
             session: session, modelID: entry.id,
             messageCount: conversation.messages.count, systemPrompt: systemPrompt,
             localThinkingEnabled: settings.localThinkingEnabled,
+            localReasoningEffort: settings.localReasoningEffort,
             localThinkingMaxTokens: settings.localThinkingMaxTokens)
         let userPrompt = Self.userPrompt(
             prompt: prompt,
@@ -1143,7 +1151,8 @@ final class InferenceEngine {
             container: entry.container!,
             turns: turns,
             additionalContext: Self.thinkingAdditionalContext(
-                for: entry, enabled: settings.localThinkingEnabled),
+                for: entry, enabled: settings.localThinkingEnabled,
+                effort: settings.localReasoningEffort),
             parameters: Self.parameters(from: settings),
             hardLimit: budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) },
             thinkingFromStart: thinkingFromStart,
@@ -1345,6 +1354,7 @@ final class InferenceEngine {
         // so there is no reasoning left to cap.
         if noThinkPrefillApplies(to: entry, settings: settings) { return false }
         if entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn { return true }
+        if entry.chatTemplateSupportsReasoningEffort { return settings.localThinkingEnabled }
         return entry.chatTemplateSupportsThinkingToggle && settings.localThinkingEnabled
     }
 
@@ -1365,8 +1375,12 @@ final class InferenceEngine {
     /// Qwen/QwQ chat templates read `enable_thinking` from template kwargs.
     /// Models without that variable in their Jinja template ignore it harmlessly.
     static func thinkingAdditionalContext(
-        for entry: Loaded, enabled: Bool
+        for entry: Loaded, enabled: Bool, effort: String = "high"
     ) -> [String: any Sendable]? {
+        if entry.chatTemplateSupportsReasoningEffort {
+            let normalized = LocalReasoningEffort(rawValue: effort)?.rawValue ?? "high"
+            return ["reasoning_effort": enabled ? normalized : "none"]
+        }
         guard entry.chatTemplateSupportsThinkingToggle else { return nil }
         return ["enable_thinking": enabled]
     }

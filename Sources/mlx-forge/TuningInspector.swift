@@ -471,7 +471,14 @@ struct TuningInspector: View {
                 localThinkingEffortPicker
             }
         } else if let active = app.engine.activeModel {
-            if active.chatTemplateSupportsThinkingToggle {
+            if active.chatTemplateSupportsReasoningEffort {
+                Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
+                    .help("Sets Inkling's reasoning_effort to the selected level; off sends none (0.0).")
+                if app.settings.localThinkingEnabled {
+                    inklingReasoningEffortPicker
+                    localThinkingEffortPicker
+                }
+            } else if active.chatTemplateSupportsThinkingToggle {
                 Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
                     .disabled(active.chatTemplateThinkingOnly)
                     .help(
@@ -508,6 +515,21 @@ struct TuningInspector: View {
     }
 
     private static let thinkingTokenPresets = [500, 1000, 2000, 4000, 8000]
+
+    private var inklingReasoningEffortPicker: some View {
+        Picker(
+            "Thinking effort",
+            selection: Binding(
+                get: { LocalReasoningEffort(rawValue: app.settings.localReasoningEffort) ?? .high },
+                set: { app.settings.localReasoningEffort = $0.rawValue })
+        ) {
+            ForEach(LocalReasoningEffort.allCases) { level in
+                Text(level.label).tag(level)
+            }
+        }
+        .pickerStyle(.menu)
+        .help("Inkling mapping: none 0.0, minimal 0.1, low 0.2, medium 0.7, high 0.9, max 0.99.")
+    }
 
     private var localThinkingBudgetBinding: Binding<Int> {
         Binding(
@@ -550,7 +572,7 @@ struct TuningInspector: View {
     private var reasoningSectionDetail: String {
         var parts: [String] = []
         if let active = app.engine.activeModel, !active.model.isGGUF {
-            if active.chatTemplateSupportsThinkingToggle || active.chatTemplateThinkingBuiltIn {
+            if active.chatTemplateSupportsThinkingToggle || active.chatTemplateSupportsReasoningEffort || active.chatTemplateThinkingBuiltIn {
                 parts.append(app.settings.localThinkingEnabled ? "think" : "no-think")
             } else if !active.chatTemplateHasTemplate {
                 parts.append("n/a")

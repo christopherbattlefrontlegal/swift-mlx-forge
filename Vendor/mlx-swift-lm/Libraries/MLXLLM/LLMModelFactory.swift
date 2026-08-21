@@ -69,6 +69,7 @@ public enum LLMTypeRegistry {
         "baichuan_m1": create(BaichuanM1Configuration.self, BaichuanM1Model.init),
         "exaone4": create(Exaone4Configuration.self, Exaone4Model.init),
         "gpt_oss": create(GPTOSSConfiguration.self, GPTOSSModel.init),
+        "inkling_mm_model": create(InklingConfiguration.self, InklingModel.init),
         "lille-130m": create(Lille130mConfiguration.self, Lille130mModel.init),
         "olmoe": create(OlmoEConfiguration.self, OlmoEModel.init),
         "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),

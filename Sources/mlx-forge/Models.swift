@@ -535,6 +535,8 @@ struct GenerationSettings: Codable, Equatable {
     var reasoningEnabled: Bool = true
     /// For Qwen/QwQ MLX models: pass `enable_thinking` into `applyChatTemplate`.
     var localThinkingEnabled: Bool = true
+    /// Inkling chat-template effort: none/minimal/low/medium/high/max.
+    var localReasoningEffort: String = "high"
     /// Max thinking tokens per local turn. 0 = unlimited. The budget is stated to the
     /// model up front; Forge closes `</think>` and continues the answer if it overruns.
     var localThinkingMaxTokens: Int = 0
@@ -586,6 +588,10 @@ struct GenerationSettings: Codable, Equatable {
         localThinkingEnabled =
             (try? c.decodeIfPresent(Bool.self, forKey: .localThinkingEnabled)).flatMap { $0 }
             ?? true
+        let decodedLocalEffort =
+            (try? c.decodeIfPresent(String.self, forKey: .localReasoningEffort)).flatMap { $0 }
+            ?? "high"
+        localReasoningEffort = LocalReasoningEffort(rawValue: decodedLocalEffort)?.rawValue ?? "high"
         if let tokens = (try? c.decodeIfPresent(Int.self, forKey: .localThinkingMaxTokens))
             .flatMap({ $0 })
         {
@@ -613,6 +619,12 @@ struct GenerationSettings: Codable, Equatable {
     private enum LegacyCodingKeys: String, CodingKey {
         case localThinkingEffort
     }
+}
+
+enum LocalReasoningEffort: String, CaseIterable, Identifiable, Codable {
+    case none, minimal, low, medium, high, max
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
 }
 
 extension GenerationSettings {
