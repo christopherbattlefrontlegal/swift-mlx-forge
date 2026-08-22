@@ -4,6 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../BundledTools/rivet"
 
+# Node 24 defaults to a ~2 GB old-space heap on GitHub's macOS runners. The
+# production Rivet bundle exceeds that while rendering chunks after transform.
+export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096"
+
 YARN=".yarn/releases/yarn-4.6.0.cjs"
 [[ -f "$YARN" ]] || { echo "Missing vendored Yarn: $YARN" >&2; exit 1; }
 
