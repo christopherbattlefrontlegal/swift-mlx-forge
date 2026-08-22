@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose an improvement to Forge
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape Forge. Explain the workflow first so the proposed solution stays grounded in a real use case.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Model loading or inference
+        - Chat or prompts
+        - Forge Graph
+        - Local API
+        - MCP or tools
+        - Installation or distribution
+        - Interface or accessibility
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Describe how the feature should behave from a user's perspective.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final check
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true

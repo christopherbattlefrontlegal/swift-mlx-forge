@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and workflow ideas
+    url: https://github.com/christopherbattlefrontlegal/swift-mlx-forge/discussions
+    about: Ask for help, share a workflow, or discuss an idea before filing an issue.
+  - name: Forge 2.0 announcement
+    url: https://github.com/christopherbattlefrontlegal/swift-mlx-forge/discussions/12
+    about: Read the launch overview and join the Forge 2.0 conversation.

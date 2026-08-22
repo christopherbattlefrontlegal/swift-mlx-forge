@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible problem in Forge
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Forge. Please do not include API keys, tokens, model weights, or private prompts.
+  - type: input
+    id: forge-version
+    attributes:
+      label: Forge version or commit
+      placeholder: v2.0.0 or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: macOS 26.x
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Apple Silicon hardware
+      placeholder: Mac Studio, M-series chip, memory
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Model loading or inference
+        - Chat or prompts
+        - Forge Graph
+        - Local API
+        - MCP or tools
+        - Installation or build
+        - Interface or accessibility
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open Forge
+        2. Load ...
+        3. Click ...
+        4. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Remove credentials, private prompts, paths, and other sensitive information first.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and private data from this report.
+          required: true
