@@ -209,7 +209,7 @@ export const NavigationBar: FC = () => {
   }
 
   return (
-    <div css={styles}>
+    <div className="forge-navigation-bar" css={styles}>
       {navigationStack.hasBackward ? (
         <Tooltip content="Go to previous graph" placement="bottom">
           <button onClick={navigationStack.navigateBack}>

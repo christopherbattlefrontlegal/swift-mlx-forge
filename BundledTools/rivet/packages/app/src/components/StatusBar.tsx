@@ -50,7 +50,7 @@ export const StatusBar: FC<{}> = () => {
   }, [graphRunning, graphStartTime, latestGraphRunning, latestGraphStartTime]);
 
   return (
-    <div css={styles}>
+    <div className="forge-status-bar" css={styles}>
       {(graphStartTime ?? 0) > 0 && (
         <div className="runtime">
           Runtime: <strong ref={runtimeRef}></strong>

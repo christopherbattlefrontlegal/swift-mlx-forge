@@ -1148,10 +1148,9 @@ export class GraphProcessor {
       // If the loop controller is excluded, we have to "break" it or else it'll loop forever...
       const breakValue = loopControllerResults['break' as PortId];
 
-      const didBreak =
-        // @ts-ignore
-        !(breakValue?.type === 'control-flow-excluded' && breakValue?.value === 'loop-not-broken') ??
-        this.#excludedDueToControlFlow(node, this.#getInputValuesForNode(node), nanoid() as ProcessId);
+      const didBreak = !(
+        breakValue?.type === 'control-flow-excluded' && breakValue?.value === 'loop-not-broken'
+      );
 
       if (!didBreak) {
         this.#emitTraceEvent(`Loop controller ${node.title} did not break, so we're looping again`);

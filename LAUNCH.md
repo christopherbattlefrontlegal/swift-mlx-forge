@@ -6,7 +6,7 @@ release notes, pinned issue, README snippets, and community posts.
 ## One-line position
 
 Forge is a native macOS workbench for Apple Silicon local LLMs: MLX plus in-process
-GGUF, prompt libraries, agent dispatch, MCP, and a loopback OpenAI-compatible API.
+GGUF, adjustable reasoning, a visual agent graph, MCP, and a loopback OpenAI-compatible API.
 
 ## Short pitch
 
@@ -17,8 +17,8 @@ can serve a local OpenAI-compatible endpoint for agent tools.
 
 ## GitHub repository description
 
-Native macOS workbench for Apple Silicon local LLMs: SwiftUI, MLX, in-process GGUF,
-prompt libraries, MCP, agent dispatch, and a local OpenAI-compatible API.
+Native macOS workbench for Apple Silicon local LLMs: SwiftUI, MLX, GGUF, visual
+agent graphs, adjustable reasoning, MCP, and an OpenAI-compatible API.
 
 ## Suggested topics
 
@@ -28,10 +28,10 @@ prompt libraries, MCP, agent dispatch, and a local OpenAI-compatible API.
 
 ## Release summary
 
-Forge v1.0 is source-installable: clone the public MIT repo, run
+Forge v2.0 is source-installable: clone the public MIT repo, run
 `./scripts/install-forge-app.sh`, and point the app at your local MLX or GGUF model
 folders. The installer builds the release product, bundles the Metal library,
-packages the design prompt tool and llama.cpp framework, ad-hoc signs locally,
+packages Forge Graph, the design prompt tool, and llama.cpp framework, ad-hoc signs locally,
 installs `/Applications/Forge.app`, and opens it.
 
 Public binary downloads are intentionally not attached until the app is signed with
@@ -39,10 +39,10 @@ a Developer ID Application certificate and notarized.
 
 ## Community post
 
-Forge is public: a native macOS workbench for Apple Silicon local LLMs. It runs MLX
-and in-process GGUF models side by side, scans model folders from disk, manages
-prompt libraries, dispatches agents, speaks MCP, and exposes a local
-OpenAI-compatible API for tools. MIT licensed. Source-installable today.
+Forge 2.0 is public: a native macOS workbench for Apple Silicon local LLMs. It runs
+MLX and in-process GGUF models side by side, supports Inkling Small reasoning effort,
+builds workflows on a customized Rivet graph, speaks MCP, and exposes a local
+OpenAI-compatible API. MIT licensed. Source-installable today.
 
 ## Claim boundaries
 

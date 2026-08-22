@@ -78,6 +78,7 @@ export const LeftSidebar: FC<{
 
   return (
     <div
+      className="forge-sidebar"
       css={styles}
       style={{ transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)', transition: 'transform 0.3s ease' }}
       key={project.metadata.id}

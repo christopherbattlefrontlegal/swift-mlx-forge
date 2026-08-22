@@ -88,46 +88,32 @@ export const NoProject: FC = () => {
   const openProject = useLoadProjectWithFileBrowser();
 
   return (
-    <div css={styles}>
+    <div className="forge-no-project" css={styles}>
       <div className="inner">
         <img src={ForgeIcon} alt="Forge Logo" className="logo" />
         <Button className="open-settings" onClick={() => setSettingsModalOpen(true)}>
           <GearIcon />
         </Button>
-        <h1>Welcome to Forge!</h1>
-        <p>No project is currently open. You can:</p>
+        <p className="eyebrow">FORGE GRAPH</p>
+        <h1>Build a local model workflow</h1>
+        <p className="intro">Connect prompts, models, tools, and outputs on a visual canvas. Graph projects stay on this Mac.</p>
 
-        <ul>
-          <li>
-            <Button appearance="primary" onClick={syncWrapper(openProject)}>
-              Open
-            </Button>{' '}
-            an existing project
-          </li>
-          <li>
-            <Button appearance="primary" onClick={() => setNewProjectModalOpen(true)}>
-              Create
-            </Button>{' '}
-            a new project
-          </li>
-          <li>
-            <p>
-              Check out the{' '}
-              <a href="#" onClick={syncWrapper(openDocumentation)}>
-                graph documentation
-              </a>
-            </p>
-          </li>
-          <li>
-            <p>
-              Need help? join the{' '}
-              <a href="#" onClick={syncWrapper(joinDiscord)}>
-                <DiscordIcon /> upstream Discord server
-              </a>{' '}
-              for ideas, support, and community
-            </p>
-          </li>
-        </ul>
+        <div className="primary-actions">
+          <Button appearance="primary" onClick={() => setNewProjectModalOpen(true)}>
+            New Graph Project
+          </Button>
+          <Button appearance="default" onClick={syncWrapper(openProject)}>
+            Open Project…
+          </Button>
+        </div>
+
+        <div className="help-links">
+          <a href="#" onClick={syncWrapper(openDocumentation)}>Graph documentation</a>
+          <span>·</span>
+          <a href="#" onClick={syncWrapper(joinDiscord)}>
+            <DiscordIcon /> Rivet community
+          </a>
+        </div>
       </div>
     </div>
   );

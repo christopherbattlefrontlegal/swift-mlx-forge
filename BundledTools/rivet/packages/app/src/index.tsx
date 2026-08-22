@@ -4,6 +4,7 @@ import './utils/deserializeProject';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import './colors.css';
+import './forge.css';
 import App from './App.js';
 
 const root = ReactDOM.createRoot(document.getElementById('root') as HTMLElement);

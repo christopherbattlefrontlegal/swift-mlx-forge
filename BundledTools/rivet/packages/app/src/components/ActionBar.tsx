@@ -162,7 +162,7 @@ export const ActionBar: FC<ActionBarProps> = ({ onRunGraph, onAbortGraph, onPaus
   const isMainGraph = hasMainGraph && graphMetadata?.id === projectMetadata.mainGraphId;
 
   return (
-    <div css={styles}>
+    <div className="forge-action-bar" css={styles}>
       {(isActuallyRemoteDebugging || (!remoteDebugger.isInternalExecutor && remoteDebugger.reconnecting)) && (
         <div
           className={clsx('remote-debugger-button active', {

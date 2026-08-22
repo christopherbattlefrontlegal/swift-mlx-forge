@@ -1,6 +1,10 @@
 # Forge
 
-Forge is a native macOS workbench for running local language models on Apple Silicon. Its single `mlx-forge` app combines a SwiftUI chat interface with two in-process inference paths:
+**A native macOS workbench for local Apple Silicon models, adjustable reasoning, visual agent graphs, and an OpenAI-compatible API.**
+
+![Forge on Apple Silicon](site/assets/forge-product-visual.png)
+
+Forge is a native macOS workbench for running local language models on Apple Silicon. Its single `mlx-forge` app combines a SwiftUI chat interface and a visual graph workbench with two in-process inference paths:
 
 - MLX models through `mlx-swift-lm`, including supported local vision-language models.
 - Compatible GGUF models through the vendored `LLM.swift`/llama.cpp backend.
@@ -16,12 +20,21 @@ Forge does not include model weights. Add folders you already own, or download M
 
 The local installer creates an ad-hoc-signed app for the Mac that built it. A binary intended for other Macs still requires Developer ID signing and Apple notarization.
 
+## Forge 2.0 highlights
+
+- Customized **Forge Graph**, built from the MIT-licensed Rivet canvas and wired to Forge's loopback OpenAI-compatible endpoint.
+- First-class **Inkling Small** support, including MXFP4/NVFP4 checkpoints, `tiktoken` tokenizers, the checkpoint's Jinja chat template, and its adjustable reasoning-effort scale.
+- Updated Qwen support, including Qwen 3.5/3.6 model families and multi-token prediction paths.
+- Explicit system-prompt editing: drafts are visibly Saved or Unsaved, and deleting a prompt can be deliberately saved as the model default.
+- A cleaner macOS 27 toolbar and glass treatment using native SwiftUI structure.
+
 ## What the Forge app provides
 
 - Recursive, bounded discovery of MLX model directories and loose `.gguf` files in folders you explicitly add.
 - Explicit load, activate, unload, unload-all, and stop controls, with up to six reserved resident model slots.
 - Local MLX chat, supported MLX VLM image input, and a text-only GGUF chat path.
 - An agent graph workbench: drag blocks onto a canvas, wire one model's output into another's input, and watch the work move through the graph as it runs.
+- A Forge-themed Rivet canvas with local project storage and a one-click Chat/Graph workbench switch.
 - Graph blocks for a task input, a model agent, a text template, a yes/no fork, text extraction, an MCP tool call, a workspace file read or write, and a collected result.
 - Any block may run a loaded local model, Anthropic, OpenAI, or OpenRouter, so a single graph can mix local and cloud models.
 - Per-block tool grants and a per-graph scoped folder, so only the blocks you choose can read or write files.
@@ -41,7 +54,7 @@ The local installer creates an ad-hoc-signed app for the Mac that built it. A bi
 - Swift 6.2 or newer through Xcode or the Xcode command-line tools.
 - Network access during the first SwiftPM dependency resolution.
 - Your own MLX or compatible GGUF model files.
-- Node.js/npm only when `scripts/build-app.sh` needs to rebuild the embedded design-prompt web bundle.
+- Node.js when the embedded Forge Graph or design-prompt web bundles need to be rebuilt.
 - Python 3 only for optional Smart Select searches against an external `awesome-prompts`-style `prompt_database` containing `search.py` and `get.py`.
 
 ## Install the app
@@ -56,7 +69,7 @@ The installer:
 
 1. checks the local toolchain and packaging security rules;
 2. builds the release `mlx-forge` product and MLX Metal library;
-3. packages the design-prompt bundle and llama.cpp framework;
+3. packages Forge Graph, the design-prompt bundle, and llama.cpp framework;
 4. ad-hoc signs the complete bundle;
 5. installs `/Applications/Forge.app`; and
 6. opens it unless `--no-open` is supplied.
@@ -206,6 +219,7 @@ No cloud key is required for local MLX or GGUF inference.
 Sources/mlx-forge/    Forge application
 Vendor/LLM.swift/     Vendored GGUF/llama.cpp bridge
 BundledTools/         Embedded design-prompt source/build
+BundledTools/rivet/   Forge's customized Rivet graph source and browser bundle
 scripts/              Build, install, Metal, and security helpers
 site/                 Project website
 ```

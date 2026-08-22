@@ -52,6 +52,16 @@ llama_cache/
 research/experiments/**/.build/
 AppleDocumentation/
 
+# Vendored Rivet local build/install state (the release bundle in dist is tracked)
+BundledTools/rivet/.pnp.cjs
+BundledTools/rivet/.pnp.loader.mjs
+BundledTools/rivet/.yarn/install-state.gz
+BundledTools/rivet/.yarn/unplugged/
+BundledTools/rivet/packages/*/dist/
+BundledTools/rivet/packages/*/node_modules/
+BundledTools/rivet/packages/app/stats.html
+BundledTools/rivet/packages/app/tsconfig.tsbuildinfo
+
 # Optional local/marketplace-specific and experimental folders kept out of open-source publish
 MacAppStore/
 marketing/

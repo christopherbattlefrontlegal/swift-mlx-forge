@@ -6,13 +6,13 @@
     <title>Forge — Native macOS workbench for local LLMs on Apple Silicon</title>
     <meta
       name="description"
-      content="Forge is a native macOS workbench for MLX and in-process GGUF models on Apple Silicon, with Smart Prompt Select, prompt folders, a design prompt builder, Brave research, a code loop, headless command composer, MCP, local API, and multi-agent dispatch."
+      content="Forge 2 is a native macOS workbench for MLX and in-process GGUF models on Apple Silicon, with adjustable reasoning, a visual agent graph, MCP, prompt workflows, and an OpenAI-compatible local API."
     >
     <link rel="canonical" href="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
     <meta property="og:title" content="Forge — Native Mac workbench for local LLMs">
     <meta
       property="og:description"
-      content="MLX + in-process GGUF on Apple Silicon. Prompt libraries, Smart Select, design prompts, Brave research, code loop, headless commands, local API, MCP, and agents — MIT, open source."
+      content="MLX + in-process GGUF on Apple Silicon. Inkling reasoning, a visual agent graph, prompt workflows, local API, MCP, and agents — MIT, open source."
     >
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://christopherbattlefrontlegal.github.io/swift-mlx-forge/">
@@ -39,7 +39,7 @@
       <a class="brand" href="#top" aria-label="Forge home">
         <img src="./assets/forge-icon.png" alt="" width="30" height="30">
         <span class="brand-name">Forge</span>
-        <span class="brand-tag">v1.0</span>
+        <span class="brand-tag">v2.0</span>
       </a>
       <nav aria-label="Sections">
         <a href="#engines">Engines</a>
@@ -87,15 +87,15 @@
           <p class="hero-lede">
             A native macOS workbench that runs <strong>MLX</strong> and in-process
             <strong>GGUF</strong> (llama.cpp) models side by side on Apple Silicon — plus the
-            operator tools that make it useful: Smart Prompt Select, prompt folders, Brave research,
-            a WebKit design prompt builder, multi-agent dispatch, an OpenRouter coding loop, and a
-            headless command composer for Claude CLI work.
+            operator tools that make it useful: adjustable Inkling reasoning, a Forge-themed visual
+            agent graph, explicit prompt drafts, Smart Prompt Select, Brave research, multi-agent
+            dispatch, and a headless command composer for Claude CLI work.
             Bring your own weights.
           </p>
           <div class="hero-badges" aria-label="Workflow highlights">
             <span>Smart Prompt Select</span>
-            <span>Design prompt builder</span>
-            <span>planner → coder → tester loop</span>
+            <span>Forge visual agent graph</span>
+            <span>Inkling reasoning effort</span>
             <span>Headless command helper</span>
             <span>MCP tool chains</span>
           </div>
@@ -118,7 +118,7 @@
             </div>
             <div>
               <dt>Workflows</dt>
-              <dd>Prompts + code loop</dd>
+              <dd>Chat + visual graph</dd>
             </div>
             <div>
               <dt>Server</dt>
@@ -260,8 +260,8 @@
               <span class="feature-index">03</span>
               <h3>Named prompt presets</h3>
               <p>
-                The inspector shows which preset (or library file) is actually loaded — not just a
-                word count. Manual edits flip the label to <em>Custom</em> until text matches again.
+                Edit a prompt as a draft, see Saved or Unsaved state, then explicitly Save or Revert.
+                Clearing the text and saving deliberately returns the model to its default prompt.
               </p>
             </article>
             <article class="feature-card reveal">
@@ -548,8 +548,8 @@
                 several buttons and Forge keeps a live in-flight bar while responses stream back.
               </p>
               <p class="quiet">
-                The old node graph remains source scaffold for non-MAS work, but the public app
-                surface uses dispatch, prompt libraries, and the coding loop.
+                Switch from Chat to Forge Graph in the native toolbar, connect model and tool nodes
+                on the customized Rivet canvas, and run them through Forge's local API bridge.
               </p>
             </article>
 
@@ -707,7 +707,7 @@
             <p class="section-copy">
               A SwiftPM package (Swift 6.2, macOS 26+) that resolves every dependency from public
               git sources. The installer builds the release product, compiles the Metal library,
-              bundles the design prompt tool and llama.cpp framework, ad-hoc signs locally, installs
+              bundles Forge Graph, the design prompt tool, and llama.cpp framework, ad-hoc signs locally, installs
               <code>/Applications/Forge.app</code>, and opens it. Public binary downloads still need
               Developer ID signing and notarization.
             </p>

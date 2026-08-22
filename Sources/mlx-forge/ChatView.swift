@@ -741,16 +741,26 @@ struct ComposerView: View {
                 .pickerStyle(.menu)
                 .font(.caption)
 
-                // Graph feature removed for App Store readiness (sandbox incompatibilities and incomplete state). Use prompt library + modes for advanced chats.
+                Divider()
+                    .frame(height: 18)
+
+                Button {
+                    app.showSystemPromptEditor = true
+                } label: {
+                    Label(
+                        app.systemPromptSourceLabel == "empty"
+                            ? "Add System Prompt" : app.systemPromptSourceLabel,
+                        systemImage: "text.quote")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .help("Open, clear, or save the system prompt")
             }
             .padding(.horizontal, Theme.s2)
             .padding(.vertical, Theme.s2)
-            .background(Theme.userBubble)
-            .clipShape(.rect(cornerRadius: Theme.radiusMedium))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.radiusMedium)
-                    .strokeBorder(.white.opacity(0.08), lineWidth: 1)
-            )
+            .glassCard(radius: Theme.radiusMedium)
             .padding(.horizontal, Theme.s3)
             .padding(.top, Theme.s3)
 
@@ -1192,7 +1202,7 @@ struct ComposerView: View {
                 .padding(.horizontal, Theme.s3)
                 .padding(.vertical, Theme.s2)
             }
-            .solidCard(radius: Theme.radiusLarge)
+            .glassCard(radius: Theme.radiusLarge)
             .padding(.horizontal, Theme.s5)
             .padding(.bottom, Theme.s2)
             .padding(.top, Theme.s2)

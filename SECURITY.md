@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-This repository is pre-1.0. Security fixes land on `main` unless a release branch is explicitly created.
+Forge 2.x is supported on `main`. Security fixes land on `main` unless a release branch is explicitly created.
 
 ## Reporting a Vulnerability
 

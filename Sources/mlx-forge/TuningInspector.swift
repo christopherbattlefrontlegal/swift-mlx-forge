@@ -7,6 +7,7 @@ struct TuningInspector: View {
     @Environment(AppState.self) private var app
     @State private var showPresetNamePrompt = false
     @State private var presetNameDraft = ""
+    @State private var promptDraft = ""
     @AppStorage("inspector.serverExpanded") private var serverExpanded = false
     @AppStorage("inspector.samplingExpanded") private var samplingExpanded = true
     @AppStorage("inspector.reasoningExpanded") private var reasoningExpanded = true
@@ -126,11 +127,12 @@ struct TuningInspector: View {
                             }
                             Divider()
                             Button("Save Current as Preset…") {
+                                savePromptDraft()
                                 presetNameDraft = ""
                                 showPresetNamePrompt = true
                             }
                             .disabled(
-                                app.settings.systemPrompt
+                                promptDraft
                                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             if !app.promptPresets.isEmpty {
                                 Menu("Delete Preset") {
@@ -176,13 +178,40 @@ struct TuningInspector: View {
                     }
 
                     if !app.showSystemPromptEditor {
-                        TextEditor(text: systemPromptBinding)
+                        TextEditor(text: $promptDraft)
                             .font(.callout)
                             .scrollContentBackground(.hidden)
                             .frame(minHeight: 56, maxHeight: 120)
                             .padding(Theme.s2)
                             .background(.black.opacity(0.25))
                             .clipShape(.rect(cornerRadius: Theme.radiusSmall))
+
+                        HStack(spacing: Theme.s2) {
+                            if promptHasUnsavedChanges {
+                                Label("Unsaved changes", systemImage: "circle.fill")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(Theme.emberGlow)
+                            } else {
+                                Label("Saved", systemImage: "checkmark.circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Spacer()
+                            Button("Revert") {
+                                promptDraft = app.settings.systemPrompt
+                            }
+                            .controlSize(.small)
+                            .disabled(!promptHasUnsavedChanges)
+
+                            Button("Save") {
+                                savePromptDraft()
+                            }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+                            .disabled(!promptHasUnsavedChanges)
+                            .keyboardShortcut("s", modifiers: [.command, .shift])
+                            .help("Save this system prompt, including an empty prompt (⇧⌘S)")
+                        }
                     } else {
                         Text("Editing in expanded window…")
                             .font(.callout)
@@ -428,6 +457,14 @@ struct TuningInspector: View {
         } message: {
             Text("Stores the current system prompt under a name in the Presets menu.")
         }
+        .onAppear {
+            promptDraft = app.settings.systemPrompt
+        }
+        .onChange(of: app.settings.systemPrompt) { oldValue, newValue in
+            if promptDraft == oldValue || !promptHasUnsavedChanges {
+                promptDraft = newValue
+            }
+        }
     }
 
     /// Tap the header to hide the panel — open again from the toolbar Tuning button.
@@ -614,14 +651,25 @@ struct TuningInspector: View {
         // Same name = overwrite, so presets stay editable in place.
         let preset: PromptPreset
         if let index = app.promptPresets.firstIndex(where: { $0.name == name }) {
-            app.promptPresets[index].text = app.settings.systemPrompt
+            app.promptPresets[index].text = promptDraft
             preset = app.promptPresets[index]
         } else {
-            preset = PromptPreset(name: name, text: app.settings.systemPrompt)
+            preset = PromptPreset(name: name, text: promptDraft)
             app.promptPresets.append(preset)
         }
-        app.applySystemPrompt(app.settings.systemPrompt, preset: preset)
+        app.applySystemPrompt(promptDraft, preset: preset)
+        app.saveNow()
         presetNameDraft = ""
+    }
+
+    private var promptHasUnsavedChanges: Bool {
+        promptDraft != app.settings.systemPrompt
+    }
+
+    private func savePromptDraft() {
+        guard promptHasUnsavedChanges else { return }
+        app.applySystemPrompt(promptDraft)
+        app.saveNow()
     }
 
     /// Loaded preset or library file name — full text, no truncation.
@@ -637,16 +685,6 @@ struct TuningInspector: View {
         return promptSummary
     }
 
-    private var systemPromptBinding: Binding<String> {
-        Binding(
-            get: { app.settings.systemPrompt },
-            set: { newValue in
-                var next = app.settings
-                next.systemPrompt = newValue
-                app.settings = next
-            })
-    }
-
     private var localThinkingEnabledBinding: Binding<Bool> {
         Binding(
             get: { app.settings.localThinkingEnabled },
@@ -658,7 +696,7 @@ struct TuningInspector: View {
     }
 
     private var promptSummary: String {
-        let prompt = app.settings.systemPrompt
+        let prompt = promptDraft
         if prompt.isEmpty { return "Empty — model default." }
         let words = prompt.split(whereSeparator: \.isWhitespace).count
         return "\(words)w · \(prompt.count)c"
@@ -1244,16 +1282,20 @@ struct SystemPromptEditor: View {
                     draft = ""
                 }
                 .disabled(draft.isEmpty)
-                Text("Press Done to apply to the next message.")
+                Text(draft == app.settings.systemPrompt ? "No unsaved changes." : "Save to use this prompt on the next message.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                 Spacer()
-                Button("Done") {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Save") {
                     commitDraft()
                     dismiss()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.ember)
+                .buttonStyle(.glassProminent)
+                .disabled(draft == app.settings.systemPrompt)
                 .keyboardShortcut(.defaultAction)
             }
             .padding(Theme.s4)
@@ -1271,6 +1313,7 @@ struct SystemPromptEditor: View {
     private func commitDraft() {
         guard draft != app.settings.systemPrompt else { return }
         app.applySystemPrompt(draft)
+        app.saveNow()
     }
 
     private var footerSummary: String {

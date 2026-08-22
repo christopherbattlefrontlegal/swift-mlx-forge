@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Generated third-party bundles may contain intentional whitespace in template literals.
+BundledTools/rivet/dist/assets/*.js whitespace=-trailing-space

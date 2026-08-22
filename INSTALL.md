@@ -7,7 +7,7 @@ Forge is source-installable today. The GitHub release is source-only until the a
 - Apple Silicon Mac.
 - macOS 26 or newer.
 - Xcode 26 or newer, or any Swift toolchain with Swift 6.2+.
-- Node.js/npm for the bundled design-prompt tool that is copied into `Forge.app`.
+- Node.js for rebuilding the bundled Forge Graph and design-prompt tools copied into `Forge.app`.
 - Local MLX or GGUF model files. Forge does not ship model weights.
 
 ## One Path
@@ -18,7 +18,7 @@ cd swift-mlx-forge
 ./scripts/install-forge-app.sh
 ```
 
-The installer builds the release `mlx-forge` product, compiles the required `mlx.metallib`, builds the embedded design-prompt web bundle if needed, copies the llama.cpp framework into the app bundle, ad-hoc signs the result, installs `/Applications/Forge.app`, and opens it.
+The installer builds the release `mlx-forge` product, compiles the required `mlx.metallib`, builds the embedded Forge Graph and design-prompt web bundles if needed, copies the llama.cpp framework into the app bundle, ad-hoc signs the result, installs `/Applications/Forge.app`, and opens it.
 
 ## Manual Build
 

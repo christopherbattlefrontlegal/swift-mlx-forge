@@ -278,7 +278,7 @@ export const ProjectSelector: FC = () => {
   const openDiscord = useOpenUrl('https://discord.gg/qT8B2gv9Mg');
 
   return (
-    <div css={styles}>
+    <div className="forge-project-selector" css={styles}>
       <div className="projects-container">
         <div className="projects">
           <DndContext onDragEnd={handleDragEnd}>

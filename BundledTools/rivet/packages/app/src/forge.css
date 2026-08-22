@@ -1,0 +1,305 @@
+/* Forge's embedded Rivet skin. Keep structural behavior upstream-compatible;
+   customize only the visual shell used inside Forge's WebKit workbench. */
+
+:root {
+  color-scheme: dark;
+  --project-selector-height: 44px;
+}
+
+body {
+  background: #0d0d10;
+}
+
+body .app {
+  --grey-darkest: #0b0b0e;
+  --grey-darker: #111116;
+  --grey-darkerish: #17171d;
+  --grey-dark: #202027;
+  --grey-dark-seethrough: rgba(27, 27, 34, 0.82);
+  --grey-dark-seethrougher: rgba(19, 19, 24, 0.76);
+  --grey-dark-bluish-seethrough: rgba(17, 17, 22, 0.86);
+  --grey-darkish: #292931;
+  --grey-darkish-seethrough: rgba(41, 41, 49, 0.62);
+  --grey: #42424d;
+  --grey-lightish: #737380;
+  --grey-light: #b8b8c2;
+  --grey-lighter: #dedee5;
+  --grey-lightest: #ffffff;
+  --foreground: #ededf2;
+  --foreground-bright: #ffffff;
+  --foreground-muted: #9898a4;
+  --foreground-on-primary: #1b0d08;
+  --primary: #ff6b35;
+  --primary-text: #ff9a5c;
+  --primary-dark: #d93c19;
+  --primary-light: #ffb14f;
+  --primary-5percent: rgba(255, 107, 53, 0.08);
+  --accent: #ff9a5c;
+  --accent-dark: #d95d2d;
+  --accent-light: #ffc26e;
+  --success: #53c86d;
+  --success-dark: #379d50;
+  --success-light: #7cdd90;
+  --shadow-primary: rgba(255, 107, 53, 0.28);
+  --shadow-primary-bright: rgba(255, 139, 61, 0.5);
+  --grey-subtle-accent: rgba(255, 255, 255, 0.035);
+  --font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  --font-family-monospace: "SF Mono", ui-monospace, Menlo, monospace;
+}
+
+body .app button,
+body .app input,
+body .app textarea {
+  font-family: var(--font-family);
+}
+
+body .app button:focus-visible,
+body .app a:focus-visible,
+body .app input:focus-visible,
+body .app textarea:focus-visible {
+  outline: 2px solid var(--primary-light);
+  outline-offset: 2px;
+}
+
+body .app .node-canvas {
+  background-color: var(--grey-darker);
+  background-image:
+    radial-gradient(circle at 52% 42%, rgba(255, 107, 53, 0.055), transparent 34%),
+    linear-gradient(to right, var(--grey-subtle-accent) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grey-subtle-accent) 1px, transparent 1px);
+}
+
+body .app .forge-project-selector {
+  background: rgba(18, 18, 23, 0.82);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  padding: 4px 8px;
+}
+
+body .app .forge-project-selector .project {
+  border: 1px solid transparent;
+  border-radius: 9px;
+  height: 34px;
+  margin: 0;
+  background: transparent;
+}
+
+body .app .forge-project-selector .project::after {
+  display: none;
+}
+
+body .app .forge-project-selector .project:hover {
+  background: rgba(255, 255, 255, 0.065);
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+body .app .forge-project-selector .project.active {
+  color: var(--foreground-bright);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 139, 61, 0.4);
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+body .app .forge-project-selector > .actions {
+  margin-right: 0;
+}
+
+body .app .forge-project-selector > .actions .get-help {
+  min-width: auto;
+  color: var(--foreground-muted);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+body .app .forge-action-bar {
+  top: calc(12px + var(--project-selector-height));
+  right: 16px;
+  height: 38px;
+  padding: 3px;
+  gap: 4px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(24, 24, 30, 0.78);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+body .app .forge-action-bar .run-button button,
+body .app .forge-action-bar .pause-button button,
+body .app .forge-action-bar .unload-recording-button button,
+body .app .forge-action-bar .run-test-button button,
+body .app .forge-action-bar .save-recording-button button,
+body .app .forge-action-bar .run-gentrace-button button,
+body .app .forge-action-bar .remote-debugger-button button {
+  height: 30px;
+  border-radius: 8px;
+  padding: 0 12px;
+}
+
+body .app .forge-action-bar .run-button button {
+  color: #fff;
+  background: linear-gradient(135deg, #ff9b45, #ee4a1c);
+  box-shadow: 0 4px 16px rgba(238, 74, 28, 0.28);
+}
+
+body .app .forge-action-bar .run-button button:hover {
+  background: linear-gradient(135deg, #ffb35c, #ff5b25);
+}
+
+body .app .forge-sidebar {
+  top: calc(var(--project-selector-height) + 12px);
+  left: 12px;
+  bottom: 12px;
+  width: 272px;
+  height: auto;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  background: rgba(20, 20, 26, 0.8);
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(22px) saturate(130%);
+  -webkit-backdrop-filter: blur(22px) saturate(130%);
+}
+
+body .app .forge-sidebar .panel {
+  width: 272px;
+}
+
+body .app .forge-sidebar .toggle-tab {
+  right: -34px;
+  top: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px;
+  background: rgba(24, 24, 30, 0.86);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+}
+
+body .app .forge-navigation-bar {
+  top: calc(62px + var(--project-selector-height));
+  left: 302px;
+}
+
+body .app .forge-navigation-bar.sidebar-closed {
+  left: 24px;
+}
+
+body .app .forge-navigation-bar button,
+body .app .forge-navigation-bar .search input {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 9px;
+  background: rgba(24, 24, 30, 0.8);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+body .app .forge-status-bar {
+  right: 12px;
+  bottom: 12px;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(22, 22, 28, 0.74);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+body .app .forge-no-project {
+  background:
+    radial-gradient(circle at 50% 38%, rgba(255, 107, 53, 0.12), transparent 30%),
+    linear-gradient(180deg, #111116, #0b0b0e);
+}
+
+body .app .forge-no-project .inner {
+  width: min(680px, calc(100vw - 80px));
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 48px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 22px;
+  color: var(--foreground);
+  background: rgba(26, 26, 32, 0.72);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(28px) saturate(140%);
+  -webkit-backdrop-filter: blur(28px) saturate(140%);
+}
+
+body .app .forge-no-project .logo {
+  position: static;
+  width: 72px;
+  margin-bottom: 24px;
+}
+
+body .app .forge-no-project .open-settings {
+  top: 18px;
+  right: 18px;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+}
+
+body .app .forge-no-project .eyebrow {
+  margin: 0 0 8px;
+  color: var(--primary-text);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+}
+
+body .app .forge-no-project h1 {
+  color: var(--foreground-bright);
+  font-size: clamp(28px, 4vw, 42px);
+  letter-spacing: -0.035em;
+}
+
+body .app .forge-no-project .intro {
+  max-width: 520px;
+  margin: 14px 0 28px;
+  color: var(--foreground-muted);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+body .app .forge-no-project .primary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+body .app .forge-no-project .help-links {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 28px;
+  color: var(--foreground-muted);
+  font-size: 13px;
+}
+
+body .app .forge-no-project .help-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--foreground-muted);
+}
+
+body .app .forge-no-project .help-links a:hover {
+  color: var(--primary-light);
+}
+
+body .app .forge-no-project .help-links svg {
+  width: 14px;
+  height: 14px;
+}
+
+@media (max-width: 760px) {
+  body .app .forge-no-project .inner {
+    width: calc(100vw - 32px);
+    padding: 32px 24px;
+  }
+
+  body .app .forge-project-selector > .actions .get-help {
+    display: none;
+  }
+}

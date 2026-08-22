@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
 
@@ -16,26 +16,16 @@ jobs:
         run: swift --version
 
       - name: Check Swift toolchain
-        id: toolchain
-        shell: bash
-        run: |
-          if ./scripts/check-toolchain.sh; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::GitHub's hosted macOS image does not currently include Swift 6.2+. Skipping compile until the runner catches up or a self-hosted macOS 26+ runner is attached."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: ./scripts/check-toolchain.sh
 
       - name: Security regression check
-        if: steps.toolchain.outputs.build == 'true'
         run: ./scripts/security-check.sh --developer
 
+      - name: Test Forge
+        run: swift test
+
       - name: Build Forge
-        if: steps.toolchain.outputs.build == 'true'
         run: swift build --product mlx-forge
 
-      - name: Explain skipped build
-        if: steps.toolchain.outputs.build != 'true'
-        run: |
-          echo "Forge requires Swift 6.2+. The public install path remains:"
-          echo "  ./scripts/install-forge-app.sh"
+      - name: Build Forge Graph
+        run: ./scripts/build-rivet.sh
