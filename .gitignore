@@ -44,7 +44,7 @@ mcp.json
 .cache/huggingface/
 hf_cache/
 hfcache/
-huggingface/
+/huggingface/
 /llama.cpp/
 llama_cache/
 
