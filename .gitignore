@@ -28,7 +28,7 @@ mcp.json
 .wrangler/
 
 # Model weights and tokenizer caches
-models/
+/models/
 *.bin
 *.safetensors
 *.gguf
