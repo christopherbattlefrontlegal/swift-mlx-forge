@@ -50,7 +50,7 @@ export const AiGraphCreatorInput: FC = () => {
 
   const [running, setRunning] = useState(false);
   const [feedbackItems, setFeedbackItems] = useState<string[]>([]);
-  const [model, setModel] = useState<(typeof modelSelectorOptions)[number]>(modelSelectorOptions[1]);
+  const [model, setModel] = useState<(typeof modelSelectorOptions)[number]>(modelSelectorOptions[0]);
   const [record, setRecord] = useState(true);
 
   const [show, setShow] = useAtom(showAiGraphCreatorInputState);
@@ -103,7 +103,7 @@ export const AiGraphCreatorInput: FC = () => {
           isDisabled={running}
           isInvalid={false}
           isReadOnly={false}
-          placeholder="Enter instructions for creating or editing the current graph..."
+          placeholder="Describe the workflow, goal, or codebase path. Graph Architect will inspect it through Desktop Commander and build the nodes live..."
           value={prompt}
           autoFocus
           onChange={(e) => setPrompt(e.target.value)}

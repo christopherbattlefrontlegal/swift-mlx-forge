@@ -9,3 +9,5 @@ export const selectedAssistModelState = atomWithStorage<ModelSelectorValue>(
   defaultModelSelectorValue,
   storage,
 );
+
+export const canvasAiHotState = atomWithStorage<boolean>('canvasAiHot', true, storage);

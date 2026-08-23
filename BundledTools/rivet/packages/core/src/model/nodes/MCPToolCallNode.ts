@@ -18,7 +18,12 @@ import { coerceTypeOptional } from '../../utils/coerceType.js';
 import { getInputOrData } from '../../utils/index.js';
 import { getError } from '../../utils/errors.js';
 import { getMCPBaseInputs, type MCPBaseNodeData } from '../../integrations/mcp/MCPBase.js';
-import { getServerHelperMessage, getServerOptions, loadMCPConfiguration } from '../../integrations/mcp/MCPUtils.js';
+import {
+  getServerHelperMessage,
+  getServerOptions,
+  isForgeMCPBridgeAvailable,
+  loadMCPConfiguration,
+} from '../../integrations/mcp/MCPUtils.js';
 import type { RivetUIContext } from '../RivetUIContext.js';
 import { dedent } from 'ts-dedent';
 import { type EditorDefinition } from '../EditorDefinition.js';
@@ -203,7 +208,7 @@ export class MCPToolCallNodeImpl extends NodeImpl<MCPToolCallNode> {
     const versionPart = `Version: ${this.data.version}`;
     const parts = [namePart, versionPart, base];
 
-    if (context.executor !== 'nodejs') {
+    if (context.executor !== 'nodejs' && !isForgeMCPBridgeAvailable()) {
       parts.push('(Requires Node Executor)');
     }
 
@@ -313,7 +318,7 @@ export class MCPToolCallNodeImpl extends NodeImpl<MCPToolCallNode> {
       return output;
     } catch (err) {
       const { message } = getError(err);
-      if (context.executor === 'browser') {
+      if (context.executor === 'browser' && !context.mcpProvider) {
         throw new Error('Failed to create Client without a node executor');
       }
       console.log(message);

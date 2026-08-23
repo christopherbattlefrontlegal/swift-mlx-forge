@@ -16,6 +16,7 @@ export function useNewProject() {
   const setProject = useSetAtom(projectState);
   const setLoadedProject = useSetAtom(loadedProjectState);
   const currentIds = useAtomValue(openedProjectsSortedIdsState);
+  const openedProjects = useAtomValue(openedProjectsState);
   const setOpenedProjectsSortedIds = useSetAtom(openedProjectsSortedIdsState);
   const setOpenedProjects = useSetAtom(openedProjectsState);
 
@@ -32,7 +33,15 @@ export function useNewProject() {
   } = {}) => {
     const { data: _data, ...project } = blankProject();
 
-    project.metadata.title = title || project.metadata.title;
+    const requestedTitle = title?.trim();
+    if (requestedTitle) {
+      project.metadata.title = requestedTitle;
+    } else {
+      const existingTitles = new Set(Object.values(openedProjects).map((entry) => entry.project.metadata.title));
+      let index = 1;
+      while (existingTitles.has(`Untitled ${index}`)) index += 1;
+      project.metadata.title = `Untitled ${index}`;
+    }
     project.metadata.description = description || project.metadata.description;
 
     setProject(project);

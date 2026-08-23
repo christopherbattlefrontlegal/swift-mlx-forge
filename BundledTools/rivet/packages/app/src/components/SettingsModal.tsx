@@ -33,6 +33,7 @@ import { DEFAULT_CHAT_NODE_TIMEOUT } from '../../../core/src/utils/defaults';
 import useAsyncEffect from 'use-async-effect';
 import { getVersion } from '@tauri-apps/api/app';
 import { swallowPromise } from '../utils/syncWrapper';
+import { canvasAiHotState } from '../state/ai';
 
 interface SettingsModalProps {}
 
@@ -158,6 +159,7 @@ export const GeneralSettingsPage: FC = () => {
   const [previousDataPerNodeToKeep, setPreviousDataPerNodeToKeep] = useAtom(previousDataPerNodeToKeepState);
   const [zoomSensitivity, setZoomSensitivity] = useAtom(zoomSensitivityState);
   const [preservePortTextCase, setPreservePortTextCase] = useAtom(preservePortTextCaseState);
+  const [canvasAiHot, setCanvasAiHot] = useAtom(canvasAiHotState);
 
   return (
     <div css={fields}>
@@ -168,6 +170,24 @@ export const GeneralSettingsPage: FC = () => {
             onChange={(e) => e && setTheme(e.value as any)}
             options={themes}
           />
+        )}
+      </Field>
+      <Field name="canvas-ai-hot">
+        {() => (
+          <>
+            <Label htmlFor="canvas-ai-hot">Canvas AI</Label>
+            <div className="toggle-field">
+              <Toggle
+                id="canvas-ai-hot"
+                isChecked={canvasAiHot}
+                onChange={(event) => setCanvasAiHot(event.target.checked)}
+              />
+            </div>
+            <HelperMessage>
+              Hot sends a dropped source to the loaded Canvas AI immediately for inspection and choices. Off stages
+              drops without sending a model request.
+            </HelperMessage>
+          </>
         )}
       </Field>
       <Field name="preserve-port-text-case" label="Preserve text case for node ports">

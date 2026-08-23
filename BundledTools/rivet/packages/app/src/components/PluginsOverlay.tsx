@@ -15,7 +15,13 @@ import { copyToClipboard } from '../utils/copyToClipboard';
 import { useLoadPackagePlugin } from '../hooks/useLoadPackagePlugin';
 import { pluginsState } from '../state/plugins';
 import useAsyncEffect from 'use-async-effect';
-import { type BuiltInPluginInfo, type PackagePluginInfo, pluginInfos, type PluginInfo } from '../plugins.js';
+import {
+  type BuiltInPluginInfo,
+  type PackagePluginInfo,
+  packagePluginsSupported,
+  pluginInfos,
+  type PluginInfo,
+} from '../plugins.js';
 import { useFuseSearch } from '../hooks/useFuseSearch';
 import { overlayOpenState } from '../state/ui';
 import { ErrorBoundary } from 'react-error-boundary';
@@ -287,6 +293,7 @@ export const PluginsOverlay: FC = () => {
   const [pluginStoreDirectory, setPluginStoreDirectory] = useState('');
 
   useAsyncEffect(async () => {
+    if (!packagePluginsSupported) return;
     try {
       const appDataDir = await appLocalDataDir();
       setPluginStoreDirectory(await join(appDataDir, 'plugins'));
@@ -337,7 +344,7 @@ export const PluginsOverlay: FC = () => {
                   onAddPlugin={addPlugin}
                 />
               ))}
-              {!searchText && (
+              {!searchText && packagePluginsSupported && (
                 <div className="plugin custom-plugin" key="custom-plugin">
                   <div className="plugin-icon" />
                   <div className="plugin-name-author">
@@ -365,10 +372,16 @@ export const PluginsOverlay: FC = () => {
       </main>
       <footer>
         <div className="helperMessage">
-          <HelperMessage>
-            Plugins are stored in: <code>{pluginStoreDirectory}</code>{' '}
-            <CopyIcon className="copy-plugin-dir-button" onClick={copyPluginStoreDirectory} />
-          </HelperMessage>
+          {packagePluginsSupported ? (
+            <HelperMessage>
+              Plugins are stored in: <code>{pluginStoreDirectory}</code>{' '}
+              <CopyIcon className="copy-plugin-dir-button" onClick={copyPluginStoreDirectory} />
+            </HelperMessage>
+          ) : (
+            <HelperMessage>
+              Forge shows built-in plugins that execute in this runtime. Native package integrations are provided through MCP.
+            </HelperMessage>
+          )}
         </div>
       </footer>
     </div>

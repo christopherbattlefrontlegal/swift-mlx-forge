@@ -30,6 +30,7 @@ import { entries } from '../../../core/src/utils/typeSafety';
 import { type RunDataByNodeId, lastRunDataByNodeState } from '../state/dataFlow';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import { TauriProjectReferenceLoader } from '../model/TauriProjectReferenceLoader';
+import { ForgeMCPProvider } from '../model/native/ForgeMCPProvider';
 
 export function useLocalExecutor() {
   const project = useAtomValue(projectState);
@@ -157,6 +158,7 @@ export function useLocalExecutor() {
                 globalRivetNodeRegistry.getPlugins(),
               ),
               nativeApi: new TauriNativeApi(),
+              mcpProvider: new ForgeMCPProvider(),
               datasetProvider,
               audioProvider,
               projectPath: loadedProject.path ?? undefined,
@@ -221,6 +223,7 @@ export function useLocalExecutor() {
                   globalRivetNodeRegistry.getPlugins(),
                 ),
                 nativeApi: new TauriNativeApi(),
+                mcpProvider: new ForgeMCPProvider(),
                 datasetProvider,
                 audioProvider,
               },

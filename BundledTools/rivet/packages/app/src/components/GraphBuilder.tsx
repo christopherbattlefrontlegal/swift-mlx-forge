@@ -1,4 +1,4 @@
-import { type FC, useEffect, useMemo, useState, type MouseEvent, useRef } from 'react';
+import { type DragEvent, type FC, useEffect, useMemo, useState, type MouseEvent, useRef } from 'react';
 import { NodeCanvas } from './NodeCanvas.js';
 import { useAtomValue, useAtom, useSetAtom } from 'jotai';
 import { connectionsState, isReadOnlyGraphState, nodesByIdState, nodesState } from '../state/graph.js';
@@ -28,6 +28,7 @@ import { syncWrapper } from '../utils/syncWrapper';
 import { AiGraphCreatorInput } from './AiGraphCreatorInput';
 import { AiGraphCreatorToggle } from './AiGraphCreatorToggle';
 import { useReloadProjectReferences } from '../hooks/useReloadProjectReferences';
+import { ForgeDropInspector } from './ForgeDropInspector';
 
 const Container = styled.div`
   position: relative;
@@ -138,6 +139,21 @@ export const GraphBuilder: FC = () => {
     }
   });
 
+  const fileDragOver = useStableCallback((event: DragEvent<HTMLDivElement>) => {
+    if (event.dataTransfer.types.includes('Files')) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  });
+
+  const filesDropped = useStableCallback((event: DragEvent<HTMLDivElement>) => {
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.dispatchEvent(new CustomEvent('forge-browser-files-dropped', { detail: files }));
+  });
+
   const [questionsNodeId, questions] = firstNodeQuestions ? firstNodeQuestions : [undefined, [] as ProcessQuestions[]];
   const lastQuestions = questions.at(-1)?.questions ?? [];
 
@@ -150,7 +166,7 @@ export const GraphBuilder: FC = () => {
   const isReadOnly = useAtomValue(isReadOnlyGraphState);
 
   return (
-    <Container onMouseDown={containerMouseDown}>
+    <Container onMouseDown={containerMouseDown} onDragOver={fileDragOver} onDrop={filesDropped}>
       <ErrorBoundary fallback={<div>Failed to render GraphBuilder</div>}>
         <NodeCanvas
           nodes={nodes}
@@ -184,6 +200,7 @@ export const GraphBuilder: FC = () => {
         <NodeChangesModalRenderer />
         <AiGraphCreatorInput />
         <AiGraphCreatorToggle />
+        <ForgeDropInspector />
       </ErrorBoundary>
     </Container>
   );

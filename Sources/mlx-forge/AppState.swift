@@ -139,6 +139,22 @@ final class AppState {
     private(set) var isOpenAIGenerating = false
     private var openAITask: Task<Void, Never>?
 
+    /// Z.AI Coding Plan lane backed by the account already signed into ZCode.
+    /// Forge persists only the on/off model selection — never the account credential.
+    var zaiModelID: String? = UserDefaults.standard.string(forKey: "zai.model") {
+        didSet {
+            if let zaiModelID {
+                UserDefaults.standard.set(zaiModelID, forKey: "zai.model")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "zai.model")
+            }
+        }
+    }
+    private(set) var zaiConfiguration = ZAICodingPlanClient.configurationStatus()
+    private(set) var isZAIGenerating = false
+    private var zaiTask: Task<Void, Never>?
+    private var zaiRunControl: ZAIRunControl?
+
     var hasAnthropicKey: Bool { SecretsStore.hasAnthropicKey }
     func setAnthropicKey(_ key: String?) {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -157,20 +173,37 @@ final class AppState {
         SecretsStore.openAIAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
+    var isZAISelected: Bool { zaiModelID?.isEmpty == false }
+
+    func refreshZAIConfiguration() {
+        zaiConfiguration = ZAICodingPlanClient.configurationStatus()
+    }
+
+    func setZAISelected(_ selected: Bool) {
+        if selected {
+            refreshZAIConfiguration()
+            guard zaiConfiguration.isConfigured else { return }
+            zaiModelID = ZAICodingPlanClient.modelID
+        } else {
+            zaiModelID = nil
+        }
+    }
+
     private var claudeSelected: Bool { (claudeModelID?.isEmpty == false) }
     private var openRouterSelected: Bool { !openRouterModelIDs.isEmpty }
     private var openAISelected: Bool { (openAIModelID?.isEmpty == false) }
+    private var zaiSelected: Bool { isZAISelected }
     private var braveSearchSelected: Bool { braveSearchEnabled }
     /// Anything currently producing tokens (local OR Claude).
     var isBusy: Bool {
         engine.isGenerating || engine.isLoadingAnything || engine.materializingModelID != nil
             || isClaudeGenerating || isOpenRouterGenerating || isOpenAIGenerating
-            || isMCPRunning || isBraveSearchGenerating
+            || isZAIGenerating || isMCPRunning || isBraveSearchGenerating
     }
     /// Whether a chat target is selected.
     var canChat: Bool {
         engine.activeModel != nil || claudeSelected || openRouterSelected || openAISelected
-            || braveSearchSelected
+            || zaiSelected || braveSearchSelected
     }
 
     var openRouterSelectionSummary: String {
@@ -549,6 +582,7 @@ final class AppState {
         case claude(modelID: String)
         case openRouter(modelID: String)
         case openAI(modelID: String)
+        case zai(modelID: String)
 
         var modelName: String {
             switch self {
@@ -560,6 +594,8 @@ final class AppState {
                 return OpenRouterClient.label(for: modelID)
             case .openAI(let modelID):
                 return OpenAIClient.label(for: modelID)
+            case .zai:
+                return ZAICodingPlanClient.label
             }
         }
     }
@@ -601,6 +637,7 @@ final class AppState {
 
         server.engine = engine
         server.store = store
+        server.mcp = mcp
         server.rivetRoot = RivetLocator.siteRoot()
         server.defaultSettings = { [weak self] in self?.settings ?? GenerationSettings() }
         server.apiKey = { SecretsStore.localServerAPIKey ?? "" }
@@ -638,6 +675,7 @@ final class AppState {
     func beginMCP() {
         guard !didBeginMCP else { return }
         didBeginMCP = true
+        refreshZAIConfiguration()
         mcp.start()
         runtimeUpdates.checkDailyIfNeeded()
     }
@@ -1099,11 +1137,14 @@ final class AppState {
 
     var canSend: Bool {
         let hasText = !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if claudeSelected || openRouterSelected || openAISelected || braveSearchSelected {
+        if claudeSelected || openRouterSelected || openAISelected || zaiSelected
+            || braveSearchSelected
+        {
             guard !isBusy && hasText else { return false }
             if claudeSelected && !hasAnthropicKey { return false }
             if openRouterSelected && !hasOpenRouterKey { return false }
             if openAISelected && !hasOpenAIKey { return false }
+            if zaiSelected && !zaiConfiguration.isConfigured { return false }
             if braveSearchSelected && !hasBraveSearchKey { return false }
             return true
         }
@@ -1124,11 +1165,14 @@ final class AppState {
         userMessage.attachedImageData = images
         conversation.messages.append(userMessage)
 
-        if claudeSelected || openRouterSelected || openAISelected || braveSearchSelected {
+        if claudeSelected || openRouterSelected || openAISelected || zaiSelected
+            || braveSearchSelected
+        {
             let selectedModels = openRouterModelIDs
             var openRouterTargets: [(modelID: String, messageID: UUID)] = []
             var claudeTarget: (modelID: String, messageID: UUID)?
             var openAITarget: (modelID: String, messageID: UUID)?
+            var zaiTarget: (modelID: String, messageID: UUID)?
             var braveTarget: UUID?
             if let claudeID = claudeModelID, !claudeID.isEmpty {
                 var assistant = ChatMessage(role: .assistant, content: "")
@@ -1148,6 +1192,12 @@ final class AppState {
                 conversation.messages.append(assistant)
                 openAITarget = (openAIID, assistant.id)
             }
+            if let zaiID = zaiModelID, !zaiID.isEmpty {
+                var assistant = ChatMessage(role: .assistant, content: "")
+                assistant.modelName = ZAICodingPlanClient.label
+                conversation.messages.append(assistant)
+                zaiTarget = (zaiID, assistant.id)
+            }
             if braveSearchSelected {
                 var assistant = ChatMessage(role: .assistant, content: "")
                 assistant.modelName = braveSearchModeLabel
@@ -1158,11 +1208,12 @@ final class AppState {
             conversation.updatedAt = Date()
             conversation.lastModelID =
                 claudeTarget?.modelID ?? selectedModels.first ?? openAITarget?.modelID
-                ?? (braveSearchSelected ? "brave" : nil)
+                ?? zaiTarget?.modelID ?? (braveSearchSelected ? "brave" : nil)
             selectedConversation = conversation
 
             let conversationID = conversation.id
             if let braveTarget { beginStreaming(messageID: braveTarget) }
+            if let zaiTarget { beginStreaming(messageID: zaiTarget.messageID) }
             if let openAITarget { beginStreaming(messageID: openAITarget.messageID) }
             for target in openRouterTargets { beginStreaming(messageID: target.messageID) }
             if let claudeTarget { beginStreaming(messageID: claudeTarget.messageID) }
@@ -1182,6 +1233,12 @@ final class AppState {
                 streamOpenAI(
                     model: openAITarget.modelID, history: historySnapshot, prompt: prompt,
                     conversationID: conversationID, messageID: openAITarget.messageID,
+                    images: images, cancellationGeneration: generation)
+            }
+            if let zaiTarget {
+                streamZAI(
+                    model: zaiTarget.modelID, history: historySnapshot, prompt: prompt,
+                    conversationID: conversationID, messageID: zaiTarget.messageID,
                     images: images, cancellationGeneration: generation)
             }
             if let braveTarget {
@@ -1599,6 +1656,107 @@ final class AppState {
         }
     }
 
+    /// Routes a chat turn through the signed-in ZCode Z.AI Coding Plan account.
+    /// ZCode tools remain disabled; approved Forge MCP actions return through the
+    /// same host-controlled FORGE_MCP_CALL loop as every other backend.
+    private func streamZAI(
+        model: String, history: Conversation, prompt: String,
+        conversationID: UUID, messageID: UUID,
+        images: [Data] = [],
+        cancellationGeneration generation: UInt64,
+        mcpDepth: Int = 0,
+        mcpOriginalPrompt: String? = nil
+    ) {
+        guard generation == cancellationGeneration else { return }
+        refreshZAIConfiguration()
+        guard zaiConfiguration.isConfigured else {
+            appendToMessage(conversationID: conversationID, messageID: messageID) {
+                $0.content = "⚠️ \(zaiConfiguration.detail)"
+                $0.isError = true
+            }
+            isZAIGenerating = false
+            endStreaming(messageID: messageID)
+            return
+        }
+        guard images.isEmpty else {
+            appendToMessage(conversationID: conversationID, messageID: messageID) {
+                $0.content = "⚠️ The Z.AI Coding Plan lane currently accepts text and code; send image attachments to a vision-capable model."
+                $0.isError = true
+            }
+            isZAIGenerating = false
+            endStreaming(messageID: messageID)
+            return
+        }
+
+        var messages: [ZAICodingPlanClient.Message] = history.messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return .init(role: "user", text: message.content)
+            case .assistant:
+                let visible = message.modelVisibleContent
+                return (visible.isEmpty || message.isErrorMessage)
+                    ? nil : .init(role: "assistant", text: visible)
+            case .system:
+                return nil
+            }
+        }
+        messages.append(.init(role: "user", text: prompt))
+
+        let runControl = ZAIRunControl()
+        zaiRunControl = runControl
+        isZAIGenerating = true
+        zaiTask = Task { [weak self] in
+            guard let self else { return }
+            let context = await self.mcpPromptContext(for: history)
+            guard self.cancellationGeneration == generation else { return }
+            let tools = context.tools.map { binding in
+                ZAICodingPlanClient.Tool(
+                    name: binding.nativeToolName,
+                    serverID: binding.serverID,
+                    toolName: binding.tool.name,
+                    description: binding.tool.description,
+                    inputSchemaJSON: binding.tool.inputSchemaJSON)
+            }
+            do {
+                let output = try await ZAICodingPlanClient.complete(
+                    system: context.system,
+                    messages: messages,
+                    tools: tools,
+                    runControl: runControl)
+                guard self.cancellationGeneration == generation else { return }
+                self.enqueueStreamDelta(
+                    output, conversationID: conversationID, messageID: messageID)
+            } catch is CancellationError {
+                // User pressed stop — the child process has already been terminated.
+            } catch {
+                self.finishStreamBuffer(messageID)
+                self.appendToMessage(conversationID: conversationID, messageID: messageID) {
+                    if $0.content.isEmpty {
+                        $0.content = "⚠️ \(error.localizedDescription)"
+                        $0.isError = true
+                    } else {
+                        $0.content += "\n\n⚠️ Z.AI GLM-5.3 interrupted: \(error.localizedDescription)"
+                    }
+                }
+            }
+            guard self.cancellationGeneration == generation else { return }
+            self.finishStreamBuffer(messageID)
+            self.isZAIGenerating = false
+            self.zaiRunControl = nil
+            self.zaiTask = nil
+            self.endStreaming(messageID: messageID)
+            _ = await self.handleMCPToolRequestIfNeeded(
+                backend: .zai(modelID: model),
+                originalPrompt: mcpOriginalPrompt ?? prompt,
+                images: [],
+                conversationID: conversationID,
+                messageID: messageID,
+                mcpDepth: mcpDepth,
+                cancellationGeneration: generation)
+            self.scheduleSave()
+        }
+    }
+
     /// Routes a chat turn to Brave Search Answers and streams deltas into the message.
     private func streamBraveSearch(
         history: Conversation, prompt: String,
@@ -1616,6 +1774,8 @@ final class AppState {
 
         let client = BraveAnswersClient(apiKey: key, config: braveSearchConfig)
         var citations: [BraveCitation] = []
+        let buffersResearchDrafts = braveSearchConfig.enableResearch
+        var researchText = ""
 
         isBraveSearchGenerating = true
         braveSearchTask?.cancel()
@@ -1624,14 +1784,24 @@ final class AppState {
                 try await client.stream(
                     query: prompt,
                     onChunk: { delta in
-                        self?.enqueueStreamDelta(
-                            delta, conversationID: conversationID, messageID: messageID)
+                        if buffersResearchDrafts {
+                            researchText += delta
+                        } else {
+                            self?.enqueueStreamDelta(
+                                delta, conversationID: conversationID, messageID: messageID)
+                        }
                     },
                     onCitation: { citation in
                         citations.append(citation)
                     },
                     onUsage: { _ in }
                 )
+                if buffersResearchDrafts {
+                    let answer = BraveAnswersClient.cleanedResearchAnswer(researchText)
+                    guard !answer.isEmpty else { throw BraveAnswersError.emptyAnswer }
+                    self?.enqueueStreamDelta(
+                        answer, conversationID: conversationID, messageID: messageID)
+                }
             } catch is CancellationError {
                 // User pressed stop — leave whatever streamed in place.
             } catch {
@@ -1949,6 +2119,17 @@ final class AppState {
                 conversationID: conversationID,
                 messageID: messageID,
                 images: images,
+                cancellationGeneration: generation,
+                mcpDepth: mcpDepth,
+                mcpOriginalPrompt: originalPrompt)
+        case .zai(let modelID):
+            streamZAI(
+                model: modelID,
+                history: liveHistory,
+                prompt: prompt,
+                conversationID: conversationID,
+                messageID: messageID,
+                images: [],
                 cancellationGeneration: generation,
                 mcpDepth: mcpDepth,
                 mcpOriginalPrompt: originalPrompt)
@@ -2403,11 +2584,16 @@ final class AppState {
         openRouterTasks.values.forEach { $0.cancel() }
         openRouterTasks.removeAll()
         openAITask?.cancel()
+        zaiRunControl?.stop()
+        zaiRunControl = nil
+        zaiTask?.cancel()
+        zaiTask = nil
         braveSearchTask?.cancel()
         braveSearchTask = nil
         isClaudeGenerating = false
         isOpenRouterGenerating = false
         isOpenAIGenerating = false
+        isZAIGenerating = false
         isBraveSearchGenerating = false
         streamingMessageID = nil
         streamingMessageIDs.removeAll()

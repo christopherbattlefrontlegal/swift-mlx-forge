@@ -140,6 +140,25 @@ struct ModelPickerControl: View {
                     Button("Refresh live catalog") { app.refreshOpenRouterCatalog() }
                 }
             }
+            Section("Z.AI Coding Plan (ZCode subscription)") {
+                Button {
+                    app.setZAISelected(!app.isZAISelected)
+                } label: {
+                    Label(
+                        ZAICodingPlanClient.label,
+                        systemImage: app.isZAISelected ? "checkmark" : "bolt.horizontal.circle")
+                }
+                .disabled(!app.zaiConfiguration.isConfigured || app.isBusy)
+
+                Button("Refresh ZCode account") {
+                    app.refreshZAIConfiguration()
+                }
+                .disabled(app.isBusy)
+
+                if !app.zaiConfiguration.isConfigured {
+                    Text(app.zaiConfiguration.summary)
+                }
+            }
             Section("Claude (API key)") {
                 ForEach(AnthropicClient.models, id: \.id) { claude in
                     Button {
@@ -206,6 +225,9 @@ struct ModelPickerControl: View {
     }
 
     private var title: String {
+        if app.isZAISelected {
+            return ZAICodingPlanClient.label
+        }
         if let claude = app.claudeModelID, !claude.isEmpty {
             return AnthropicClient.label(for: claude)
         }
@@ -255,6 +277,9 @@ struct ModelPickerControl: View {
     }
 
     private var dotColor: Color {
+        if app.isZAISelected {
+            return app.zaiConfiguration.isConfigured ? Theme.okGreen : .red
+        }
         if let claude = app.claudeModelID, !claude.isEmpty {
             return app.hasAnthropicKey ? Theme.okGreen : Theme.emberGlow
         }

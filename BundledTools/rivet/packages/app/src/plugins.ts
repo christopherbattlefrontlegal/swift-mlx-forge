@@ -45,7 +45,7 @@ export type BuiltInPluginInfo = SharedPluginInfo & {
 
 export type PluginInfo = PackagePluginInfo | BuiltInPluginInfo;
 
-export const pluginInfos: PluginInfo[] = [
+const allPluginInfos: PluginInfo[] = [
   {
     type: 'package',
     id: 'rivet-plugin-example-python-exec@latest',
@@ -302,3 +302,14 @@ export const pluginInfos: PluginInfo[] = [
     logoImage: QdrantLogo,
   },
 ];
+
+export const packagePluginsSupported =
+  typeof globalThis.location === 'undefined' || !globalThis.location.pathname.startsWith('/rivet/');
+
+// Rivet's NPM plugin installer depends on Tauri filesystem, HTTP, archive, and
+// sidecar APIs. Forge embeds the browser build, so advertising those packages
+// would create Add buttons that cannot execute. Keep standalone Rivet unchanged
+// and show only genuinely loadable built-ins inside Forge.
+export const pluginInfos: PluginInfo[] = packagePluginsSupported
+  ? allPluginInfos
+  : allPluginInfos.filter((plugin) => plugin.type === 'built-in');

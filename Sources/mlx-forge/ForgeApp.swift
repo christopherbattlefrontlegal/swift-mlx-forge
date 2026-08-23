@@ -40,6 +40,15 @@ struct ForgeApp: App {
                     appState.newConversation()
                 }
                 .keyboardShortcut("n")
+                Divider()
+                Button("Open Graph Project…") {
+                    sendGraphCommand(.openProject)
+                }
+                .keyboardShortcut("o")
+                Button("Import Graph…") {
+                    sendGraphCommand(.importGraph)
+                }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
             }
             CommandMenu("Model") {
                 Button("Browse Models…") {
@@ -67,6 +76,17 @@ struct ForgeApp: App {
         Settings {
             ForgeSettingsView()
                 .environment(appState)
+        }
+    }
+
+    private func sendGraphCommand(_ command: ForgeGraphCommand) {
+        if appState.showRivet {
+            NotificationCenter.default.post(name: .forgeGraphCommand, object: command)
+        } else {
+            appState.showRivet = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                NotificationCenter.default.post(name: .forgeGraphCommand, object: command)
+            }
         }
     }
 }

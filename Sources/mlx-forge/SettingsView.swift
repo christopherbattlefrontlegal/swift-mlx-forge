@@ -38,6 +38,42 @@ private struct ClaudeKeySettings: View {
                 .font(.headline)
 
             providerCard(
+                title: "Z.AI Coding Plan",
+                icon: "bolt.horizontal.circle",
+                description: app.zaiConfiguration.detail
+            ) {
+                HStack(spacing: Theme.s2) {
+                    Label(
+                        app.zaiConfiguration.summary,
+                        systemImage: app.zaiConfiguration.isConfigured
+                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(
+                            app.zaiConfiguration.isConfigured ? Theme.okGreen : Theme.emberGlow)
+                    Spacer()
+                    Button("Refresh ZCode Account") {
+                        app.refreshZAIConfiguration()
+                    }
+                    .controlSize(.small)
+                    .disabled(app.isBusy)
+                }
+
+                Toggle(
+                    "Use GLM-5.3 in chat",
+                    isOn: Binding(
+                        get: { app.isZAISelected },
+                        set: { app.setZAISelected($0) }))
+                    .disabled(!app.zaiConfiguration.isConfigured || app.isBusy)
+
+                Text(
+                    "No API key is copied into Forge. Requests reuse the account selected in ZCode, and the credential exists only in the isolated ZCode child process environment."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            providerCard(
                 title: "OpenRouter",
                 icon: "point.3.connected.trianglepath.dotted",
                 description: app.hasOpenRouterKey

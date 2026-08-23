@@ -16,6 +16,7 @@ import Foundation
 import MLXLMCommon
 import Network
 import Observation
+import SystemConfiguration
 
 /// `@unchecked Sendable` box for handing a non-Sendable value (ChatSession,
 /// [Chat.Message]) into the server's off-main generation task. Safe because
@@ -41,6 +42,7 @@ final class ForgeServer {
 
     weak var engine: InferenceEngine?
     weak var store: ModelStore?
+    weak var mcp: MCPManager?
     /// Compiled Rivet browser app served from `/rivet/` on this same listener.
     /// Same-origin hosting lets Rivet use the API without weakening CORS.
     var rivetRoot: URL?
@@ -249,6 +251,10 @@ final class ForgeServer {
             await handleHealth(on: connection, allowOrigin: allowOrigin)
         case ("GET", "/v1/models"):
             await handleModels(on: connection, allowOrigin: allowOrigin)
+        case ("POST", "/v1/forge/mcp/tools"):
+            await handleMCPTools(on: connection, allowOrigin: allowOrigin)
+        case ("POST", "/v1/forge/mcp/call"):
+            await handleMCPCall(request, on: connection, allowOrigin: allowOrigin)
         case ("POST", "/v1/chat/completions"):
             await handleChat(request, on: connection, allowOrigin: allowOrigin)
         default:
@@ -360,7 +366,7 @@ final class ForgeServer {
     private func handleChat(
         _ request: HTTPRequest, on connection: NWConnection, allowOrigin: String?
     ) async {
-        let chat: ChatCompletionRequest
+        var chat: ChatCompletionRequest
         do {
             chat = try JSONDecoder().decode(ChatCompletionRequest.self, from: request.body)
         } catch {
@@ -368,6 +374,19 @@ final class ForgeServer {
                 on: connection, status: "400 Bad Request",
                 message: "Invalid request body.", allowOrigin: allowOrigin)
             return
+        }
+
+        if chat.model == "forge/local" {
+            guard let localName = engine?.activeModel?.model.name
+                ?? engine?.loadedModels.first?.model.name
+            else {
+                await HTTPResponse.sendError(
+                    on: connection, status: "409 Conflict",
+                    message: "Load a local model before using Graph Architect.",
+                    allowOrigin: allowOrigin)
+                return
+            }
+            chat.model = localName
         }
 
         // Resolve (auto-loading if installed but cold). On failure, return a generic
@@ -397,8 +416,9 @@ final class ForgeServer {
         let messages: [Chat.Message] = chat.messages.map { message in
             switch message.role {
             case "system", "developer": return .system(message.text)
-            case "assistant": return .assistant(message.text)
-            case "tool": return .tool(message.text)
+            case "assistant":
+                return .assistant(message.text, toolCalls: message.decodedToolCalls)
+            case "tool": return .tool(message.text, id: message.toolCallID)
             default: return .user(message.text)
             }
         }
@@ -412,7 +432,6 @@ final class ForgeServer {
             .map(\.content)
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
-        let history = Array(messages.filter { $0.role != .system }.dropLast())
         let settings = defaultSettings()
 
         let responseIDForEntry = "chatcmpl-\(UUID().uuidString.prefix(12))"
@@ -440,11 +459,11 @@ final class ForgeServer {
         let session = ChatSession(
             container,
             instructions: systemText.isEmpty ? nil : systemText,
-            history: history,
             generateParameters: parameters,
             additionalContext: InferenceEngine.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled,
-                effort: settings.localReasoningEffort))
+                effort: settings.localReasoningEffort),
+            tools: chat.toolSpecs)
         let responseID = "chatcmpl-\(UUID().uuidString.prefix(12))"
         let created = Int(Date().timeIntervalSince1970)
 
@@ -458,6 +477,73 @@ final class ForgeServer {
                 responseID: responseID, created: created, on: connection, allowOrigin: allowOrigin)
         }
         engine?.refreshMemory()
+    }
+
+    private func handleMCPTools(on connection: NWConnection, allowOrigin: String?) async {
+        guard allowOrigin != nil else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The MCP bridge is available only to the embedded graph workbench.",
+                allowOrigin: nil)
+            return
+        }
+        guard let mcp else {
+            await HTTPResponse.sendError(
+                on: connection, status: "503 Service Unavailable",
+                message: "MCP manager unavailable.", allowOrigin: allowOrigin)
+            return
+        }
+        let tools = await mcp.prepareToolCatalogForPrompt().map { binding -> [String: Any] in
+            [
+                "server": binding.serverID,
+                "name": binding.tool.name,
+                "description": binding.tool.description,
+                "inputSchema": binding.inputSchemaObject,
+            ]
+        }
+        await HTTPResponse.sendJSON(
+            on: connection, object: ["tools": tools], allowOrigin: allowOrigin)
+    }
+
+    private func handleMCPCall(
+        _ request: HTTPRequest, on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard allowOrigin != nil else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The MCP bridge is available only to the embedded graph workbench.",
+                allowOrigin: nil)
+            return
+        }
+        guard let mcp,
+            let object = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+            let rawServer = object["server"] as? String,
+            let tool = object["tool"] as? String,
+            let arguments = object["arguments"] as? [String: Any]
+        else {
+            await HTTPResponse.sendError(
+                on: connection, status: "400 Bad Request",
+                message: "Expected server, tool, and arguments.", allowOrigin: allowOrigin)
+            return
+        }
+        let server = mcp.resolveEntryID(rawServer)
+        guard mcp.effectiveSelectedTools(for: server).contains(tool) else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The requested MCP tool is not enabled.", allowOrigin: allowOrigin)
+            return
+        }
+        do {
+            let result = try await mcp.callTool(
+                entryID: server, name: tool, arguments: arguments)
+            await HTTPResponse.send(
+                on: connection, status: "200 OK", contentType: "application/json",
+                body: result, allowOrigin: allowOrigin)
+        } catch {
+            await HTTPResponse.sendError(
+                on: connection, status: "502 Bad Gateway",
+                message: error.localizedDescription, allowOrigin: allowOrigin)
+        }
     }
 
     private func resolveModel(named name: String) async throws -> InferenceEngine.Loaded {
@@ -499,16 +585,10 @@ final class ForgeServer {
             let session = sessionBox.value
             let messages = messagesBox.value
             do {
-                // The session already carries the prior turns as history; the final user
-                // message is the turn we are replying to.
-                let replyTarget = messages.last(where: { $0.role != .system })
-                let prompt = replyTarget?.content ?? ""
-                let role = replyTarget?.role ?? .user
-                let images = replyTarget?.images ?? []
-                let videos = replyTarget?.videos ?? []
                 var finishReason = "stop"
+                var toolIndex = 0
                 for try await item in session.streamDetails(
-                    to: prompt, role: role, images: images, videos: videos)
+                    to: messages.filter { $0.role != .system })
                 {
                     if Task.isCancelled { break }
                     switch item {
@@ -523,8 +603,24 @@ final class ForgeServer {
                     case .info(let info):
                         // Report length-truncation honestly so clients can retry/extend.
                         if info.stopReason == .length { finishReason = "length" }
-                    case .toolCall:
-                        break
+                    case .toolCall(let call):
+                        finishReason = "tool_calls"
+                        let delta: [String: Any] = [
+                            "tool_calls": [[
+                                "index": toolIndex,
+                                "id": call.id ?? "call-\(UUID().uuidString)",
+                                "type": "function",
+                                "function": [
+                                    "name": call.function.name,
+                                    "arguments": Self.toolArgumentsJSON(call),
+                                ],
+                            ]]
+                        ]
+                        toolIndex += 1
+                        let delivered = await HTTPResponse.sendRaw(
+                            on: connection,
+                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: delta, finish: nil))\n\n")
+                        guard delivered else { return }
                     }
                 }
                 await HTTPResponse.sendRaw(
@@ -561,6 +657,12 @@ final class ForgeServer {
         return String(decoding: data, as: UTF8.self)
     }
 
+    nonisolated private static func toolArgumentsJSON(_ call: ToolCall) -> String {
+        let object = call.function.arguments.mapValues(\.anyValue)
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func completeChat(
         session: ChatSession, messages: [Chat.Message], model: String,
         responseID: String, created: Int, on connection: NWConnection, allowOrigin: String?
@@ -576,35 +678,46 @@ final class ForgeServer {
             // turn serving an API request doesn't freeze the app UI.
             let sessionBox = SendableBox(value: session)
             let messagesBox = SendableBox(value: messages)
-            let (output, info) = try await gate.withTurnDetached { [sessionBox, messagesBox] in
+            let (output, info, toolCalls) = try await gate.withTurnDetached { [sessionBox, messagesBox] in
                 let session = sessionBox.value
                 let messages = messagesBox.value
-                let replyTarget = messages.last(where: { $0.role != .system })
-                let prompt = replyTarget?.content ?? ""
-                let role = replyTarget?.role ?? .user
-                let images = replyTarget?.images ?? []
-                let videos = replyTarget?.videos ?? []
                 var output = ""
                 var info: GenerateCompletionInfo?
+                var toolCalls: [ToolCall] = []
                 for try await item in session.streamDetails(
-                    to: prompt, role: role, images: images, videos: videos
+                    to: messages.filter { $0.role != .system }
                 ) {
                     switch item {
                     case .chunk(let text): output += text
                     case .info(let i): info = i
-                    case .toolCall: break
+                    case .toolCall(let call): toolCalls.append(call)
                     }
                 }
-                return (output, info)
+                return (output, info, toolCalls)
             }
-            let finishReason = info?.stopReason == .length ? "length" : "stop"
+            let finishReason = !toolCalls.isEmpty
+                ? "tool_calls" : (info?.stopReason == .length ? "length" : "stop")
+            var responseMessage: [String: Any] = ["role": "assistant", "content": output]
+            if !toolCalls.isEmpty {
+                responseMessage["tool_calls"] = toolCalls.enumerated().map { index, call in
+                    [
+                        "index": index,
+                        "id": call.id ?? "call-\(UUID().uuidString)",
+                        "type": "function",
+                        "function": [
+                            "name": call.function.name,
+                            "arguments": Self.toolArgumentsJSON(call),
+                        ],
+                    ] as [String: Any]
+                }
+            }
             let body: [String: Any] = [
                 "id": responseID, "object": "chat.completion",
                 "created": created, "model": model,
                 "choices": [
                     [
                         "index": 0,
-                        "message": ["role": "assistant", "content": output],
+                        "message": responseMessage,
                         "finish_reason": finishReason,
                     ]
                 ],
@@ -750,11 +863,24 @@ enum LocalNetwork {
             }
             freeifaddrs(addresses)
         }
-        let localHostName = Host.current().names.first { $0.hasSuffix(".local") }
-        if let localHostName, !hosts.contains(localHostName) {
+        // `Host.current().names` performs synchronous reverse-DNS/mDNS resolution.
+        // This function is read from SwiftUI's body on the main actor, so a slow
+        // resolver freezes the whole app (and endpoint requests can hit the same
+        // path through `localIdentity()`). The SystemConfiguration value is the
+        // machine's configured Bonjour name and does not perform network lookup.
+        if let localHostName = configuredBonjourHostName(), !hosts.contains(localHostName) {
             hosts.append(localHostName)
         }
         return hosts
+    }
+
+    private static func configuredBonjourHostName() -> String? {
+        guard let configured = SCDynamicStoreCopyLocalHostName(nil) as String? else {
+            return nil
+        }
+        let name = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return name.hasSuffix(".local") ? name : "\(name).local"
     }
 }
 
@@ -768,18 +894,63 @@ private struct ChatCompletionRequest: Decodable {
     var top_p: Double?
     var max_tokens: Int?
     var max_completion_tokens: Int?
+    var tools: [JSONValue]?
+
+    var toolSpecs: [ToolSpec]? {
+        let converted = tools?.compactMap { value -> ToolSpec? in
+            guard case .object(let object) = value else { return nil }
+            return object.mapValues(Self.sendableValue)
+        } ?? []
+        return converted.isEmpty ? nil : converted
+    }
+
+    private static func sendableValue(_ value: JSONValue) -> any Sendable {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .double(let value): return value
+        case .string(let value): return value
+        case .array(let values): return values.map(sendableValue)
+        case .object(let values): return values.mapValues(sendableValue)
+        }
+    }
 
     struct Message: Decodable {
         var role: String
         var text: String
+        var toolCalls: [ToolCallPayload]?
+        var toolCallID: String?
+
+        var decodedToolCalls: [ToolCall]? {
+            let calls = toolCalls?.compactMap { payload -> ToolCall? in
+                guard payload.type == nil || payload.type == "function" else { return nil }
+                let arguments: [String: JSONValue]
+                if let data = payload.function.arguments.data(using: .utf8),
+                    let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+                {
+                    arguments = decoded
+                } else {
+                    arguments = [:]
+                }
+                return ToolCall(
+                    function: .init(name: payload.function.name, arguments: arguments),
+                    id: payload.id)
+            } ?? []
+            return calls.isEmpty ? nil : calls
+        }
 
         enum CodingKeys: String, CodingKey {
             case role, content
+            case toolCalls = "tool_calls"
+            case toolCallID = "tool_call_id"
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             role = try container.decode(String.self, forKey: .role)
+            toolCalls = try container.decodeIfPresent([ToolCallPayload].self, forKey: .toolCalls)
+            toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID)
             // content can be a string or an array of typed parts.
             if let string = try? container.decode(String.self, forKey: .content) {
                 text = string
@@ -793,6 +964,17 @@ private struct ChatCompletionRequest: Decodable {
         struct Part: Decodable {
             var type: String?
             var text: String?
+        }
+
+        struct ToolCallPayload: Decodable {
+            var id: String?
+            var type: String?
+            var function: Function
+
+            struct Function: Decodable {
+                var name: String
+                var arguments: String
+            }
         }
     }
 }

@@ -67,6 +67,11 @@ struct BraveAnswersClient {
 
         var request = URLRequest(url: URL(string: "https://api.search.brave.com/res/v1/chat/completions")!)
         request.httpMethod = "POST"
+        // Brave Research can spend more than URLRequest's default timeout
+        // gathering sources before it emits the next SSE event. Match Forge's
+        // other long-running cloud streams so a normal research pause is not
+        // reported as a failed request.
+        request.timeoutInterval = 1800
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-subscription-token")
 
@@ -137,6 +142,107 @@ struct BraveAnswersClient {
         if !deliveredText {
             throw BraveAnswersError.emptyAnswer
         }
+    }
+
+    /// Research mode may emit an intermediate writer draft, then repeat or
+    /// revise that draft before the final answer. Unlike ordinary Answers
+    /// mode, Forge buffers Research output and runs it through this cleanup so
+    /// internal drafting notes and superseded answers never become the saved
+    /// assistant response.
+    static func cleanedResearchAnswer(_ raw: String) -> String {
+        let normalizedNewlines = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var blocks: [String] = []
+        var lines: [String] = []
+
+        func flushLines() {
+            let block = lines
+                .filter { !isResearchPlanningLeak($0) }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !block.isEmpty { blocks.append(block) }
+            lines.removeAll(keepingCapacity: true)
+        }
+
+        var sawDraftSignal = false
+        for line in normalizedNewlines.components(separatedBy: "\n") {
+            if isResearchPlanningLeak(line) {
+                sawDraftSignal = true
+                continue
+            }
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                flushLines()
+            } else {
+                lines.append(line)
+            }
+        }
+        flushLines()
+
+        var result: [String] = []
+        for block in blocks {
+            let canonical = canonicalResearchBlock(block)
+            if let exact = result.firstIndex(where: {
+                canonicalResearchBlock($0) == canonical
+            }) {
+                // A byte-for-byte repeated answer is a strong signal that the
+                // Research writer is emitting candidates rather than sections.
+                sawDraftSignal = true
+                result[exact] = block
+                continue
+            }
+
+            let threshold = sawDraftSignal ? 0.45 : 0.82
+            if researchWordSet(block).count >= 20,
+               let revision = result.indices.last(where: { index in
+                   researchWordSet(result[index]).count >= 20
+                       && researchSimilarity(result[index], block) >= threshold
+               })
+            {
+                result[revision] = block
+            } else {
+                result.append(block)
+            }
+        }
+        return result.joined(separator: "\n\n")
+    }
+
+    private static func isResearchPlanningLeak(_ line: String) -> Bool {
+        let value = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !value.isEmpty else { return false }
+        return value.contains("i will output")
+            || value.contains("i'll output")
+            || value.contains("i will now write")
+            || value.contains("i'll now write")
+            || value.contains("this covers all bases")
+            || value.contains(".writer")
+    }
+
+    private static func canonicalResearchBlock(_ block: String) -> String {
+        block.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    private static func researchWordSet(_ text: String) -> Set<String> {
+        let stopWords: Set<String> = [
+            "and", "are", "but", "for", "from", "has", "have", "into", "its",
+            "not", "that", "the", "their", "these", "this", "through", "using",
+            "was", "were", "while", "with"
+        ]
+        return Set(
+            text.lowercased()
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count > 2 && !stopWords.contains($0) })
+    }
+
+    private static func researchSimilarity(_ lhs: String, _ rhs: String) -> Double {
+        let left = researchWordSet(lhs)
+        let right = researchWordSet(rhs)
+        let denominator = min(left.count, right.count)
+        guard denominator > 0 else { return 0 }
+        return Double(left.intersection(right).count) / Double(denominator)
     }
 
     private static func parseCitationTag(_ text: String) -> BraveCitation? {

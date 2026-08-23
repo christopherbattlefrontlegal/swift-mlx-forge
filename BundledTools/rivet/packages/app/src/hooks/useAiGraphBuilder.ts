@@ -30,6 +30,7 @@ import { useDependsOnPlugins } from './useDependsOnPlugins';
 import graphBuilderProject from '../../graphs/graph-creator.rivet-project?raw';
 import graphBuilderData from '../../graphs/graph-creator.rivet-data?raw';
 import { referencedProjectsState } from '../state/savedGraphs';
+import { buildForgeGraphArchitectRequest, loadForgeMCPTools } from '../prompts/forgeGraphArchitect';
 
 export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onFeedback: (feedback: string) => void }) {
   const [graph, setGraph] = useAtom(graphState);
@@ -44,6 +45,7 @@ export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onF
 
   return async function applyPrompt(prompt: string, modelAndApi: `${string}:${string}`, abort: AbortSignal) {
     const recorder = new ExecutionRecorder({ includePartialOutputs: false, includeTrace: false });
+    const canRecord = record && !globalThis.location?.pathname.startsWith('/rivet/');
 
     try {
       let workingGraph = cloneDeep(graph);
@@ -63,6 +65,33 @@ export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onF
       };
 
       const externalFunctions: Record<string, ExternalFunction> = {
+        callMCPTool: async (_ctx, request) => {
+          const call = request as { server?: string; tool?: string; arguments?: Record<string, unknown> };
+          if (!call.server || !call.tool) {
+            throw new Error('callMCPTool requires server and tool');
+          }
+          const response = await fetch(`${globalThis.location.origin}/v1/forge/mcp/call`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              server: call.server,
+              tool: call.tool,
+              arguments: call.arguments ?? {},
+            }),
+            signal: abort,
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            let message = text;
+            try {
+              message = (JSON.parse(text) as { error?: { message?: string } }).error?.message ?? text;
+            } catch {
+              // Keep the response body when it is not JSON.
+            }
+            throw new Error(message || `MCP call failed (${response.status})`);
+          }
+          return { type: 'string', value: text };
+        },
         createNode: async (_ctx, nodeType) => {
           const newNode = globalRivetNodeRegistry.createDynamic(nodeType as string);
           workingGraph.nodes.push(newNode);
@@ -476,10 +505,13 @@ export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onF
       const registry = registerBuiltInNodes(new NodeRegistration());
       registry.registerPlugin(corePlugins.anthropic);
 
+      const mcpTools = await loadForgeMCPTools();
+      const graphArchitectRequest = buildForgeGraphArchitectRequest(prompt, mcpTools);
+
       const processor = coreCreateProcessor(project, {
         graph: 'Main',
         inputs: {
-          request: prompt,
+          request: graphArchitectRequest,
           graph: JSON.stringify(workingGraph, null, 2),
           model: model!,
           api: api!,
@@ -499,13 +531,13 @@ export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onF
         ...(await fillMissingSettingsFromEnvironmentVariables(settings, plugins)),
       });
 
-      if (record) {
+      if (canRecord) {
         recorder.record(processor.processor);
       }
 
       const { cost } = await processor.run();
 
-      if (record) {
+      if (canRecord) {
         const serialized = recorder.serialize();
 
         const fileName = `recordings/graph-${Date.now()}.rivet-recording`;
@@ -524,7 +556,7 @@ export function useAiGraphBuilder({ record, onFeedback }: { record: boolean; onF
 
       console.log(`Cost: ${coerceType(cost, 'number')}`);
     } catch (err) {
-      if (record) {
+      if (canRecord) {
         const serialized = recorder.serialize();
         const fileName = `recordings/error-${Date.now()}.rivet-recording`;
         await createDir('recordings', {

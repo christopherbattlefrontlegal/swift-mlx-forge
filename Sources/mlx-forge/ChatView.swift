@@ -829,17 +829,19 @@ struct ComposerView: View {
                     .padding(.bottom, Theme.s1)
                 }
 
-                // Bottom command bar. Sections are deliberately spread across the wide composer
-                // so the controls read as grouped actions instead of one cramped icon run.
-                HStack(spacing: 0) {
+                // Keep actions and model endpoints on separate rows. Combining them with
+                // expanding spacers made the provider names collapse to one character per
+                // line whenever the inspector narrowed the composer.
+                VStack(alignment: .leading, spacing: Theme.s2) {
                     HStack(spacing: Theme.s3) {
-                        Button {
-                            pickPhoto()
-                        } label: {
-                            ToolbarIcon("photo.badge.plus")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Attach photo for review or context (user-selected; sandbox-safe). Data is available for local VLM or MCP photo-review tools.")
+                        HStack(spacing: Theme.s3) {
+                            Button {
+                                pickPhoto()
+                            } label: {
+                                ToolbarIcon("photo.badge.plus")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Attach photo for review or context (user-selected; sandbox-safe). Data is available for local VLM or MCP photo-review tools.")
 
                         Button {
                             let images = pendingImages
@@ -860,9 +862,7 @@ struct ComposerView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Attach files — text/code/JSON/Markdown are inlined as context, PDFs are text-extracted, images attach like photos")
-                    }
-
-                    Spacer(minLength: Theme.s6)
+                        }
 
                     HStack(spacing: Theme.s3) {
                         Menu {
@@ -970,9 +970,7 @@ struct ComposerView: View {
                             app.isEnhancingPrompt
                                 || app.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         .help("Enhance prompt — rewrites your draft into a clearer, more effective prompt (needs Anthropic or OpenRouter key)")
-                    }
-
-                    Spacer(minLength: Theme.s6)
+                        }
 
                     HStack(spacing: Theme.s3) {
                         Button {
@@ -996,9 +994,12 @@ struct ComposerView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Build a Claude Code non-interactive command")
+                        }
+
+                        Spacer(minLength: 0)
                     }
 
-                    Spacer(minLength: Theme.s6)
+                    Divider()
 
                     HStack(spacing: Theme.s3) {
                         // Right side: local API and cloud-provider controls.
@@ -1006,6 +1007,7 @@ struct ComposerView: View {
                             Text("API")
                                 .font(.callout.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                             Toggle("API", isOn: Binding(
                                 get: { app.serverEnabled },
                                 set: { enabled in
@@ -1031,6 +1033,7 @@ struct ComposerView: View {
                             Text("OpenRouter")
                                 .font(.callout.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                             Toggle("OpenRouter", isOn: Binding(
                                 get: { !app.openRouterModelIDs.isEmpty },
                                 set: { enabled in
@@ -1062,6 +1065,7 @@ struct ComposerView: View {
                             Text("Anthropic")
                                 .font(.callout.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                             Toggle("Anthropic", isOn: Binding(
                                 get: { app.claudeModelID != nil },
                                 set: { enabled in
@@ -1106,6 +1110,7 @@ struct ComposerView: View {
                             Text("OpenAI")
                                 .font(.callout.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                             Toggle("OpenAI", isOn: Binding(
                                 get: { app.openAIModelID != nil },
                                 set: { enabled in
@@ -1162,9 +1167,7 @@ struct ComposerView: View {
                             .buttonStyle(.plain)
                             .help("Eject all loaded/loading local models")
                         }
-                    }
-
-                    Spacer(minLength: Theme.s6)
+                        Spacer(minLength: Theme.s6)
 
                     if app.isBusy {
                         Button {
@@ -1197,6 +1200,7 @@ struct ComposerView: View {
                         .disabled(!app.canSend || isPreparingAttachments)
                         .keyboardShortcut(.return, modifiers: .command)
                         .help("Send (⌘↩)")
+                        }
                     }
                 }
                 .padding(.horizontal, Theme.s3)
