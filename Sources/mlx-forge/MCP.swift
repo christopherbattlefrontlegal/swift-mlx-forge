@@ -676,7 +676,7 @@ final class MCPManager {
                 params: [
                     "protocolVersion": "2025-03-26",
                     "capabilities": [String: String](),
-                    "clientInfo": ["name": "Forge", "version": "2.0.0"],
+                    "clientInfo": ["name": "Forge", "version": "2.0.1"],
                 ])
             try session.notify(method: "notifications/initialized")
             let result = try session.request(
@@ -1382,7 +1382,7 @@ struct MCPHTTPClient {
             params: [
                 "protocolVersion": "2025-03-26",
                 "capabilities": [String: String](),
-                "clientInfo": ["name": "Forge", "version": "2.0.0"],
+                "clientInfo": ["name": "Forge", "version": "2.0.1"],
             ],
             sessionID: nil)
         _ = initialized
@@ -1420,7 +1420,7 @@ struct MCPHTTPClient {
             params: [
                 "protocolVersion": "2025-03-26",
                 "capabilities": [String: String](),
-                "clientInfo": ["name": "Forge", "version": "2.0.0"],
+                "clientInfo": ["name": "Forge", "version": "2.0.1"],
             ],
             sessionID: nil)
         _ = initialized
