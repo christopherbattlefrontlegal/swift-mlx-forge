@@ -149,6 +149,7 @@ $ICON_PLIST
     <key>ForgeMCPConfigPath</key><string></string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <key>NSAppleEventsUsageDescription</key><string>Forge controls Apple Music playback (play, pause, volume, EQ) from the Media tab.</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>Forge — native MLX runtime</string>
 </dict>

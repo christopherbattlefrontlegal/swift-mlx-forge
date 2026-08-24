@@ -83,14 +83,14 @@ enum MediaGenClient {
     // MARK: - Images
 
     static func generateImage(
-        provider: MediaProvider, prompt: String, size: String
+        provider: MediaProvider, model: String, prompt: String, size: String
     ) async throws -> Data {
         switch provider {
         case .openAIImage:
             guard let key = SecretsStore.openAIAPIKey else {
                 throw MediaGenError.noKey("OpenAI")
             }
-            var body: [String: Any] = ["model": "gpt-image-1", "prompt": prompt, "n": 1]
+            var body: [String: Any] = ["model": model, "prompt": prompt, "n": 1]
             if size != "default" { body["size"] = size }
             let json = try await postJSON(
                 url: "https://api.openai.com/v1/images/generations", key: key, body: body)
@@ -100,7 +100,7 @@ enum MediaGenClient {
                 throw MediaGenError.noKey("xAI")
             }
             let body: [String: Any] = [
-                "model": "grok-2-image", "prompt": prompt,
+                "model": model, "prompt": prompt,
                 "response_format": "b64_json", "n": 1,
             ]
             let json = try await postJSON(
@@ -133,14 +133,14 @@ enum MediaGenClient {
     /// Creates a Sora render job, polls until it finishes, and returns MP4 bytes.
     /// `onStatus` receives human-readable progress ("rendering 42%").
     static func generateVideo(
-        prompt: String, seconds: Int, size: String,
+        model: String, prompt: String, seconds: Int, size: String,
         onStatus: @escaping @Sendable (String) -> Void
     ) async throws -> Data {
         guard let key = SecretsStore.openAIAPIKey else {
             throw MediaGenError.noKey("OpenAI")
         }
         let body: [String: Any] = [
-            "model": "sora-2", "prompt": prompt,
+            "model": model, "prompt": prompt,
             "seconds": String(seconds), "size": size,
         ]
         let created = try await postJSON(

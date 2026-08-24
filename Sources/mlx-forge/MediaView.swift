@@ -21,6 +21,9 @@ struct MediaView: View {
     @State private var isGenerating = false
     @State private var selected: MediaAsset?
     @State private var generationTask: Task<Void, Never>?
+    @AppStorage("media.model.openAIImage") private var openAIImageModel = "gpt-image-1"
+    @AppStorage("media.model.grokImage") private var grokImageModel = "grok-2-image"
+    @AppStorage("media.model.video") private var videoModel = "sora-2"
 
     var body: some View {
         HSplitView {
@@ -57,6 +60,8 @@ struct MediaView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+
+            modelPicker
 
             Text("Prompt")
                 .font(.caption.weight(.semibold))
@@ -142,6 +147,44 @@ struct MediaView: View {
         }
     }
 
+    private var modelOptions: [String] {
+        switch provider {
+        case .openAIImage: return CloudModelCatalog.imageModels(.openAI)
+        case .grokImage: return CloudModelCatalog.imageModels(.xAI)
+        case .openAIVideo: return CloudModelCatalog.videoModels()
+        }
+    }
+
+    private var modelBinding: Binding<String> {
+        switch provider {
+        case .openAIImage: return $openAIImageModel
+        case .grokImage: return $grokImageModel
+        case .openAIVideo: return $videoModel
+        }
+    }
+
+    /// Model options come from the live provider catalogs (see Settings);
+    /// the stored choice is kept in the list even if a refresh drops it.
+    @ViewBuilder
+    private var modelPicker: some View {
+        let _ = app.cloudCatalogTick
+        let options = modelOptions
+        let binding = modelBinding
+        let full = options.contains(binding.wrappedValue)
+            ? options : options + [binding.wrappedValue]
+        Picker("Model", selection: binding) {
+            ForEach(full, id: \.self) { Text($0).tag($0) }
+        }
+    }
+
+    private var selectedModel: String {
+        switch provider {
+        case .openAIImage: return openAIImageModel
+        case .grokImage: return grokImageModel
+        case .openAIVideo: return videoModel
+        }
+    }
+
     private func generate() {
         let requestPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requestPrompt.isEmpty, !isGenerating else { return }
@@ -149,6 +192,7 @@ struct MediaView: View {
         errorText = ""
         status = provider.isVideo ? "submitting render job" : "generating"
         let requestProvider = provider
+        let requestModel = selectedModel
         let requestSize = imageSize
         let requestSeconds = videoSeconds
         generationTask = Task { @MainActor in
@@ -161,14 +205,16 @@ struct MediaView: View {
                 let fileExtension: String
                 if requestProvider.isVideo {
                     data = try await MediaGenClient.generateVideo(
-                        prompt: requestPrompt, seconds: requestSeconds, size: requestSize
+                        model: requestModel, prompt: requestPrompt,
+                        seconds: requestSeconds, size: requestSize
                     ) { progress in
                         Task { @MainActor in self.status = progress }
                     }
                     fileExtension = "mp4"
                 } else {
                     data = try await MediaGenClient.generateImage(
-                        provider: requestProvider, prompt: requestPrompt, size: requestSize)
+                        provider: requestProvider, model: requestModel,
+                        prompt: requestPrompt, size: requestSize)
                     fileExtension = "png"
                 }
                 if let asset = library.save(
@@ -286,13 +332,28 @@ struct MediaView: View {
 /// other application's window or interface is embedded.
 @MainActor
 private enum AppleMusicRemote {
+    /// Last script failure, kept so the UI can explain a denial instead of
+    /// silently doing nothing. Error -1743 is the Automation-permission block.
+    private(set) static var lastError: (code: Int, message: String)?
+
     @discardableResult
     static func run(_ source: String) -> String? {
         let script = NSAppleScript(source: source)
         var errorInfo: NSDictionary?
         let result = script?.executeAndReturnError(&errorInfo)
-        guard errorInfo == nil else { return nil }
+        if let errorInfo {
+            lastError = (
+                (errorInfo[NSAppleScript.errorNumber] as? Int) ?? 0,
+                (errorInfo[NSAppleScript.errorMessage] as? String) ?? "unknown script error"
+            )
+            return nil
+        }
+        lastError = nil
         return result?.stringValue
+    }
+
+    static var permissionDenied: Bool {
+        lastError?.code == -1743
     }
 
     static func playPause() { run("tell application \"Music\" to playpause") }
@@ -326,19 +387,17 @@ private enum AppleMusicRemote {
     }
 
     static func eqPresetNames() -> [String] {
-        guard
-            let joined = run(
-                "tell application \"Music\" to return name of every EQ preset as string")
-        else { return [] }
-        // AppleScript coerces the list with the current text item delimiter,
-        // which is "" by default, so fetch again with an explicit delimiter.
-        if joined.contains("|") || joined.isEmpty { return [] }
-        let listed = run(
+        // Lists coerce to text with the active delimiter, so set one first.
+        let joined = run(
             """
             set AppleScript's text item delimiters to "|"
-            tell application "Music" to return (name of every EQ preset) as string
+            tell application "Music" to set presetNames to name of every EQ preset
+            set joined to presetNames as string
+            set AppleScript's text item delimiters to ""
+            return joined
             """)
-        return (listed ?? joined).split(separator: "|").map(String.init)
+        guard let joined, !joined.isEmpty else { return [] }
+        return joined.split(separator: "|").map(String.init)
     }
 
     static func currentEQ() -> String {
@@ -413,9 +472,25 @@ private struct MusicTransportBar: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.ember)
-                Text("Pipes Music.app playback control into this tab.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if connectError.isEmpty {
+                    Text("Pipes Music.app playback control into this tab.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(connectError)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.emberGlow)
+                        .lineLimit(2)
+                    Button("Open Automation Settings") {
+                        if let url = URL(
+                            string:
+                                "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+                        ) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .controlSize(.small)
+                }
             }
 
             Spacer()
@@ -428,9 +503,27 @@ private struct MusicTransportBar: View {
         }
     }
 
+    @State private var connectError = ""
+
     private func connect() {
-        // First scripting call prompts macOS for Automation permission.
-        AppleMusicRemote.run("tell application \"Music\" to activate")
+        // A real query, so the first press both triggers the macOS Automation
+        // prompt and proves the pipe works before the transport appears.
+        let state = AppleMusicRemote.run(
+            "tell application \"Music\" to return player state as string")
+        guard state != nil else {
+            if AppleMusicRemote.permissionDenied {
+                connectError =
+                    "macOS blocked Forge from controlling Music. Allow Forge under "
+                    + "Privacy & Security, Automation, then press the button again."
+            } else {
+                connectError = AppleMusicRemote.lastError.map {
+                    "Music scripting failed (\($0.code)); \($0.message)"
+                } ?? "Music scripting failed."
+            }
+            connected = false
+            return
+        }
+        connectError = ""
         connected = true
         volume = AppleMusicRemote.volume()
         eqPresets = AppleMusicRemote.eqPresetNames()

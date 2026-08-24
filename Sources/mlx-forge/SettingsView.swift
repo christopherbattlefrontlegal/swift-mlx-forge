@@ -30,6 +30,81 @@ private struct ClaudeKeySettings: View {
     @State private var customOpenRouterModel = ""
     @State private var braveSearchDraft = ""
     @State private var xaiDraft = ""
+    @State private var customModelDrafts: [CloudProvider: String] = [:]
+
+    /// OpenRouter-style live catalog controls, shared by every provider card:
+    /// refresh from the provider's /v1/models, show freshness, add custom ids.
+    @ViewBuilder
+    private func catalogControls(for provider: CloudProvider) -> some View {
+        let tick = app.cloudCatalogTick
+        Divider()
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            HStack(spacing: Theme.s2) {
+                Button("Refresh model catalog") {
+                    app.refreshCloudCatalog(provider)
+                }
+                .controlSize(.small)
+                .disabled(app.catalogLoading.contains(provider))
+                if app.catalogLoading.contains(provider) {
+                    ProgressView().controlSize(.small)
+                }
+                Text(catalogSummary(for: provider, tick: tick))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if let error = app.catalogErrors[provider] {
+                Text(error).font(.caption2).foregroundStyle(.red)
+            }
+            HStack(spacing: Theme.s2) {
+                TextField(
+                    "add model id",
+                    text: Binding(
+                        get: { customModelDrafts[provider] ?? "" },
+                        set: { customModelDrafts[provider] = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                Button("Add") {
+                    let draft = (customModelDrafts[provider] ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !draft.isEmpty else { return }
+                    app.addCustomCloudModel(provider, id: draft)
+                    customModelDrafts[provider] = ""
+                }
+                .controlSize(.small)
+                .disabled(
+                    (customModelDrafts[provider] ?? "")
+                        .trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            let customs = CloudModelCatalog.customModels(provider)
+            if !customs.isEmpty {
+                ForEach(customs, id: \.self) { id in
+                    HStack(spacing: Theme.s1) {
+                        Text(id).font(.caption2.monospaced())
+                        Button {
+                            app.removeCustomCloudModel(provider, id: id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func catalogSummary(for provider: CloudProvider, tick: Int) -> String {
+        _ = tick
+        let count = CloudModelCatalog.fetchedCount(provider)
+        guard count > 0 else { return "Using the built-in list. Refresh to fetch live models." }
+        guard let refreshed = CloudModelCatalog.lastRefresh(provider) else {
+            return "\(count) live models"
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        let age = formatter.localizedString(for: refreshed, relativeTo: Date())
+        return "\(count) live models, updated \(age)"
+    }
 
     var body: some View {
         @Bindable var app = app
@@ -261,6 +336,8 @@ private struct ClaudeKeySettings: View {
                         .help("Remove the stored xAI key")
                     }
                 }
+
+                catalogControls(for: .xAI)
             }
 
             providerCard(
@@ -302,6 +379,8 @@ private struct ClaudeKeySettings: View {
                         .help("Remove the stored OpenAI key")
                     }
                 }
+
+                catalogControls(for: .openAI)
             }
 
             providerCard(
@@ -320,6 +399,8 @@ private struct ClaudeKeySettings: View {
                     }
                 }
                 .pickerStyle(.menu)
+
+                catalogControls(for: .anthropic)
 
                 HStack(spacing: Theme.s2) {
                     SecureField(

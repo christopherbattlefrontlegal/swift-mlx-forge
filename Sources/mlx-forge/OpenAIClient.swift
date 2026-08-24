@@ -71,7 +71,8 @@ struct OpenAIClient {
         return ["role": turn.role, "content": parts]
     }
 
-    static let models: [(id: String, label: String)] = [
+    /// Curated fallback shown before the first live catalog fetch.
+    static let defaultModels: [(id: String, label: String)] = [
         ("gpt-5.5", "GPT-5.5"),
         ("gpt-5.5-pro", "GPT-5.5 Pro"),
         ("gpt-5.4", "GPT-5.4"),
@@ -79,6 +80,11 @@ struct OpenAIClient {
         ("o4-mini", "o4-mini"),
         ("o3", "o3"),
     ]
+
+    /// Live catalog when fetched, plus user-added ids (see CloudModelCatalog).
+    static var models: [(id: String, label: String)] {
+        CloudModelCatalog.chatModels(.openAI)
+    }
 
     static func label(for id: String) -> String {
         models.first { $0.id == id }?.label ?? id

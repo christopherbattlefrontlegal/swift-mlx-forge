@@ -436,6 +436,58 @@ final class AppState {
         }
     }
 
+    // MARK: - Cloud model catalogs (OpenAI / Anthropic / xAI)
+
+    /// Bumped whenever a catalog changes so pickers re-read the model lists.
+    private(set) var cloudCatalogTick = 0
+    private(set) var catalogLoading: Set<CloudProvider> = []
+    var catalogErrors: [CloudProvider: String] = [:]
+
+    func refreshCloudCatalog(_ provider: CloudProvider, quiet: Bool = false) {
+        guard provider.apiKey != nil else {
+            if !quiet {
+                catalogErrors[provider] = "Add a \(provider.label) API key first."
+            }
+            return
+        }
+        guard !catalogLoading.contains(provider) else { return }
+        catalogLoading.insert(provider)
+        catalogErrors[provider] = nil
+        Task { @MainActor in
+            do {
+                try await CloudModelCatalog.refresh(provider)
+            } catch {
+                if !quiet { catalogErrors[provider] = error.localizedDescription }
+            }
+            catalogLoading.remove(provider)
+            cloudCatalogTick &+= 1
+        }
+    }
+
+    /// Launch-time refresh for every provider with a key. Skips catalogs
+    /// fetched within the last 12 hours; failures stay silent.
+    func autoRefreshCloudCatalogs() {
+        for provider in CloudProvider.allCases {
+            guard provider.apiKey != nil else { continue }
+            if let last = CloudModelCatalog.lastRefresh(provider),
+                Date().timeIntervalSince(last) < 12 * 3600
+            {
+                continue
+            }
+            refreshCloudCatalog(provider, quiet: true)
+        }
+    }
+
+    func addCustomCloudModel(_ provider: CloudProvider, id: String) {
+        CloudModelCatalog.addCustomModel(provider, id: id)
+        cloudCatalogTick &+= 1
+    }
+
+    func removeCustomCloudModel(_ provider: CloudProvider, id: String) {
+        CloudModelCatalog.removeCustomModel(provider, id: id)
+        cloudCatalogTick &+= 1
+    }
+
     var hasBraveSearchKey: Bool { SecretsStore.hasBraveSearchKey }
     func setBraveSearchKey(_ key: String?) {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)

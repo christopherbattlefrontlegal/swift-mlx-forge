@@ -85,13 +85,18 @@ struct AnthropicClient {
         return ["role": message.role, "content": blocks]
     }
 
-    /// Selectable Claude models. Default to Opus 4.8 (most capable GA model).
-    static let models: [(id: String, label: String)] = [
+    /// Curated fallback shown before the first live catalog fetch.
+    static let defaultModels: [(id: String, label: String)] = [
         ("claude-opus-4-8", "Claude Opus 4.8"),
         ("claude-fable-5", "Claude Fable 5"),
         ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
         ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
     ]
+
+    /// Live catalog when fetched, plus user-added ids (see CloudModelCatalog).
+    static var models: [(id: String, label: String)] {
+        CloudModelCatalog.chatModels(.anthropic)
+    }
 
     static func label(for id: String) -> String {
         models.first { $0.id == id }?.label ?? id

@@ -112,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockFlame.start()
         AppState.shared.beginMCP()
+        AppState.shared.autoRefreshCloudCatalogs()
     }
 
     func applicationShouldHandleReopen(
