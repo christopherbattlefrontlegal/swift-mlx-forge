@@ -147,6 +147,18 @@ enum WorkbenchTab: Hashable {
     case chat, graph, media
 }
 
+/// macOS 27 introduces a picker style meant for tab-based navigation (it also
+/// reads as "tabs" in VoiceOver); older systems keep the segmented look.
+private struct WorkbenchPickerStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 27, *) {
+            content.pickerStyle(.tabs)
+        } else {
+            content.pickerStyle(.segmented)
+        }
+    }
+}
+
 struct RootView: View {
     @Environment(AppState.self) private var app
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
@@ -228,7 +240,7 @@ struct RootView: View {
                     Label("Media", systemImage: "photo.on.rectangle.angled")
                         .tag(WorkbenchTab.media)
                 }
-                .pickerStyle(.segmented)
+                .modifier(WorkbenchPickerStyle())
                 .labelsHidden()
                 .frame(width: 225)
                 .help("Switch between Forge chat, Forge Graph, and the Media Studio")

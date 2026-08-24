@@ -118,7 +118,16 @@ enum CloudModelCatalog {
                 headers: ["x-api-key": key, "anthropic-version": "2023-06-01"]
             ).map { ($0.id, $0.displayName ?? $0.id) }
         }
-        let sorted = provider == .anthropic ? entries : entries.sorted { $0.0 > $1.0 }
+        // Anthropic already lists newest first. Others sort newest-looking first
+        // within the GPT family, then everything else (o-series and friends).
+        let sorted: [(String, String)]
+        if provider == .anthropic {
+            sorted = entries
+        } else {
+            let gpt = entries.filter { $0.0.hasPrefix("gpt-") }.sorted { $0.0 > $1.0 }
+            let rest = entries.filter { !$0.0.hasPrefix("gpt-") }.sorted { $0.0 > $1.0 }
+            sorted = gpt + rest
+        }
         persist(provider, entries: sorted)
     }
 

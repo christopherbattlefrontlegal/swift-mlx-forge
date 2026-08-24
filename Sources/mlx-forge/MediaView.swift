@@ -400,11 +400,26 @@ private enum AppleMusicRemote {
         return joined.split(separator: "|").map(String.init)
     }
 
+    /// Empty string means the equalizer is off; asking for the current preset
+    /// while EQ is disabled raises -1728, so guard on `EQ enabled` first.
     static func currentEQ() -> String {
-        run("tell application \"Music\" to return name of current EQ preset") ?? ""
+        run(
+            """
+            tell application "Music"
+                if EQ enabled then
+                    return name of current EQ preset
+                else
+                    return ""
+                end if
+            end tell
+            """) ?? ""
     }
 
     static func setEQ(_ name: String) {
+        guard !name.isEmpty else {
+            run("tell application \"Music\" to set EQ enabled to false")
+            return
+        }
         let escaped = name.replacingOccurrences(of: "\"", with: "\\\"")
         run(
             """
@@ -455,11 +470,11 @@ private struct MusicTransportBar: View {
 
                 if !eqPresets.isEmpty {
                     Picker("EQ", selection: $currentEQ) {
+                        Text("EQ off").tag("")
                         ForEach(eqPresets, id: \.self) { Text($0).tag($0) }
                     }
                     .frame(maxWidth: 170)
                     .onChange(of: currentEQ) { _, newValue in
-                        guard !newValue.isEmpty else { return }
                         AppleMusicRemote.setEQ(newValue)
                     }
                     .help("Less this, more that: the player's EQ presets")
