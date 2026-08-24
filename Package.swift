@@ -69,7 +69,10 @@ let package = Package(
         ),
         .testTarget(
             name: "mlx-forgeTests",
-            dependencies: ["mlx-forge"],
+            dependencies: [
+                "mlx-forge",
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
             path: "Tests/mlx-forgeTests"
         )
     ]

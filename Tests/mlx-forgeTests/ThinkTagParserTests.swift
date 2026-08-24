@@ -1,4 +1,5 @@
 import XCTest
+import MLXLMCommon
 
 @testable import mlx_forge
 
@@ -155,6 +156,140 @@ final class ThinkTagParserTests: XCTestCase {
         XCTAssertFalse(parser.isStructurallyValid)
     }
 
+    func testPreparedPromptTokenStateRoutesFirstGeneratedTokenToReasoning() {
+        let context = ReasoningStreamContext.fromPromptTokenSequence(
+            [100, 101, 10],
+            format: .think,
+            startTokenIDs: [10],
+            endTokenIDs: [11])
+        XCTAssertTrue(context.startsInReasoning)
+        XCTAssertEqual(context.format, .think)
+
+        var classifier = ReasoningStreamClassifier(context: context)
+        let first = classifier.ingest("private reasoning")
+        let second = classifier.ingest("</think>Final answer")
+        let tail = classifier.finalize()
+
+        XCTAssertEqual(first, [.reasoning("private reasoning")])
+        XCTAssertEqual(second, [.content("Final answer")])
+        XCTAssertEqual(tail, [])
+    }
+
+    func testPreparedEmptyThinkPrefillStartsInContent() {
+        let context = ReasoningStreamContext.fromPromptTokenSequence(
+            [100, 10, 11],
+            format: .think,
+            startTokenIDs: [10],
+            endTokenIDs: [11])
+
+        XCTAssertFalse(context.startsInReasoning)
+        XCTAssertEqual(context.format, .think)
+
+        var classifier = ReasoningStreamClassifier(context: context)
+        XCTAssertEqual(classifier.ingest("Final answer"), [.content("Final answer")])
+        XCTAssertEqual(classifier.finalize(), [])
+    }
+
+    func testLatestPreparedMarkerSequenceWinsAcrossHistory() {
+        let context = ReasoningStreamContext.fromPromptTokenSequence(
+            [10, 90, 11, 91, 10],
+            format: .longcatThink,
+            startTokenIDs: [10],
+            endTokenIDs: [11])
+
+        XCTAssertEqual(context.format, .longcatThink)
+        XCTAssertTrue(context.startsInReasoning)
+    }
+
+    func testPreparedPromptSupportsMultiTokenThoughtChannelMarkers() {
+        let context = ReasoningStreamContext.fromPromptTokenSequence(
+            [100, 20, 21],
+            format: .thoughtChannel,
+            startTokenIDs: [20, 21],
+            endTokenIDs: [22])
+
+        XCTAssertEqual(context.format, .thoughtChannel)
+        XCTAssertTrue(context.startsInReasoning)
+
+        var classifier = ReasoningStreamClassifier(context: context)
+        var deltas = classifier.ingest("private reasoning<channel|>Final answer")
+        deltas += classifier.finalize()
+        XCTAssertEqual(deltas, [.reasoning("private reasoning"), .content("Final answer")])
+    }
+
+    func testTokenizerInfersDocumentedSingleTokenThinkingMarkers() {
+        let tokenizer = ThinkingMarkerTestTokenizer(
+            vocabulary: [
+                "<think>": 10,
+                "</think>": 11,
+                "<longcat_think>": 12,
+                "</longcat_think>": 13,
+            ])
+
+        XCTAssertEqual(
+            tokenizer.thinkingMarkers,
+            ThinkingMarkers(
+                start: "<think>", end: "</think>",
+                startTokenIDs: [10], endTokenIDs: [11]))
+    }
+
+    func testTokenizerInfersDocumentedLongcatThinkingMarkers() {
+        let tokenizer = ThinkingMarkerTestTokenizer(
+            vocabulary: [
+                "<longcat_think>": 12,
+                "</longcat_think>": 13,
+            ])
+
+        XCTAssertEqual(
+            tokenizer.thinkingMarkers,
+            ThinkingMarkers(
+                start: "<longcat_think>", end: "</longcat_think>",
+                startTokenIDs: [12], endTokenIDs: [13]))
+    }
+
+    func testTokenizerInfersDocumentedMultiTokenThoughtChannel() {
+        let tokenizer = ThinkingMarkerTestTokenizer(
+            vocabulary: ["<|channel>": 20, "<channel|>": 22],
+            encodings: [
+                "<|channel>thought": [20, 21],
+                "<channel|>": [22],
+            ])
+
+        let markers = tokenizer.thinkingMarkers
+        XCTAssertEqual(
+            markers,
+            ThinkingMarkers(
+                start: "<|channel>thought", end: "<channel|>",
+                startTokenIDs: [20, 21], endTokenIDs: [22]))
+        XCTAssertTrue(markers?.startsInThinking(promptTokenIDs: [99, 22, 20, 21]) == true)
+        XCTAssertFalse(markers?.startsInThinking(promptTokenIDs: [99, 20, 21, 22]) == true)
+    }
+
+    func testPreopenedMarkerSplitCloseAtEveryBoundary() {
+        let closeTag = "</think>"
+        for index in 0...closeTag.count {
+            var classifier = ReasoningStreamClassifier(
+                context: ReasoningStreamContext(format: .think, startsInReasoning: true))
+            let split = closeTag.index(closeTag.startIndex, offsetBy: index)
+            var deltas = classifier.ingest("secret" + closeTag[..<split])
+            deltas += classifier.ingest(String(closeTag[split...]) + "answer")
+            deltas += classifier.finalize()
+
+            XCTAssertEqual(
+                deltas,
+                [.reasoning("secret"), .content("answer")],
+                "close-tag boundary \(index)")
+        }
+    }
+
+    func testClassifierReportsUnterminatedReasoning() {
+        var classifier = ReasoningStreamClassifier(
+            context: ReasoningStreamContext(format: .think, startsInReasoning: true))
+
+        XCTAssertEqual(classifier.ingest("unfinished"), [.reasoning("unfinished")])
+        XCTAssertEqual(classifier.finalize(), [.invalidReasoningStructure])
+    }
+
     func testParserNeverSurfacesControlTags() {
         var parser = ThinkTagParser()
         let first = parser.addContent("plain </think> with partial ")
@@ -178,5 +313,37 @@ final class ThinkTagParserTests: XCTestCase {
         let split = parser.addContent(text)
         let tail = parser.finalize()
         return (split.reasoning + tail.reasoning, split.content + tail.content)
+    }
+}
+
+private struct ThinkingMarkerTestTokenizer: Tokenizer {
+    let vocabulary: [String: Int]
+    let encodings: [String: [Int]]
+
+    init(vocabulary: [String: Int], encodings: [String: [Int]] = [:]) {
+        self.vocabulary = vocabulary
+        self.encodings = encodings
+    }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        encodings[text] ?? vocabulary[text].map { [$0] } ?? []
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { vocabulary[token] }
+    func convertIdToToken(_ id: Int) -> String? {
+        vocabulary.first(where: { $0.value == id })?.key
+    }
+
+    let bosToken: String? = nil
+    let eosToken: String? = nil
+    let unknownToken: String? = nil
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        []
     }
 }

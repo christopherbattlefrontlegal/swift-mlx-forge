@@ -583,7 +583,7 @@ final class InferenceEngine {
         settings: GenerationSettings,
         systemInstructions: String = "",
         targetModelID: String? = nil,
-        onChunk: @escaping @MainActor (String) -> Void,
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
     ) {
         let entry: Loaded?
@@ -743,7 +743,7 @@ final class InferenceEngine {
         prompt: String,
         settings: GenerationSettings,
         systemInstructions: String,
-        onChunk: @escaping @MainActor (String) -> Void,
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
     ) {
         let systemPrompt = systemInstructions
@@ -1033,6 +1033,15 @@ final class InferenceEngine {
     nonisolated static let thinkingBudgetForceCloseSuffix =
         "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 
+    nonisolated static func thinkingBudgetForceCloseSuffix(
+        for format: ReasoningTagFormat
+    ) -> String {
+        guard format != .think else { return thinkingBudgetForceCloseSuffix }
+        return
+            "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n"
+            + format.closeTag + "\n\n"
+    }
+
     static func thinkingBudgetGraceTokens(for target: Int) -> Int {
         max(1, Int((Double(target) * thinkingBudgetGraceFraction).rounded()))
     }
@@ -1064,12 +1073,18 @@ final class InferenceEngine {
         entry: Loaded,
         images: [Data],
         start: Date,
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws -> GenerateCompletionInfo? {
         var completionInfo: GenerateCompletionInfo?
-        // Templates that pre-open <think> inside the generation prompt stream reasoning
-        // with no opening tag — surface one so the UI can render a live reasoning block.
-        var emittedSyntheticThinkOpen = false
+        let promptCapture = RenderedPromptCapture()
+        session.onPromptPrepared = { prepared in
+            promptCapture.set(
+                RenderedPromptSnapshot(
+                    tokenIDs: prepared.tokenIDs,
+                    thinkingMarkers: prepared.thinkingMarkers))
+        }
+        defer { session.onPromptPrepared = nil }
+        var classifier: ReasoningStreamClassifier?
 
         let mlxImages = try Self.mlxImages(from: images)
         for try await item in session.streamDetails(
@@ -1081,23 +1096,24 @@ final class InferenceEngine {
                 if materializingModelID == entry.id {
                     materializingModelID = nil
                 }
-                if !emittedSyntheticThinkOpen {
-                    emittedSyntheticThinkOpen = true
-                    if entry.chatTemplateThinkingBuiltIn, !text.hasPrefix("<think>") {
-                        onChunk("<think>")
-                    }
-                }
                 liveTokenCount += 1
                 let elapsed = Date().timeIntervalSince(start)
                 if elapsed > 0.2 {
                     liveTokensPerSecond = Double(liveTokenCount) / elapsed
                 }
-                onChunk(text)
+                if classifier == nil {
+                    classifier = ReasoningStreamClassifier(
+                        context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                }
+                for delta in classifier!.ingest(text) { onChunk(delta) }
             case .info(let info):
                 completionInfo = info
             case .toolCall:
                 break
             }
+        }
+        if var classifier {
+            for delta in classifier.finalize() { onChunk(delta) }
         }
         return completionInfo
     }
@@ -1122,7 +1138,7 @@ final class InferenceEngine {
         budgetTarget: Int?,
         noThinkPrefill: Bool,
         start: Date,
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws -> GenerateCompletionInfo? {
         var turns: [BudgetTurn] = []
         let trimmedSystem = systemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1141,11 +1157,9 @@ final class InferenceEngine {
         })
         turns.append(BudgetTurn(role: "user", content: userPrompt, images: images))
 
-        let thinkingFromStart =
-            !noThinkPrefill
-            && (entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn)
         var completionInfo: GenerateCompletionInfo?
-        var emittedSyntheticThinkOpen = false
+        let promptCapture = RenderedPromptCapture()
+        var classifier: ReasoningStreamClassifier?
 
         let stream = Self.budgetedGenerationStream(
             container: entry.container!,
@@ -1155,7 +1169,7 @@ final class InferenceEngine {
                 effort: settings.localReasoningEffort),
             parameters: Self.parameters(from: settings),
             hardLimit: budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) },
-            thinkingFromStart: thinkingFromStart,
+            promptCapture: promptCapture,
             prefillText: noThinkPrefill ? Self.noThinkPrefillText : nil)
 
         for try await item in stream {
@@ -1165,26 +1179,24 @@ final class InferenceEngine {
                 if materializingModelID == entry.id {
                     materializingModelID = nil
                 }
-                if !emittedSyntheticThinkOpen {
-                    emittedSyntheticThinkOpen = true
-                    // thinkingFromStart = the template pre-opened <think>, so the
-                    // raw stream begins mid-reasoning with no opening tag — surface
-                    // one so ThinkTagParser routes the tokens into the reasoning channel.
-                    if thinkingFromStart, !text.hasPrefix("<think>") {
-                        onChunk("<think>")
-                    }
-                }
                 liveTokenCount += 1
                 let elapsed = Date().timeIntervalSince(start)
                 if elapsed > 0.2 {
                     liveTokensPerSecond = Double(liveTokenCount) / elapsed
                 }
-                onChunk(text)
+                if classifier == nil {
+                    classifier = ReasoningStreamClassifier(
+                        context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                }
+                for delta in classifier!.ingest(text) { onChunk(delta) }
             case .info(let info):
                 completionInfo = info
             case .toolCall:
                 break
             }
+        }
+        if var classifier {
+            for delta in classifier.finalize() { onChunk(delta) }
         }
         return completionInfo
     }
@@ -1200,13 +1212,13 @@ final class InferenceEngine {
         additionalContext: [String: any Sendable]?,
         parameters: GenerateParameters,
         hardLimit: Int?,
-        thinkingFromStart: Bool,
+        promptCapture: RenderedPromptCapture,
         prefillText: String? = nil
     ) -> AsyncThrowingStream<Generation, Error> {
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
         let task = Task {
             [container, turns, additionalContext, parameters, hardLimit,
-                thinkingFromStart, prefillText, continuation] in
+                promptCapture, prefillText, continuation] in
             do {
                 try await container.perform { context in
                     let messages: [Chat.Message] = try turns.map { turn in
@@ -1231,6 +1243,13 @@ final class InferenceEngine {
                             promptTokens, MLXArray(prefillIDs.map { Int32($0) }),
                         ])
                     }
+
+                    let promptTokenIDs = promptTokens.asArray(Int.self)
+                    let promptSnapshot = RenderedPromptSnapshot(
+                        tokenIDs: promptTokenIDs,
+                        thinkingMarkers: context.tokenizer.thinkingMarkers)
+                    promptCapture.set(promptSnapshot)
+                    let reasoningContext = promptSnapshot.reasoningContext
 
                     // Phase 1 — decode until </think> closes naturally or the cap hits.
                     let phase1: AsyncStream<Generation>
@@ -1267,11 +1286,14 @@ final class InferenceEngine {
                         switch item {
                         case .chunk(let text):
                             generated += text
-                            if !thinkingClosed, generated.contains("</think>") {
+                            if !thinkingClosed,
+                                generated.contains(reasoningContext.format.closeTag)
+                            {
                                 thinkingClosed = true
                             }
                             if let hardLimit, !thinkingClosed,
-                                thinkingFromStart || generated.contains("<think>")
+                                reasoningContext.startsInReasoning
+                                    || generated.contains(reasoningContext.format.openTag)
                             {
                                 // Chunks from the naive detokenizer are one token each.
                                 thinkingTokens += 1
@@ -1296,7 +1318,8 @@ final class InferenceEngine {
                     }
 
                     // Phase 2 — canonical early-stop injection, then continue the answer.
-                    let injection = thinkingBudgetForceCloseSuffix
+                    let injection = thinkingBudgetForceCloseSuffix(
+                        for: reasoningContext.format)
                     continuation.yield(.chunk(injection))
                     let continuationIDs = context.tokenizer.encode(
                         text: generated + injection, addSpecialTokens: false)

@@ -555,9 +555,7 @@ final class AppState {
     private(set) var streamingMessageIDs: Set<UUID> = []
     /// Live token buffer shown in the transcript without rewriting `conversations` each flush.
     private(set) var streamingTextByMessageID: [UUID: String] = [:]
-    /// Live reasoning (inside <think>) split out by ``ThinkTagParser`` so a
-    /// reasoning block renders the instant the first thinking token lands,
-    /// instead of waiting for the closing </think> before anything classifies.
+    /// Live reasoning delivered on the typed inference channel.
     private(set) var streamingReasoningByMessageID: [UUID: String] = [:]
 
     func isMessageStreaming(_ messageID: UUID) -> Bool {
@@ -567,7 +565,7 @@ final class AppState {
     private var saveTask: Task<Void, Never>?
     private var streamBuffers: [UUID: String] = [:]
     private var streamReasoningBuffers: [UUID: String] = [:]
-    private var streamReasoningParsers: [UUID: ThinkTagParser] = [:]
+    private var invalidReasoningStreamMessageIDs: Set<UUID> = []
     private var streamBufferConversationIDs: [UUID: UUID] = [:]
     private var streamFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var activeMCPCallCount = 0
@@ -1725,7 +1723,7 @@ final class AppState {
                     runControl: runControl)
                 guard self.cancellationGeneration == generation else { return }
                 self.enqueueStreamDelta(
-                    output, conversationID: conversationID, messageID: messageID)
+                    .content(output), conversationID: conversationID, messageID: messageID)
             } catch is CancellationError {
                 // User pressed stop — the child process has already been terminated.
             } catch {
@@ -1785,7 +1783,7 @@ final class AppState {
                     query: prompt,
                     onChunk: { delta in
                         if buffersResearchDrafts {
-                            researchText += delta
+                            if case .content(let text) = delta { researchText += text }
                         } else {
                             self?.enqueueStreamDelta(
                                 delta, conversationID: conversationID, messageID: messageID)
@@ -1800,7 +1798,7 @@ final class AppState {
                     let answer = BraveAnswersClient.cleanedResearchAnswer(researchText)
                     guard !answer.isEmpty else { throw BraveAnswersError.emptyAnswer }
                     self?.enqueueStreamDelta(
-                        answer, conversationID: conversationID, messageID: messageID)
+                        .content(answer), conversationID: conversationID, messageID: messageID)
                 }
             } catch is CancellationError {
                 // User pressed stop — leave whatever streamed in place.
@@ -2159,7 +2157,7 @@ final class AppState {
         streamingMessageID = messageID
         streamingTextByMessageID[messageID] = ""
         streamingReasoningByMessageID[messageID] = ""
-        streamReasoningParsers[messageID] = ThinkTagParser()
+        invalidReasoningStreamMessageIDs.remove(messageID)
     }
 
     private func endStreaming(messageID: UUID) {
@@ -2169,7 +2167,7 @@ final class AppState {
         }
         streamingTextByMessageID.removeValue(forKey: messageID)
         streamingReasoningByMessageID.removeValue(forKey: messageID)
-        streamReasoningParsers.removeValue(forKey: messageID)
+        invalidReasoningStreamMessageIDs.remove(messageID)
         if smartPromptSelectionActive {
             applySmartSelectedPromptIfPresent(messageID: messageID)
         }
@@ -2202,7 +2200,9 @@ final class AppState {
                         system: system,
                         messages: [.init(role: "user", text: draft)],
                         config: AnthropicStreamConfig(reasoningEnabled: false, maxTokens: 4096)
-                    ) { enhanced += $0 }
+                    ) { delta in
+                        if case .content(let text) = delta { enhanced += text }
+                    }
                 } else if let key = SecretsStore.openRouterAPIKey, !key.isEmpty {
                     enhanced = try await OpenRouterClient(apiKey: key).complete(
                         model: openRouterModelIDs.first ?? OpenRouterClient.defaultModelID,
@@ -2600,7 +2600,7 @@ final class AppState {
         streamingTextByMessageID.removeAll()
         streamingReasoningByMessageID.removeAll()
         streamReasoningBuffers.removeAll()
-        streamReasoningParsers.removeAll()
+        invalidReasoningStreamMessageIDs.removeAll()
         scheduleSave()
     }
 
@@ -2616,22 +2616,26 @@ final class AppState {
     }
 
     private func enqueueStreamDelta(
-        _ delta: String, conversationID: UUID, messageID: UUID
+        _ delta: InferenceStreamDelta, conversationID: UUID, messageID: UUID
     ) {
-        guard !delta.isEmpty, streamingMessageIDs.contains(messageID) else { return }
+        guard streamingMessageIDs.contains(messageID) else { return }
         streamBufferConversationIDs[messageID] = conversationID
-        // Split each delta through the incremental parser so reasoning lands in
-        // its own live channel — rendering a reasoning block the moment the
-        // first thinking token arrives, not after </think> closes.
-        var parser = streamReasoningParsers[messageID] ?? ThinkTagParser()
-        let split = parser.addContent(delta)
-        streamReasoningParsers[messageID] = parser
-        if !split.reasoning.isEmpty {
-            streamReasoningBuffers[messageID, default: ""] += split.reasoning
+
+        var appendedText = false
+        switch delta {
+        case .reasoning(let text):
+            guard !text.isEmpty else { return }
+            streamReasoningBuffers[messageID, default: ""] += text
+            appendedText = true
+        case .content(let text):
+            guard !text.isEmpty else { return }
+            streamBuffers[messageID, default: ""] += text
+            appendedText = true
+        case .invalidReasoningStructure:
+            invalidReasoningStreamMessageIDs.insert(messageID)
         }
-        if !split.content.isEmpty {
-            streamBuffers[messageID, default: ""] += split.content
-        }
+
+        guard appendedText else { return }
         guard streamFlushTasks[messageID] == nil else { return }
         streamFlushTasks[messageID] = Task { [weak self] in
             // Batch UI updates — rewriting conversations every flush blocked scroll input.
@@ -2658,17 +2662,8 @@ final class AppState {
     private func finishStreamBuffer(_ messageID: UUID) {
         streamFlushTasks[messageID]?.cancel()
         streamFlushTasks[messageID] = nil
-        var parserStructurallyValid = true
-        if var parser = streamReasoningParsers.removeValue(forKey: messageID) {
-            let tail = parser.finalize()
-            parserStructurallyValid = parser.isStructurallyValid
-            if !tail.reasoning.isEmpty {
-                streamReasoningBuffers[messageID, default: ""] += tail.reasoning
-            }
-            if !tail.content.isEmpty {
-                streamBuffers[messageID, default: ""] += tail.content
-            }
-        }
+        let reasoningStructureValid =
+            invalidReasoningStreamMessageIDs.remove(messageID) == nil
         if let reasoning = streamReasoningBuffers.removeValue(forKey: messageID),
             !reasoning.isEmpty
         {
@@ -2685,10 +2680,10 @@ final class AppState {
         let reasoning = streamingReasoningByMessageID[messageID] ?? ""
         let content = streamingTextByMessageID[messageID] ?? ""
         appendToMessage(conversationID: conversationID, messageID: messageID) {
-            // Persist reasoning and visible content separately so malformed tags
-            // remain inspectable without polluting replay history.
+            // Persist reasoning and visible content separately; only content is
+            // replayed into later model turns.
             $0.reasoning = reasoning
-            $0.reasoningStructureValid = parserStructurallyValid
+            $0.reasoningStructureValid = reasoningStructureValid
             $0.content = content
         }
         streamBufferConversationIDs[messageID] = nil

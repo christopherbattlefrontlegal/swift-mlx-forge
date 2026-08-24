@@ -220,7 +220,7 @@ struct OpenRouterClient {
         config: OpenRouterStreamConfig = OpenRouterStreamConfig(),
         sessionID: String? = nil,
         tools: [MCPToolBinding] = [],
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws {
         guard !apiKey.isEmpty else { throw OpenRouterError.noKey }
 
@@ -313,25 +313,22 @@ struct OpenRouterClient {
                     toolCalls[index] = entry
                 }
             }
-            if let chunk = assembler.ingest(delta: delta) {
+            for chunk in assembler.ingest(delta: delta) {
                 await onChunk(chunk)
             }
-        }
-        if let tail = assembler.finish() {
-            await onChunk(tail)
         }
         // Bridge the first native tool call into the FORGE_MCP_CALL sentinel the
         // existing MCP round-trip machinery parses out of the message text.
         if let call = toolCalls.sorted(by: { $0.key < $1.key }).first?.value,
             let binding = tools.first(where: { $0.nativeToolName == call.name }) {
             let arguments = call.json.isEmpty ? "{}" : call.json
-            await onChunk(
+            await onChunk(.content(
                 "\nFORGE_MCP_CALL {\"server\":\"\(binding.serverID)\",\"tool\":\"\(binding.tool.name)\",\"arguments\":\(arguments)}"
-            )
+            ))
         } else if finishReason == "length" {
-            await onChunk(
+            await onChunk(.content(
                 "\n\n⚠️ Output hit the max-token limit (\(config.maxTokens)) — raise Max Tokens in Tuning so reasoning can finish."
-            )
+            ))
         }
     }
 
@@ -377,13 +374,10 @@ struct OpenRouterClient {
     }
 }
 
-/// Wraps OpenRouter reasoning fields into <think> markers so the chat UI
-/// renders them as a live-streaming collapsible Reasoning block.
+/// Maps OpenRouter reasoning fields into the typed Forge stream contract.
 private struct OpenRouterReasoningStreamAssembler {
-    private var thinkingOpen = false
-    private var thinkingClosed = false
-
-    mutating func ingest(delta: [String: Any]) -> String? {
+    mutating func ingest(delta: [String: Any]) -> [InferenceStreamDelta] {
+        var result: [InferenceStreamDelta] = []
         if let details = delta["reasoning_details"] as? [[String: Any]] {
             for detail in details {
                 let kind = detail["type"] as? String ?? ""
@@ -392,36 +386,18 @@ private struct OpenRouterReasoningStreamAssembler {
                     ?? (detail["summary"] as? String)
                     ?? ""
                 if !text.isEmpty, kind.hasPrefix("reasoning") {
-                    return appendThinking(text)
+                    result.append(.reasoning(text))
                 }
             }
         }
-        if let reasoning = delta["reasoning"] as? String, !reasoning.isEmpty {
-            return appendThinking(reasoning)
+        if result.isEmpty,
+            let reasoning = delta["reasoning"] as? String, !reasoning.isEmpty
+        {
+            result.append(.reasoning(reasoning))
         }
         if let content = delta["content"] as? String, !content.isEmpty {
-            var out = closeThinkingIfNeeded() ?? ""
-            out += content
-            return out.isEmpty ? nil : out
+            result.append(.content(content))
         }
-        return nil
-    }
-
-    private mutating func appendThinking(_ text: String) -> String {
-        if !thinkingOpen {
-            thinkingOpen = true
-            return "<think>\n" + text
-        }
-        return text
-    }
-
-    private mutating func closeThinkingIfNeeded() -> String? {
-        guard thinkingOpen, !thinkingClosed else { return nil }
-        thinkingClosed = true
-        return "\n</think>\n\n"
-    }
-
-    mutating func finish() -> String? {
-        closeThinkingIfNeeded()
+        return result
     }
 }

@@ -584,22 +584,38 @@ final class ForgeServer {
         _ = try? await gate.withTurnDetached { [sessionBox, messagesBox] in
             let session = sessionBox.value
             let messages = messagesBox.value
+            let promptCapture = RenderedPromptCapture()
+            session.onPromptPrepared = { prepared in
+                promptCapture.set(
+                    RenderedPromptSnapshot(
+                        tokenIDs: prepared.tokenIDs,
+                        thinkingMarkers: prepared.thinkingMarkers))
+            }
+            defer { session.onPromptPrepared = nil }
             do {
                 var finishReason = "stop"
                 var toolIndex = 0
+                var classifier: ReasoningStreamClassifier?
                 for try await item in session.streamDetails(
                     to: messages.filter { $0.role != .system })
                 {
                     if Task.isCancelled { break }
                     switch item {
                     case .chunk(let chunk):
-                        let delivered = await HTTPResponse.sendRaw(
-                            on: connection,
-                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: ["content": chunk], finish: nil))\n\n")
-                        // Client hung up — stop generating instead of burning GPU to
-                        // completion into a dead socket (ending iteration cancels the
-                        // underlying generation).
-                        guard delivered else { return }
+                        if classifier == nil {
+                            classifier = ReasoningStreamClassifier(
+                                context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                        }
+                        for delta in classifier!.ingest(chunk) {
+                            guard let payload = Self.apiPayload(for: delta) else { continue }
+                            let delivered = await HTTPResponse.sendRaw(
+                                on: connection,
+                                "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: payload, finish: nil))\n\n")
+                            // Client hung up — stop generating instead of burning GPU to
+                            // completion into a dead socket (ending iteration cancels the
+                            // underlying generation).
+                            guard delivered else { return }
+                        }
                     case .info(let info):
                         // Report length-truncation honestly so clients can retry/extend.
                         if info.stopReason == .length { finishReason = "length" }
@@ -620,6 +636,15 @@ final class ForgeServer {
                         let delivered = await HTTPResponse.sendRaw(
                             on: connection,
                             "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: delta, finish: nil))\n\n")
+                        guard delivered else { return }
+                    }
+                }
+                if var classifier {
+                    for delta in classifier.finalize() {
+                        guard let payload = Self.apiPayload(for: delta) else { continue }
+                        let delivered = await HTTPResponse.sendRaw(
+                            on: connection,
+                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: payload, finish: nil))\n\n")
                         guard delivered else { return }
                     }
                 }
@@ -657,6 +682,16 @@ final class ForgeServer {
         return String(decoding: data, as: UTF8.self)
     }
 
+    nonisolated private static func apiPayload(
+        for delta: InferenceStreamDelta
+    ) -> [String: Any]? {
+        switch delta {
+        case .reasoning(let text): return ["reasoning": text]
+        case .content(let text): return ["content": text]
+        case .invalidReasoningStructure: return nil
+        }
+    }
+
     nonisolated private static func toolArgumentsJSON(_ call: ToolCall) -> String {
         let object = call.function.arguments.mapValues(\.anyValue)
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return "{}" }
@@ -678,26 +713,58 @@ final class ForgeServer {
             // turn serving an API request doesn't freeze the app UI.
             let sessionBox = SendableBox(value: session)
             let messagesBox = SendableBox(value: messages)
-            let (output, info, toolCalls) = try await gate.withTurnDetached { [sessionBox, messagesBox] in
+            let (output, reasoning, info, toolCalls) = try await gate.withTurnDetached {
+                [sessionBox, messagesBox] in
                 let session = sessionBox.value
                 let messages = messagesBox.value
+                let promptCapture = RenderedPromptCapture()
+                session.onPromptPrepared = { prepared in
+                    promptCapture.set(
+                        RenderedPromptSnapshot(
+                            tokenIDs: prepared.tokenIDs,
+                            thinkingMarkers: prepared.thinkingMarkers))
+                }
+                defer { session.onPromptPrepared = nil }
                 var output = ""
+                var reasoning = ""
                 var info: GenerateCompletionInfo?
                 var toolCalls: [ToolCall] = []
+                var classifier: ReasoningStreamClassifier?
                 for try await item in session.streamDetails(
                     to: messages.filter { $0.role != .system }
                 ) {
                     switch item {
-                    case .chunk(let text): output += text
+                    case .chunk(let text):
+                        if classifier == nil {
+                            classifier = ReasoningStreamClassifier(
+                                context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                        }
+                        for delta in classifier!.ingest(text) {
+                            switch delta {
+                            case .reasoning(let text): reasoning += text
+                            case .content(let text): output += text
+                            case .invalidReasoningStructure: break
+                            }
+                        }
                     case .info(let i): info = i
                     case .toolCall(let call): toolCalls.append(call)
                     }
                 }
-                return (output, info, toolCalls)
+                if var classifier {
+                    for delta in classifier.finalize() {
+                        switch delta {
+                        case .reasoning(let text): reasoning += text
+                        case .content(let text): output += text
+                        case .invalidReasoningStructure: break
+                        }
+                    }
+                }
+                return (output, reasoning, info, toolCalls)
             }
             let finishReason = !toolCalls.isEmpty
                 ? "tool_calls" : (info?.stopReason == .length ? "length" : "stop")
             var responseMessage: [String: Any] = ["role": "assistant", "content": output]
+            if !reasoning.isEmpty { responseMessage["reasoning"] = reasoning }
             if !toolCalls.isEmpty {
                 responseMessage["tool_calls"] = toolCalls.enumerated().map { index, call in
                     [
@@ -795,9 +862,10 @@ final class ForgeServer {
                     system: systemText.isEmpty ? nil : systemText,
                     history: history)
                 _ = await gguf.respond(to: prompt, maxOutputTokens: maxOutputTokens) { delta in
+                    guard let payload = Self.apiPayload(for: delta) else { return }
                     let delivered = await HTTPResponse.sendRaw(
                         on: connection,
-                        "data: \(chunkJSON(delta: ["content": delta], finish: nil))\n\n")
+                        "data: \(chunkJSON(delta: payload, finish: nil))\n\n")
                     // Client hung up — stop llama.cpp instead of generating into a dead socket.
                     if !delivered { gguf.stop() }
                 }

@@ -125,15 +125,14 @@ struct AnthropicClient {
 
     var apiKey: String
 
-    /// Streams a chat completion. Thinking deltas are wrapped in <think> tags
-    /// so the chat UI streams them into the collapsible Reasoning block.
+    /// Streams a chat completion with provider-native reasoning and content channels.
     func stream(
         model: String,
         system: String?,
         messages: [Message],
         config: AnthropicStreamConfig = AnthropicStreamConfig(),
         tools: [MCPToolBinding] = [],
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws {
         guard !apiKey.isEmpty else { throw AnthropicError.noKey }
 
@@ -191,7 +190,6 @@ struct AnthropicClient {
             throw AnthropicError.http(status, Self.extractError(from: data) ?? "request failed")
         }
 
-        var assembler = ReasoningStreamAssembler()
         // Native tool_use accumulation: index → (nativeName, partial JSON input).
         var toolCalls: [Int: (name: String, json: String)] = [:]
         var stopReason: String?
@@ -227,10 +225,7 @@ struct AnthropicClient {
             switch type {
             case "content_block_start":
                 if let block = obj["content_block"] as? [String: Any] {
-                    if block["type"] as? String == "thinking",
-                        let chunk = assembler.openThinking() {
-                        await onChunk(chunk)
-                    } else if block["type"] as? String == "tool_use",
+                    if block["type"] as? String == "tool_use",
                         let name = block["name"] as? String,
                         let index = obj["index"] as? Int {
                         toolCalls[index] = (name: name, json: "")
@@ -240,15 +235,11 @@ struct AnthropicClient {
                 if let delta = obj["delta"] as? [String: Any],
                     let deltaType = delta["type"] as? String {
                     if deltaType == "thinking_delta",
-                        let text = delta["thinking"] as? String, !text.isEmpty,
-                        let chunk = assembler.appendThinking(text) {
-                        await onChunk(chunk)
+                        let text = delta["thinking"] as? String, !text.isEmpty {
+                        await onChunk(.reasoning(text))
                     } else if deltaType == "text_delta",
                         let text = delta["text"] as? String, !text.isEmpty {
-                        if let prefix = assembler.closeThinkingIfNeeded() {
-                            await onChunk(prefix)
-                        }
-                        await onChunk(text)
+                        await onChunk(.content(text))
                     } else if deltaType == "input_json_delta",
                         let fragment = delta["partial_json"] as? String,
                         let index = obj["index"] as? Int,
@@ -267,22 +258,16 @@ struct AnthropicClient {
                     (obj["error"] as? [String: Any])?["message"] as? String ?? "stream error"
                 throw AnthropicError.stream(message)
             case "message_stop":
-                if let tail = assembler.finish() {
-                    await onChunk(tail)
-                }
                 if let tail = sentinelTail() {
-                    await onChunk(tail)
+                    await onChunk(.content(tail))
                 }
                 return
             default:
                 break
             }
         }
-        if let tail = assembler.finish() {
-            await onChunk(tail)
-        }
         if let tail = sentinelTail() {
-            await onChunk(tail)
+            await onChunk(.content(tail))
         }
     }
 
@@ -299,36 +284,5 @@ struct AnthropicClient {
             }
         }
         return nil
-    }
-}
-
-/// Wraps Anthropic thinking/text SSE blocks into <think> markers so the chat
-/// UI renders them as a live-streaming collapsible Reasoning block.
-private struct ReasoningStreamAssembler {
-    private var thinkingOpen = false
-    private var thinkingClosed = false
-
-    mutating func openThinking() -> String? {
-        guard !thinkingOpen else { return nil }
-        thinkingOpen = true
-        return "<think>\n"
-    }
-
-    mutating func appendThinking(_ text: String) -> String? {
-        if !thinkingOpen {
-            thinkingOpen = true
-            return "<think>\n" + text
-        }
-        return text
-    }
-
-    mutating func closeThinkingIfNeeded() -> String? {
-        guard thinkingOpen, !thinkingClosed else { return nil }
-        thinkingClosed = true
-        return "\n</think>\n\n"
-    }
-
-    mutating func finish() -> String? {
-        closeThinkingIfNeeded()
     }
 }

@@ -144,6 +144,26 @@ public struct SpeculativeDecodingConfig: Sendable {
 ///   model operations.
 public final class ChatSession {
 
+    /// The prompt token sequence exactly as prepared for generation, together
+    /// with the thinking markers inferred from that tokenizer's vocabulary.
+    public struct PreparedPrompt: Sendable {
+        public let tokenIDs: [Int]
+        public let thinkingMarkers: ThinkingMarkers?
+
+        public init(tokenIDs: [Int], thinkingMarkers: ThinkingMarkers?) {
+            self.tokenIDs = tokenIDs
+            self.thinkingMarkers = thinkingMarkers
+        }
+
+        public var tokenCount: Int {
+            tokenIDs.count
+        }
+
+        public var startsInThinking: Bool {
+            thinkingMarkers?.startsInThinking(promptTokenIDs: tokenIDs) ?? false
+        }
+    }
+
     enum Cache {
         case empty
         case kvcache([KVCache], draftKVCache: [KVCache]?)
@@ -159,6 +179,7 @@ public final class ChatSession {
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
+    public var onPromptPrepared: (@Sendable (PreparedPrompt) -> Void)?
 
     /// Speculative decoding configuration, nil if disabled.
     public let speculativeDecoding: SpeculativeDecodingConfig?
@@ -578,7 +599,8 @@ public final class ChatSession {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, loadedDraftModel, generateParameters, speculativeDecoding
+                additionalContext, cache, loadedDraftModel, generateParameters, speculativeDecoding,
+                onPromptPrepared
             ] in
             do {
                 try await cache.update { cache in
@@ -638,6 +660,13 @@ public final class ChatSession {
                             processing: processing,
                             tools: tools, additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
+                        if let onPromptPrepared {
+                            let tokenIDs = input.text.tokens.asArray(Int.self)
+                            onPromptPrepared(
+                                PreparedPrompt(
+                                    tokenIDs: tokenIDs,
+                                    thinkingMarkers: tokenizer.thinkingMarkers))
+                        }
                         messages.removeAll()
 
                         // Select the token iterator based on speculative decoding configuration.

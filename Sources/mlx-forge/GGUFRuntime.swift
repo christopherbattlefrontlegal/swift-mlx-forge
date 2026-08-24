@@ -82,39 +82,45 @@ final class GGUFRuntime: @unchecked Sendable {
     /// Streams a reply, calling `onDelta` per chunk; returns the full text.
     /// Cancel by calling `stop()` (or cancelling the surrounding Task).
     ///
-    /// `thinkingEnabled: true` streams reasoning inline (raw `<think>` text the chat UI
-    /// renders as a live reasoning block); `false` uses llama.cpp's suppressed mode,
-    /// which injects an empty thinking block so the model skips reasoning entirely.
+    /// Reasoning and answer text leave LLM.swift on distinct native channels.
+    /// Suppressed mode injects an empty reasoning block before generation.
     func respond(
         to prompt: String, thinkingEnabled: Bool = true,
         maxOutputTokens: Int? = nil,
-        onDelta: @escaping @Sendable (String) async -> Void
+        onDelta: @escaping @Sendable (InferenceStreamDelta) async -> Void
     ) async -> String {
-        let capture = GGUFResponseCapture()
-        await llm.respond(to: prompt, thinking: thinkingEnabled ? .none : .suppressed) {
-            stream in
-            var text = ""
-            var generatedChunks = 0
-            if maxOutputTokens == 0 {
+        let capture = GGUFResponseCapture(maxChunks: maxOutputTokens)
+        let (stream, continuation) = AsyncStream<InferenceStreamDelta>.makeStream()
+        let delivery = Task {
+            for await delta in stream {
+                await onDelta(delta)
+            }
+        }
+
+        @Sendable func receive(_ value: String?, as kind: GGUFResponseCapture.Kind) {
+            guard let value, !value.isEmpty else { return }
+            let decision = capture.record(value, as: kind)
+            if decision.shouldDeliver {
+                continuation.yield(
+                    kind == .reasoning ? .reasoning(value) : .content(value))
+            }
+            if decision.shouldStop || Task.isCancelled {
                 self.llm.stop()
             }
-            for await delta in stream {
-                if Task.isCancelled || maxOutputTokens == 0 { break }
-                text += delta
-                generatedChunks += 1
-                await onDelta(delta)
-                if let maxOutputTokens, generatedChunks >= maxOutputTokens {
-                    self.llm.stop()
-                    break
-                }
-            }
-            capture.set(text)
-            return text
         }
-        // LLM.swift's callback-based `respond` overload does not update its
-        // published `output` property. Return the text collected by this exact
-        // invocation instead of a stale/empty property value.
-        return capture.get()
+
+        llm.updateThinking = { receive($0, as: .reasoning) }
+        llm.update = { receive($0, as: .content) }
+
+        await llm.respond(
+            to: prompt,
+            thinking: thinkingEnabled ? .enabled : .suppressed)
+
+        llm.updateThinking = { _ in }
+        llm.update = { _ in }
+        continuation.finish()
+        await delivery.value
+        return capture.content()
     }
 
     func stop() {
@@ -123,16 +129,49 @@ final class GGUFRuntime: @unchecked Sendable {
 }
 
 private final class GGUFResponseCapture: @unchecked Sendable {
-    private let lock = NSLock()
-    private var text = ""
-
-    func set(_ value: String) {
-        lock.lock()
-        text = value
-        lock.unlock()
+    enum Kind: Sendable {
+        case reasoning, content
     }
 
-    func get() -> String {
+    struct Decision: Sendable {
+        let shouldDeliver: Bool
+        let shouldStop: Bool
+    }
+
+    private let lock = NSLock()
+    private let maxChunks: Int?
+    private var text = ""
+    private var chunkCount = 0
+    private var stopped = false
+
+    init(maxChunks: Int?) {
+        self.maxChunks = maxChunks
+    }
+
+    func record(_ value: String, as kind: Kind) -> Decision {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !stopped else {
+            return Decision(shouldDeliver: false, shouldStop: false)
+        }
+        guard maxChunks != 0 else {
+            stopped = true
+            return Decision(shouldDeliver: false, shouldStop: true)
+        }
+
+        chunkCount += 1
+        if kind == .content {
+            text += value
+        }
+        let reachedLimit = maxChunks.map { chunkCount >= $0 } ?? false
+        if reachedLimit {
+            stopped = true
+        }
+        return Decision(shouldDeliver: true, shouldStop: reachedLimit)
+    }
+
+    func content() -> String {
         lock.lock()
         defer { lock.unlock() }
         return text

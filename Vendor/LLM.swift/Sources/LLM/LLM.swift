@@ -1196,53 +1196,53 @@ open class LLM: ObservableObject {
         didSet {
             guard let template else {
                 preprocess = { input, _, _ in return input }
-                Task {
-                    await core.setStopSequence(nil)
-                    await core.setThinkingTokens(start: nil, end: nil, startMarker: nil, endMarker: nil)
+                configure {
+                    await self.core.setStopSequence(nil)
+                    await self.core.setThinkingTokens(start: nil, end: nil, startMarker: nil, endMarker: nil)
                 }
                 return
             }
             preprocess = template.preprocess
-            Task {
-                await core.setStopSequence(template.stopSequence)
-                await setupThinkingTokens(from: template)
+            configure {
+                await self.core.setStopSequence(template.stopSequence)
+                await self.setupThinkingTokens(from: template)
             }
         }
     }
     
     public var seed: UInt32 {
         didSet {
-            Task { await core.setParameters(seed: seed) }
+            configure { await self.core.setParameters(seed: self.seed) }
         }
     }
     
     public var topK: Int32 {
         didSet {
-            Task { await core.setParameters(topK: topK) }
+            configure { await self.core.setParameters(topK: self.topK) }
         }
     }
     
     public var topP: Float {
         didSet {
-            Task { await core.setParameters(topP: topP) }
+            configure { await self.core.setParameters(topP: self.topP) }
         }
     }
     
     public var temp: Float {
         didSet {
-            Task { await core.setParameters(temp: temp) }
+            configure { await self.core.setParameters(temp: self.temp) }
         }
     }
 
     public var repeatPenalty: Float {
         didSet {
-            Task { await core.setParameters(repeatPenalty: repeatPenalty) }
+            configure { await self.core.setParameters(repeatPenalty: self.repeatPenalty) }
         }
     }
     
     public var repetitionLookback: Int32 {
         didSet {
-            Task { await core.setParameters(repetitionLookback: repetitionLookback) }
+            configure { await self.core.setParameters(repetitionLookback: self.repetitionLookback) }
         }
     }
     
@@ -1252,6 +1252,15 @@ open class LLM: ObservableObject {
     public let core: LLMCore
     
     private var isAvailable = true
+    private var configuration: Task<Void, Never>? = nil
+
+    private func configure(_ apply: @Sendable @escaping () async -> Void) {
+        let previous = configuration
+        configuration = Task {
+            await previous?.value
+            await apply()
+        }
+    }
     private var input: String = ""
     
     static var isLogSilenced = false
@@ -1347,8 +1356,8 @@ open class LLM: ObservableObject {
             )
             
             if let stopSequence {
-                Task {
-                    await core.setStopSequence(stopSequence)
+                configure {
+                    await self.core.setStopSequence(stopSequence)
                 }
             }
         } catch {
@@ -1457,7 +1466,7 @@ open class LLM: ObservableObject {
         let (endTokens, endMarker) = await convertToTokensAndMarker(template.thinkingEnd)
         await core.setThinkingTokens(start: startTokens, end: endTokens, startMarker: startMarker, endMarker: endMarker)
     }
-    
+
     private func convertToTokensAndMarker(_ sequence: TokenSequence?) async -> ([Token]?, String?) {
         guard let sequence else { return (nil, nil) }
         switch sequence {
@@ -1482,7 +1491,7 @@ open class LLM: ObservableObject {
     
     public func reset() {
         history.removeAll()
-        Task { await core.resetContext() }
+        configure { await self.core.resetContext() }
     }
     
     open func recoverFromLengthy(_ input: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
@@ -1494,6 +1503,7 @@ open class LLM: ObservableObject {
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         let response = await core.generateResponseStream(from: input)
         var output = ""
@@ -1510,6 +1520,7 @@ open class LLM: ObservableObject {
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         self.input = input
         let processedInput = preprocess(input, history, thinking)
@@ -1525,12 +1536,13 @@ open class LLM: ObservableObject {
         
         postprocess(output)
     }
-    
+
     open func respond(to input: String, thinking: ThinkingMode = .none) async {
         guard isAvailable else { return }
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         self.input = input
         let processedInput = preprocess(input, history, thinking)
@@ -1584,6 +1596,7 @@ open class LLM: ObservableObject {
         as type: T.Type,
         thinking: ThinkingMode = .none
     ) async throws -> StructuredOutput<T> {
+        await configuration?.value
         let schemaPrompt = """
         \(prompt)
         

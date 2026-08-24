@@ -57,7 +57,7 @@ struct BraveAnswersClient {
 
     func stream(
         query: String,
-        onChunk: @escaping @MainActor (String) -> Void,
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onCitation: (@MainActor (BraveCitation) -> Void)? = nil,
         onUsage: (@MainActor (BraveSearchUsage) -> Void)? = nil
     ) async throws {
@@ -136,7 +136,7 @@ struct BraveAnswersClient {
             if text.hasPrefix("<enum_item>") { continue }
 
             deliveredText = true
-            await onChunk(text)
+            await onChunk(.content(text))
         }
 
         if !deliveredText {
