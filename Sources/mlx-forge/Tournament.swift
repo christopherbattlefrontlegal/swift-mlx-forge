@@ -308,13 +308,13 @@ struct TournamentView: View {
         "anthropic/claude-sonnet-4.5",
         "openai/gpt-5",
         "google/gemini-2.5-pro",
-        "x-ai/grok-4",
+        "x-ai/grok-4.3",
     ]
     @State private var availableModels: [String] = [
         "anthropic/claude-sonnet-4.5",
         "openai/gpt-5",
         "google/gemini-2.5-pro",
-        "x-ai/grok-4",
+        "x-ai/grok-4.3",
         "deepseek/deepseek-v3.2",
         "moonshotai/kimi-k3",
     ]
