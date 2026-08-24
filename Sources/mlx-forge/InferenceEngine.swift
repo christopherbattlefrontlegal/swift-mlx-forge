@@ -1081,7 +1081,8 @@ final class InferenceEngine {
             promptCapture.set(
                 RenderedPromptSnapshot(
                     tokenIDs: prepared.tokenIDs,
-                    thinkingMarkers: prepared.thinkingMarkers))
+                    thinkingMarkers: prepared.thinkingMarkers,
+                    promptTailText: prepared.promptTailText))
         }
         defer { session.onPromptPrepared = nil }
         var classifier: ReasoningStreamClassifier?
@@ -1247,7 +1248,9 @@ final class InferenceEngine {
                     let promptTokenIDs = promptTokens.asArray(Int.self)
                     let promptSnapshot = RenderedPromptSnapshot(
                         tokenIDs: promptTokenIDs,
-                        thinkingMarkers: context.tokenizer.thinkingMarkers)
+                        thinkingMarkers: context.tokenizer.thinkingMarkers,
+                        promptTailText: context.tokenizer.decode(
+                            tokenIds: Array(promptTokenIDs.suffix(64))))
                     promptCapture.set(promptSnapshot)
                     let reasoningContext = promptSnapshot.reasoningContext
 

@@ -53,6 +53,9 @@ final class ForgeServer {
 
     private var listener: NWListener?
     private var startGeneration = 0
+    /// In-flight request tasks. stop() cancels them so a long generation can't
+    /// keep the GPU gate (and app shutdown) hostage after the listener closes.
+    private var requestTasks: [UUID: Task<Void, Never>] = [:]
     /// The port we are actually bound to. Drives `localIdentity()` so Host/Origin
     /// enforcement is keyed off the real socket, not the observable `state` (which
     /// can briefly lag a stale listener's lifecycle events).
@@ -146,6 +149,8 @@ final class ForgeServer {
         listener?.cancel()
         listener = nil
         boundPort = nil
+        requestTasks.values.forEach { $0.cancel() }
+        requestTasks.removeAll()
         state = .stopped
     }
 
@@ -153,7 +158,8 @@ final class ForgeServer {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
-        Task { [weak self] in
+        let requestID = UUID()
+        requestTasks[requestID] = Task { [weak self] in
             do {
                 let request = try await HTTPRequest.read(from: connection)
                 await self?.route(request, on: connection)
@@ -163,6 +169,7 @@ final class ForgeServer {
                     message: "Bad request.", allowOrigin: nil)
             }
             connection.cancel()
+            self?.requestTasks.removeValue(forKey: requestID)
         }
     }
 
@@ -589,7 +596,8 @@ final class ForgeServer {
                 promptCapture.set(
                     RenderedPromptSnapshot(
                         tokenIDs: prepared.tokenIDs,
-                        thinkingMarkers: prepared.thinkingMarkers))
+                        thinkingMarkers: prepared.thinkingMarkers,
+                        promptTailText: prepared.promptTailText))
             }
             defer { session.onPromptPrepared = nil }
             do {
@@ -722,7 +730,8 @@ final class ForgeServer {
                     promptCapture.set(
                         RenderedPromptSnapshot(
                             tokenIDs: prepared.tokenIDs,
-                            thinkingMarkers: prepared.thinkingMarkers))
+                            thinkingMarkers: prepared.thinkingMarkers,
+                            promptTailText: prepared.promptTailText))
                 }
                 defer { session.onPromptPrepared = nil }
                 var output = ""

@@ -149,10 +149,18 @@ public final class ChatSession {
     public struct PreparedPrompt: Sendable {
         public let tokenIDs: [Int]
         public let thinkingMarkers: ThinkingMarkers?
+        /// Decoded text of the prompt's last tokens. Lets consumers apply the
+        /// prompt-state rule when the template spells reasoning tags as plain
+        /// text and the tokenizer has no dedicated marker tokens.
+        public let promptTailText: String
 
-        public init(tokenIDs: [Int], thinkingMarkers: ThinkingMarkers?) {
+        public init(
+            tokenIDs: [Int], thinkingMarkers: ThinkingMarkers?,
+            promptTailText: String = ""
+        ) {
             self.tokenIDs = tokenIDs
             self.thinkingMarkers = thinkingMarkers
+            self.promptTailText = promptTailText
         }
 
         public var tokenCount: Int {
@@ -665,7 +673,9 @@ public final class ChatSession {
                             onPromptPrepared(
                                 PreparedPrompt(
                                     tokenIDs: tokenIDs,
-                                    thinkingMarkers: tokenizer.thinkingMarkers))
+                                    thinkingMarkers: tokenizer.thinkingMarkers,
+                                    promptTailText: tokenizer.decode(
+                                        tokenIds: Array(tokenIDs.suffix(64)))))
                         }
                         messages.removeAll()
 

@@ -60,6 +60,31 @@ struct ReasoningStreamContext: Equatable, Hashable, Sendable {
             startTokenIDs: markers.startTokenIDs,
             endTokenIDs: markers.endTokenIDs)
     }
+
+    /// Prompt-state rule for templates that spell the reasoning tag as plain
+    /// text (no dedicated marker token in the vocabulary — common in community
+    /// conversions whose templates open `<think>` in the generation prompt):
+    /// the last open tag wins only when it follows the last close tag. `tail`
+    /// is the decoded text of the prompt's final tokens.
+    static func fromPromptTailText(_ tail: String) -> ReasoningStreamContext? {
+        for format in [ReasoningTagFormat.think, .longcatThink] {
+            let lastOpen = tail.range(of: format.openTag, options: .backwards)
+            let lastClose = tail.range(of: format.closeTag, options: .backwards)
+            switch (lastOpen, lastClose) {
+            case (.none, .none):
+                continue
+            case (.some(let open), .some(let close)):
+                return ReasoningStreamContext(
+                    format: format,
+                    startsInReasoning: open.lowerBound > close.lowerBound)
+            case (.some, .none):
+                return ReasoningStreamContext(format: format, startsInReasoning: true)
+            case (.none, .some):
+                return ReasoningStreamContext(format: format, startsInReasoning: false)
+            }
+        }
+        return nil
+    }
 }
 
 /// Converts a model's tagged compatibility stream into typed deltas before it
@@ -100,9 +125,21 @@ struct ReasoningStreamClassifier: Sendable {
 struct RenderedPromptSnapshot: Sendable {
     let tokenIDs: [Int]
     let thinkingMarkers: ThinkingMarkers?
+    /// Decoded text of the prompt's last tokens — the fallback signal when the
+    /// tokenizer exposes no marker tokens but the template opened a think block
+    /// as plain text.
+    var promptTailText: String? = nil
 
     var reasoningContext: ReasoningStreamContext {
-        .fromPromptTokenSequence(tokenIDs, markers: thinkingMarkers)
+        if thinkingMarkers != nil {
+            return .fromPromptTokenSequence(tokenIDs, markers: thinkingMarkers)
+        }
+        if let promptTailText,
+            let context = ReasoningStreamContext.fromPromptTailText(promptTailText)
+        {
+            return context
+        }
+        return .taggedThink
     }
 }
 
