@@ -173,6 +173,13 @@ final class AppState {
         SecretsStore.openAIAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
+    var hasXAIKey: Bool { SecretsStore.hasXAIKey }
+
+    func setXAIKey(_ key: String?) {
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        SecretsStore.xaiAPIKey = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+
     var isZAISelected: Bool { zaiModelID?.isEmpty == false }
 
     func refreshZAIConfiguration() {
@@ -528,6 +535,10 @@ final class AppState {
     var showHeadlessHelper = false
     var showDesignPrompt = false
     var showSystemPromptEditor = false
+    /// Media Studio pane (image/video generation + Apple Music transport).
+    var showMediaStudio = false
+    /// Tournament configuration/run sheet.
+    var showTournament = false
 
     /// Rivet uses Forge's existing OpenAI-compatible server as a normal client.
     /// Keep it alive while either the public API toggle or the Rivet workbench

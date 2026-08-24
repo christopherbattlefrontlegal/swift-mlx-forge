@@ -29,6 +29,7 @@ private struct ClaudeKeySettings: View {
     @State private var openAIDraft = ""
     @State private var customOpenRouterModel = ""
     @State private var braveSearchDraft = ""
+    @State private var xaiDraft = ""
 
     var body: some View {
         @Bindable var app = app
@@ -224,6 +225,40 @@ private struct ClaudeKeySettings: View {
                         } label: {
                             Image(systemName: "trash")
                         }
+                    }
+                }
+            }
+
+            providerCard(
+                title: "xAI (Grok)",
+                icon: "sparkle",
+                description: app.hasXAIKey
+                    ? "xAI key saved. Used for Grok image generation in the Media Studio."
+                    : "Stored in the macOS Keychain. Used for Grok image generation in the Media Studio."
+            ) {
+                HStack(spacing: Theme.s2) {
+                    SecureField(
+                        app.hasXAIKey ? "Replace key" : "XAI_API_KEY",
+                        text: $xaiDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    Button("Save") {
+                        let key = xaiDraft.trimmingCharacters(in: .whitespaces)
+                        guard !key.isEmpty else { return }
+                        app.setXAIKey(key)
+                        xaiDraft = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.ember)
+                    .disabled(xaiDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if app.hasXAIKey {
+                        Button(role: .destructive) {
+                            app.setXAIKey(nil)
+                            xaiDraft = ""
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .help("Remove the stored xAI key")
                     }
                 }
             }
