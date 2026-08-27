@@ -1921,8 +1921,15 @@ final class AppState {
             // usually a stream cut off mid-JSON or a call emitted inside <think>.
             // Don't kill the run: quietly hand the problem back to the model so it
             // can re-send the call. mcpParseRetryCount bounds the loop.
+            // A mid-chain turn that came back completely empty is a stalled
+            // model (usually right after a very large tool result), not a
+            // final answer — nudge it to re-emit the next call instead of
+            // letting the run die silent.
+            let emptyMidChainTurn =
+                mcpDepth > 0 && content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if content.contains("FORGE_MCP_CALL") || content.contains("MCP request:")
                 || looksLikeBareMCPArguments(content, mcpDepth: mcpDepth)
+                || emptyMidChainTurn
             {
                 if mcpParseRetryCount < 3 {
                     mcpParseRetryCount += 1
