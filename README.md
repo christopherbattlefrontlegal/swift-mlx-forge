@@ -2,12 +2,12 @@
 
 **A native macOS workbench for local Apple Silicon models, adjustable reasoning, visual agent graphs, and an OpenAI-compatible API.**
 
-[![Forge 2.0.1](https://img.shields.io/github/v/release/christopherbattlefrontlegal/swift-mlx-forge?display_name=tag&sort=semver&label=release&color=5b5bd6)](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases/tag/v2.0.1)
+[![Forge 2.1.0](https://img.shields.io/github/v/release/christopherbattlefrontlegal/swift-mlx-forge?display_name=tag&sort=semver&label=release&color=5b5bd6)](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases/tag/v2.1.0)
 [![CI](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-native-black?logo=apple)](https://christopherbattlefrontlegal.github.io/swift-mlx-forge/)
 
-[See what’s new in Forge 2.0.1](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases/tag/v2.0.1) · [Visit the website](https://christopherbattlefrontlegal.github.io/swift-mlx-forge/) · [Join the discussion](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/discussions)
+[See what’s new in Forge 2.1.0](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/releases/tag/v2.1.0) · [Visit the website](https://christopherbattlefrontlegal.github.io/swift-mlx-forge/) · [Join the discussion](https://github.com/christopherbattlefrontlegal/swift-mlx-forge/discussions)
 
 ![Forge on Apple Silicon](site/assets/forge-product-visual.png)
 
