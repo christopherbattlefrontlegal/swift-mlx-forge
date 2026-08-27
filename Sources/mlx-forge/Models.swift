@@ -317,7 +317,15 @@ struct Conversation: Identifiable, Codable, Equatable {
                     role: .assistant,
                     content: message.modelVisibleContent)
             case .system:
-                return nil
+                // Executed tool results must survive into replayed history:
+                // without them, every turn after a tool chain shows dangling
+                // "MCP request:" bubbles with no data and consecutive assistant
+                // turns, and models answer from nothing (or not at all). Replay
+                // them as user turns; status noise ("MCP running:") stays hidden.
+                guard message.content.hasPrefix("MCP result:")
+                    || message.content.hasPrefix("MCP failed:")
+                else { return nil }
+                return ModelReplayTurn(role: .user, content: message.content)
             }
         }
     }

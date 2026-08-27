@@ -859,11 +859,11 @@ private struct MCPInspectorRow: View {
                 Button {
                     revealCurrentTarget()
                 } label: {
-                    Image(systemName: entry.isBuiltIn ? "folder" : "doc.text.magnifyingglass")
+                    Image(systemName: "doc.text.magnifyingglass")
                         .font(.callout)
                 }
                 .buttonStyle(.borderless)
-                .help(entry.isBuiltIn ? "Reveal built-in MCP workspace folder" : "Reveal MCP config file")
+                .help("Reveal MCP config file")
             }
 
             VStack(alignment: .leading, spacing: Theme.s1) {
@@ -990,7 +990,6 @@ private struct MCPInspectorRow: View {
     }
 
     private var transportSummary: String {
-        if entry.isBuiltIn { return "built-in" }
         if entry.config.url != nil { return "http" }
         guard let command = entry.config.command?.trimmingCharacters(in: .whitespacesAndNewlines),
               !command.isEmpty
@@ -1182,11 +1181,7 @@ private struct MCPInspectorRow: View {
     }
 
     private func revealCurrentTarget() {
-        if entry.isBuiltIn {
-            NSWorkspace.shared.activateFileViewerSelecting([ForgePaths.appSupport])
-        } else {
-            NSWorkspace.shared.activateFileViewerSelecting([MCPManager.projectConfigFile])
-        }
+        NSWorkspace.shared.activateFileViewerSelecting([MCPManager.projectConfigFile])
     }
 }
 

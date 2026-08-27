@@ -170,9 +170,9 @@ Transport rules:
 - HTTPS MCP endpoints are allowed.
 - Plain HTTP is allowed only for `127.0.0.1`, `localhost`, or `::1`.
 - Developer builds may run trusted, enabled stdio commands.
-- Mac App Store sandbox builds must use the built-in workspace tools or an HTTP bridge.
+- Mac App Store sandbox builds must use an HTTP bridge.
 
-The built-in `forge-commander` can access Forge's Application Support folder plus only the workspace folders explicitly granted in Settings. Tool selection has three distinct states: no saved selection means all current and future tools, a saved subset means only that subset, and an explicit empty selection means no tools.
+Every MCP server Forge uses — Desktop Commander, memory graph, sequential-thinking, and any others — is declared in `mcp.json`; there is no built-in fallback server. Tool selection has three distinct states: no saved selection means all current and future tools, a saved subset means only that subset, and an explicit empty selection means no tools.
 
 Model output can invoke MCP only through Forge's explicit call formats. Generic JSON in prose and content inside `<think>` reasoning blocks are not executable tool requests. Pressing **Stop** invalidates subsequent calls and model follow-ups in the same tool chain; it cannot undo a tool side effect that already started.
 

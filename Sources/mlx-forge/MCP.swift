@@ -93,14 +93,10 @@ final class MCPManager {
         let id: String  // key in the "mcpServers" dictionary
         let config: MCPServerConfig
         var status: Status
-        let builtIn: Bool
-
-        var isBuiltIn: Bool { builtIn }
 
         /// Short transport label for the UI: host for url entries, the command
         /// line for stdio entries.
         var transport: String {
-            if isBuiltIn { return "Built in workspace tools" }
             if let url = config.url { return URL(string: url)?.host ?? url }
             if let command = config.command {
                 return ([command] + (config.args ?? [])).joined(separator: " ")
@@ -114,19 +110,11 @@ final class MCPManager {
     private(set) var selectedToolsByServer: [String: [String]] = [:] {
         didSet { UserDefaults.standard.set(selectedToolsByServer, forKey: "mcp.selectedTools") }
     }
-    var commanderRoots: [URL] = [] {
-        didSet {
-            guard hasStarted else { return }
-            loadConfig(connectExternalServers: false)
-        }
-    }
 
     /// Local MCP server config for this project.
     static var projectConfigFile: URL {
         resolveProjectConfigFile()
     }
-
-    nonisolated fileprivate static let commanderID = "forge-commander"
 
     /// Serializes a tools/list entry's `inputSchema` for native tool calling.
     nonisolated static func serializedInputSchema(from tool: [String: Any]) -> String? {
@@ -138,7 +126,6 @@ final class MCPManager {
     }
 
     private var watcher: DispatchSourceFileSystemObject?
-    private var hasStarted = false
     /// Live stdio MCP processes keyed by mcp.json server id (e.g. desktop-commander).
     private var stdioSessions: [String: MCPStdioSession] = [:]
     /// An external server is trusted only while its complete configuration still
@@ -168,7 +155,6 @@ final class MCPManager {
 
     func start() {
         ensureTemplate()
-        hasStarted = true
         loadConfig(connectExternalServers: false)
         watch()
     }
@@ -180,7 +166,7 @@ final class MCPManager {
 
     func connectAvailableServers() {
         for entry in entries {
-            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { continue }
+            guard isServerEnabled(entry.id) else { continue }
             switch entry.status {
             case .available, .failed:
                 break
@@ -202,8 +188,7 @@ final class MCPManager {
         }
     }
 
-    /// Maps user/model aliases to the mcp.json server id. External servers always win
-    /// over the built-in forge-commander fallback.
+    /// Maps user/model aliases (e.g. "desktop commander") to the mcp.json server id.
     func resolveEntryID(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
@@ -218,11 +203,6 @@ final class MCPManager {
         if let alias = aliases[normalized], entries.contains(where: { $0.id == alias }) {
             return alias
         }
-        if normalized == "forge-commander",
-           entries.contains(where: { $0.id == "desktop-commander" })
-        {
-            return "desktop-commander"
-        }
         return trimmed
     }
 
@@ -233,7 +213,6 @@ final class MCPManager {
             throw MCPError.server(
                 "MCP server '\(entryID)' is not declared in \(Self.projectConfigFile.path)")
         }
-        guard !entry.isBuiltIn else { return }
         guard isServerEnabled(resolved) else {
             throw MCPError.server("MCP server '\(resolved)' is disabled in Forge.")
         }
@@ -336,21 +315,7 @@ final class MCPManager {
             allServers.merge(file.mcpServers) { _, new in new }
         }
         lastLoaded = Date()
-        var nextEntries: [Entry] = []
-        // When desktop-commander (or any declared replacement) is in mcp.json, use it
-        // directly — do not register the restricted built-in forge-commander fallback.
-        let usesExternalCommander = allServers.keys.contains("desktop-commander")
-        if allServers[Self.commanderID] == nil, !usesExternalCommander {
-            configureDefaultTool(for: Self.commanderID, tools: BuiltinCommander.tools)
-            nextEntries.append(
-                Entry(
-                    id: Self.commanderID,
-                    config: MCPServerConfig(url: nil, headers: nil, command: nil, args: nil, env: nil),
-                    status: !disabledServerIDs.contains(Self.commanderID)
-                        ? .connected(tools: BuiltinCommander.tools) : .disabled,
-                    builtIn: true))
-        }
-        nextEntries += allServers.keys.sorted().map {
+        entries = allServers.keys.sorted().map {
             let config = allServers[$0]!
             let enabled = !disabledServerIDs.contains($0) && isTrusted($0, config: config)
             return Entry(
@@ -358,13 +323,10 @@ final class MCPManager {
                 config: config,
                 status: enabled
                     ? (connectExternalServers ? .connecting : .available)
-                    : .disabled,
-                builtIn: false)
+                    : .disabled)
         }
-        entries = nextEntries
         guard connectExternalServers else { return }
         for entry in entries {
-            guard !entry.isBuiltIn else { continue }
             guard isServerEnabled(entry.id) else { continue }
             if let urlString = entry.config.url {
                 connect(
@@ -419,7 +381,7 @@ final class MCPManager {
     func isServerEnabled(_ id: String) -> Bool {
         guard !disabledServerIDs.contains(id) else { return false }
         guard let entry = entries.first(where: { $0.id == id }) else { return false }
-        return entry.isBuiltIn || isTrusted(id, config: entry.config)
+        return isTrusted(id, config: entry.config)
     }
 
     func setServerEnabled(_ id: String, enabled: Bool) {
@@ -434,18 +396,14 @@ final class MCPManager {
         }
         let entry = entries[index]
         if enabled {
-            if !entry.isBuiltIn { trust(id, config: entry.config) }
+            trust(id, config: entry.config)
             entries[index].status = .connecting
-            if !entry.isBuiltIn {
-                if let urlString = entry.config.url {
-                    connect(entryID: entry.id, urlString: urlString, headers: entry.config.headers ?? [:])
-                } else if let command = entry.config.command {
-                    connectStdio(entryID: entry.id, command: command, args: entry.config.args ?? [], env: entry.config.env ?? [:])
-                } else {
-                    entries[index].status = .failed("entry needs a \"url\" or \"command\" field")
-                }
+            if let urlString = entry.config.url {
+                connect(entryID: entry.id, urlString: urlString, headers: entry.config.headers ?? [:])
+            } else if let command = entry.config.command {
+                connectStdio(entryID: entry.id, command: command, args: entry.config.args ?? [], env: entry.config.env ?? [:])
             } else {
-                entries[index].status = .connected(tools: BuiltinCommander.tools)
+                entries[index].status = .failed("entry needs a \"url\" or \"command\" field")
             }
         } else {
             invalidateConnection(id)
@@ -475,6 +433,16 @@ final class MCPManager {
         guard let entry = entries.first(where: { $0.id == entryID }) else { return [] }
         if case .connected(let tools) = entry.status { return tools }
         return []
+    }
+
+    /// Finds the single enabled server exposing `toolName`. Used when a model
+    /// emits a native-format tool call (e.g. Qwen's <tool_call>) without a
+    /// server id. Ambiguous names (two servers, same tool) return nil.
+    func serverID(forToolNamed toolName: String) -> String? {
+        let matches = entries.filter { entry in
+            isServerEnabled(entry.id) && tools(for: entry.id).contains { $0.name == toolName }
+        }
+        return matches.count == 1 ? matches.first?.id : nil
     }
 
     func selectedTools(for entryID: String) -> [String] {
@@ -522,8 +490,7 @@ final class MCPManager {
 
     func selectedConnectedTools() -> [MCPToolBinding] {
         entries.flatMap { entry -> [MCPToolBinding] in
-            guard !entry.isBuiltIn,
-                  isServerEnabled(entry.id),
+            guard isServerEnabled(entry.id),
                   case .connected(let tools) = entry.status
             else { return [] }
             let selected = Set(effectiveSelectedTools(for: entry.id))
@@ -537,7 +504,7 @@ final class MCPManager {
     /// otherwise exposes every tool on connected servers so the model always sees MCP.
     func selectedPromptTools() -> [MCPToolBinding] {
         entries.flatMap { entry -> [MCPToolBinding] in
-            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return [] }
+            guard isServerEnabled(entry.id) else { return [] }
             let persisted = selectedToolsByServer[entry.id]
             if case .connected(let tools) = entry.status, !tools.isEmpty {
                 let catalog = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
@@ -562,7 +529,7 @@ final class MCPManager {
         connectAvailableServers()
         for _ in 0..<24 {
             let pending = entries.contains { entry in
-                guard !entry.isBuiltIn, isServerEnabled(entry.id) else { return false }
+                guard isServerEnabled(entry.id) else { return false }
                 switch entry.status {
                 case .connecting, .available:
                     return true
@@ -580,7 +547,7 @@ final class MCPManager {
     /// Ensures connected servers have tool selections — defaults to all tools when empty.
     private func syncDefaultToolSelections() {
         for entry in entries {
-            guard !entry.isBuiltIn, isServerEnabled(entry.id) else { continue }
+            guard isServerEnabled(entry.id) else { continue }
             guard case .connected(let tools) = entry.status else { continue }
             configureDefaultTool(for: entry.id, tools: tools)
         }
@@ -732,10 +699,6 @@ final class MCPManager {
             throw MCPError.server(
                 "MCP server '\(entryID)' not found in \(Self.projectConfigFile.path)")
         }
-        if entry.isBuiltIn {
-            return try BuiltinCommander.call(
-                name: name, arguments: arguments, roots: effectiveCommanderRoots)
-        }
         let normalizedArguments = Self.normalizedArguments(
             arguments, toolName: name, entry: entry)
         let argsPayload = try JSONSerialization.data(withJSONObject: normalizedArguments)
@@ -811,16 +774,6 @@ final class MCPManager {
         if let data = try? encoder.encode(file) {
             try? data.write(to: Self.projectConfigFile, options: .atomic)
         }
-    }
-
-    private var effectiveCommanderRoots: [URL] {
-        // App support is Forge-owned. Every other reachable folder must have
-        // been added explicitly in Settings (and is persisted as a bookmark).
-        var roots = [ForgePaths.appSupport]
-        for root in commanderRoots where !roots.contains(root) {
-            roots.append(root)
-        }
-        return roots
     }
 
     private static func normalizedArguments(
@@ -954,234 +907,6 @@ final class MCPManager {
         guard path == home || path.hasPrefix(home + "/") else { return path }
         let relative = String(path.dropFirst(home.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         return relative.isEmpty ? "." : relative
-    }
-}
-
-// MARK: - Built-in Forge commander tools
-
-private enum BuiltinCommander {
-    static let tools: [MCPTool] = [
-        MCPTool(
-            name: "list_roots",
-            description: "List folders available to the built-in Forge commander tools."),
-        MCPTool(
-            name: "list_directory",
-            description: "List files in an allowed workspace folder. Arguments: path, limit."),
-        MCPTool(
-            name: "read_file",
-            description: "Read a UTF-8 text file from an allowed workspace. Arguments: path, maxBytes."),
-        MCPTool(
-            name: "write_file",
-            description: "Write UTF-8 text to a file under an allowed workspace. Arguments: path, content, createDirectories."),
-        MCPTool(
-            name: "search_files",
-            description: "Search file and folder names under an allowed workspace. Arguments: path, query, limit."),
-        MCPTool(
-            name: "get_file_info",
-            description: "Return basic metadata for a file or folder under an allowed workspace.")
-    ]
-
-    static func call(name: String, arguments: [String: Any], roots: [URL]) throws -> Data {
-        switch name {
-        case "list_roots":
-            return try result(
-                rootListText(roots),
-                structured: ["roots": roots.map { ["path": $0.path] }])
-        case "list_directory":
-            let url = try resolve(arguments["path"] as? String ?? ".", roots: roots)
-            let limit = cappedInt(arguments["limit"], default: 200, max: 1_000)
-            return try listDirectory(url, limit: limit)
-        case "read_file":
-            let url = try resolve(requiredString(arguments, "path"), roots: roots)
-            let maxBytes = cappedInt(arguments["maxBytes"], default: 200_000, max: 1_000_000)
-            return try readFile(url, maxBytes: maxBytes)
-        case "write_file":
-            let url = try resolve(requiredString(arguments, "path"), roots: roots)
-            let content = try requiredString(arguments, "content")
-            let createDirectories = (arguments["createDirectories"] as? Bool) ?? false
-            return try writeFile(url, content: content, createDirectories: createDirectories)
-        case "search_files":
-            let url = try resolve(arguments["path"] as? String ?? ".", roots: roots)
-            let query = try requiredString(arguments, "query")
-            let limit = cappedInt(arguments["limit"], default: 100, max: 500)
-            return try searchFiles(url, query: query, limit: limit, roots: roots)
-        case "get_file_info":
-            let url = try resolve(requiredString(arguments, "path"), roots: roots)
-            return try fileInfo(url)
-        default:
-            throw MCPError.server("Unknown built-in commander tool: \(name)")
-        }
-    }
-
-    private static func listDirectory(_ url: URL, limit: Int) throws -> Data {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else {
-            throw MCPError.server("Path is not a directory: \(url.path)")
-        }
-        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
-        let children = try FileManager.default.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            .prefix(limit)
-        let rows = children.map { child -> [String: Any] in
-            let values = try? child.resourceValues(forKeys: Set(keys))
-            return [
-                "name": child.lastPathComponent,
-                "path": child.path,
-                "type": values?.isDirectory == true ? "directory" : "file",
-                "size": values?.fileSize ?? 0,
-                "modified": values?.contentModificationDate?.description ?? ""
-            ]
-        }
-        let text = rows.map { row in
-            "\(row["type"] ?? "file")\t\(row["size"] ?? 0)\t\(row["name"] ?? "")"
-        }.joined(separator: "\n")
-        return try result(text.isEmpty ? "(empty)" : text, structured: ["entries": Array(rows)])
-    }
-
-    private static func readFile(_ url: URL, maxBytes: Int) throws -> Data {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue else {
-            throw MCPError.server("Path is not a readable file: \(url.path)")
-        }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: maxBytes + 1) ?? Data()
-        let truncated = data.count > maxBytes
-        let textData = truncated ? data.prefix(maxBytes) : data[...]
-        guard let text = String(data: Data(textData), encoding: .utf8) else {
-            throw MCPError.server("File is not valid UTF-8 text: \(url.path)")
-        }
-        return try result(
-            text,
-            structured: ["path": url.path, "bytesRead": textData.count, "truncated": truncated])
-    }
-
-    private static func writeFile(
-        _ url: URL, content: String, createDirectories: Bool
-    ) throws -> Data {
-        guard content.utf8.count <= 1_000_000 else {
-            throw MCPError.server("Refusing to write more than 1 MB through built-in commander.")
-        }
-        let parent = url.deletingLastPathComponent()
-        if createDirectories {
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        }
-        try content.data(using: .utf8)?.write(to: url, options: .atomic)
-        return try result(
-            "Wrote \(content.utf8.count) bytes to \(url.path)",
-            structured: ["path": url.path, "bytesWritten": content.utf8.count])
-    }
-
-    private static func searchFiles(
-        _ url: URL, query: String, limit: Int, roots: [URL]
-    ) throws -> Data {
-        let needle = query.lowercased()
-        guard !needle.isEmpty else { throw MCPError.server("query is required") }
-        guard let enumerator = FileManager.default.enumerator(
-            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
-        else { throw MCPError.server("Unable to enumerate: \(url.path)") }
-
-        var hits: [[String: Any]] = []
-        for case let item as URL in enumerator {
-            guard contains(item, roots: roots) else { continue }
-            if item.lastPathComponent.lowercased().contains(needle) {
-                let values = try? item.resourceValues(forKeys: [.isDirectoryKey])
-                hits.append([
-                    "path": item.path,
-                    "name": item.lastPathComponent,
-                    "type": values?.isDirectory == true ? "directory" : "file"
-                ])
-                if hits.count >= limit { break }
-            }
-        }
-        let text = hits.map { "\($0["type"] ?? "file")\t\($0["path"] ?? "")" }
-            .joined(separator: "\n")
-        return try result(text.isEmpty ? "No matches." : text, structured: ["matches": hits])
-    }
-
-    private static func fileInfo(_ url: URL) throws -> Data {
-        let values = try url.resourceValues(forKeys: [
-            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey,
-            .isReadableKey, .isWritableKey
-        ])
-        let info: [String: Any] = [
-            "path": url.path,
-            "type": values.isDirectory == true ? "directory" : "file",
-            "size": values.fileSize ?? 0,
-            "created": values.creationDate?.description ?? "",
-            "modified": values.contentModificationDate?.description ?? "",
-            "readable": values.isReadable ?? false,
-            "writable": values.isWritable ?? false
-        ]
-        let text = info.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n")
-        return try result(text, structured: info)
-    }
-
-    private static func resolve(_ rawPath: String, roots: [URL]) throws -> URL {
-        guard !roots.isEmpty else {
-            throw MCPError.server("No commander roots are available.")
-        }
-        let raw = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let candidate: URL
-        if raw.isEmpty || raw == "." {
-            candidate = roots[0]
-        } else if raw == "~" {
-            candidate = URL(filePath: NSHomeDirectory())
-        } else if raw.hasPrefix("~/") {
-            candidate = URL(filePath: NSHomeDirectory())
-                .appendingPathComponent(String(raw.dropFirst(2)))
-        } else if raw.hasPrefix("/") {
-            candidate = URL(filePath: raw)
-        } else {
-            candidate = roots[0].appendingPathComponent(raw)
-        }
-
-        let safeURL = candidate.standardizedFileURL
-        guard contains(safeURL, roots: roots) else {
-            throw MCPError.server(
-                "Path is outside allowed commander roots. Add the folder in Settings > MCP Servers.")
-        }
-        return safeURL
-    }
-
-    private static func contains(_ url: URL, roots: [URL]) -> Bool {
-        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
-        return roots.contains { root in
-            let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
-            return path == rootPath || path.hasPrefix(rootPath + "/")
-        }
-    }
-
-    private static func requiredString(_ args: [String: Any], _ key: String) throws -> String {
-        guard let value = args[key] as? String,
-              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw MCPError.server("\(key) is required")
-        }
-        return value
-    }
-
-    private static func cappedInt(_ value: Any?, default defaultValue: Int, max maxValue: Int) -> Int {
-        if let int = value as? Int { return min(Swift.max(int, 1), maxValue) }
-        if let string = value as? String, let int = Int(string) {
-            return min(Swift.max(int, 1), maxValue)
-        }
-        return defaultValue
-    }
-
-    private static func rootListText(_ roots: [URL]) -> String {
-        roots.enumerated().map { index, root in "\(index + 1). \(root.path)" }
-            .joined(separator: "\n")
-    }
-
-    private static func result(_ text: String, structured: [String: Any]) throws -> Data {
-        let payload: [String: Any] = [
-            "content": [["type": "text", "text": text]],
-            "structuredContent": structured
-        ]
-        return try JSONSerialization.data(withJSONObject: payload)
     }
 }
 

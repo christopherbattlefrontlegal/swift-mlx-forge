@@ -288,7 +288,8 @@ func loadLLMContainerWithPolicy(
         extraEOSTokens: mutableConfiguration.extraEOSTokens,
         stopStrings: mutableConfiguration.stopStrings,
         eosTokenIds: mutableConfiguration.eosTokenIds,
-        toolCallFormat: mutableConfiguration.toolCallFormat)
+        toolCallFormat: ChatTemplateSniffer.toolCallFormat(modelDirectory: modelDirectory)
+            ?? mutableConfiguration.toolCallFormat)
 
     let processor = ForgeLLMInputProcessor(
         tokenizer: tokenizer,

@@ -1548,7 +1548,8 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
+    tools: [[String: any Sendable]]? = nil,
+    toolCallStartsInReasoning: Bool = false
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1560,7 +1561,8 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
-            tools: tools
+            tools: tools,
+            startsInReasoning: toolCallStartsInReasoning
         )
     )
 }
@@ -2254,11 +2256,13 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
-        tools: [[String: any Sendable]]? = nil
+        tools: [[String: any Sendable]]? = nil,
+        startsInReasoning: Bool = false
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         stopStringFilter = StopStringFilter(stopStrings: stopStrings)
-        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        toolCallProcessor = ToolCallProcessor(
+            format: format, tools: tools, startsInReasoning: startsInReasoning)
     }
 
     mutating func onToken(

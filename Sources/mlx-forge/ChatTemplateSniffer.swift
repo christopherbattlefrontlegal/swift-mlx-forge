@@ -1,6 +1,7 @@
 // Forge — detect chat-template capabilities from on-disk tokenizer files at load time.
 
 import Foundation
+import MLXLMCommon
 
 enum ChatTemplateSniffer {
 
@@ -42,6 +43,19 @@ enum ChatTemplateSniffer {
             caps.thinkingBuiltIntoTemplate = true
         }
         return caps
+    }
+
+    /// Tool-call wire format the model was trained on, inferred from its own
+    /// template markup. Qwen3.5/Qwen3-Coder templates render calls as
+    /// `<function=name><parameter=key>` blocks; Hermes-style templates (Qwen3
+    /// and most others) render JSON inside `<tool_call>`. Without this the
+    /// runtime's ToolCallProcessor falls back to JSON-only and XML-format
+    /// calls stream through as plain text instead of native tool calls.
+    nonisolated static func toolCallFormat(modelDirectory: URL) -> ToolCallFormat? {
+        guard let template = loadChatTemplateText(from: modelDirectory) else { return nil }
+        if template.contains("<function=") { return .xmlFunction }
+        if template.contains("<tool_call>") { return .json }
+        return nil
     }
 
     nonisolated private static func loadChatTemplateText(from directory: URL) -> String? {

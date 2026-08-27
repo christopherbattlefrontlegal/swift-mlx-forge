@@ -679,6 +679,13 @@ public final class ChatSession {
                         }
                         messages.removeAll()
 
+                        // Thinking-by-default templates end the prompt inside an
+                        // open <think>; the tool-call processor must know so it
+                        // does not mistake reasoning text for tool calls.
+                        let promptStartsInThinking =
+                            tokenizer.thinkingMarkers?.startsInThinking(
+                                promptTokenIDs: input.text.tokens.asArray(Int.self)) ?? false
+
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
                         func defaultGeneration() throws -> (
@@ -693,7 +700,8 @@ public final class ChatSession {
                                 modelConfiguration: modelConfiguration,
                                 tokenizer: tokenizer,
                                 iterator: iterator,
-                                tools: tools
+                                tools: tools,
+                                toolCallStartsInReasoning: promptStartsInThinking
                             )
                         }
 
@@ -781,7 +789,8 @@ public final class ChatSession {
                                         modelConfiguration: modelConfiguration,
                                         tokenizer: tokenizer,
                                         iterator: iterator,
-                                        tools: tools
+                                        tools: tools,
+                                        toolCallStartsInReasoning: promptStartsInThinking
                                     )
                                 }
                             }

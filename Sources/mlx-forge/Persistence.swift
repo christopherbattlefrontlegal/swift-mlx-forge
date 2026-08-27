@@ -72,10 +72,6 @@ struct PersistedSettings: Codable {
     /// Stored with bookmarks for sandbox persistence.
     var promptDirectories: [String] = []
     var promptDirectoryBookmarks: [Data] = []
-    /// Workspace folders exposed to the built-in Forge commander MCP tools.
-    /// Stored with bookmarks so sandboxed builds retain explicit user grants.
-    var commanderDirectories: [String] = []
-    var commanderDirectoryBookmarks: [Data] = []
     /// Last selected prompt content from the library (auto-applied to new conversations).
     var lastPromptContent: String = ""
     /// Saved preset id when the inspector prompt matches a named preset.
@@ -94,8 +90,6 @@ struct PersistedSettings: Codable {
         extraModelDirectoryBookmarks: [Data] = [],
         promptDirectories: [String] = [],
         promptDirectoryBookmarks: [Data] = [],
-        commanderDirectories: [String] = [],
-        commanderDirectoryBookmarks: [Data] = [],
         lastPromptContent: String = "",
         activePromptPresetID: UUID? = nil,
         activePromptExternalLabel: String? = nil,
@@ -109,8 +103,6 @@ struct PersistedSettings: Codable {
         self.extraModelDirectoryBookmarks = extraModelDirectoryBookmarks
         self.promptDirectories = promptDirectories
         self.promptDirectoryBookmarks = promptDirectoryBookmarks
-        self.commanderDirectories = commanderDirectories
-        self.commanderDirectoryBookmarks = commanderDirectoryBookmarks
         self.lastPromptContent = lastPromptContent
         self.activePromptPresetID = activePromptPresetID
         self.activePromptExternalLabel = activePromptExternalLabel
@@ -140,12 +132,6 @@ struct PersistedSettings: Codable {
             .flatMap { $0 } ?? []
         promptDirectoryBookmarks =
             (try? c.decodeIfPresent([Data].self, forKey: .promptDirectoryBookmarks))
-            .flatMap { $0 } ?? []
-        commanderDirectories =
-            (try? c.decodeIfPresent([String].self, forKey: .commanderDirectories))
-            .flatMap { $0 } ?? []
-        commanderDirectoryBookmarks =
-            (try? c.decodeIfPresent([Data].self, forKey: .commanderDirectoryBookmarks))
             .flatMap { $0 } ?? []
         lastPromptContent = (try? c.decodeIfPresent(String.self, forKey: .lastPromptContent)) ?? ""
         activePromptPresetID = try? c.decodeIfPresent(UUID.self, forKey: .activePromptPresetID)

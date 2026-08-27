@@ -60,12 +60,6 @@ final class AppState {
     /// Cached prompt index — refreshed off the hot path so SwiftUI body eval doesn't walk disks.
     private var cachedPrompts: [(category: String, items: [(name: String, url: URL)])] = []
 
-    /// User-granted folders exposed to the built-in Forge commander tools.
-    var commanderDirectories: [URL] = [] {
-        didSet { mcp.commanderRoots = commanderDirectories }
-    }
-    private var commanderDirectoryBookmarks: [URL: Data] = [:]
-
     /// Last selected prompt content from library – auto-applied as systemPrompt for new conversations.
     var lastPromptContent: String = "" {
         didSet { scheduleSave() }
@@ -689,8 +683,6 @@ final class AppState {
         settings = persistedSettings.generation
         promptPresets = persistedSettings.promptPresets
         promptDirectories = resolvePromptDirectories(from: persistedSettings)
-        commanderDirectories = resolveCommanderDirectories(from: persistedSettings)
-        mcp.commanderRoots = commanderDirectories
         lastPromptContent = persistedSettings.lastPromptContent
         activePromptPresetID = persistedSettings.activePromptPresetID
         activePromptExternalLabel = persistedSettings.activePromptExternalLabel
@@ -794,28 +786,6 @@ final class AppState {
         return dirs
     }
 
-    /// Resolves persisted Forge commander workspace bookmarks.
-    private func resolveCommanderDirectories(from settings: PersistedSettings) -> [URL] {
-        var dirs: [URL] = []
-        for data in settings.commanderDirectoryBookmarks {
-            var stale = false
-            guard
-                let url = try? URL(
-                    resolvingBookmarkData: data, options: [.withSecurityScope],
-                    relativeTo: nil, bookmarkDataIsStale: &stale)
-            else { continue }
-            _ = url.startAccessingSecurityScopedResource()
-            commanderDirectoryBookmarks[url] =
-                (stale ? try? url.bookmarkData(options: .withSecurityScope) : nil) ?? data
-            dirs.append(url)
-        }
-        for path in settings.commanderDirectories {
-            let url = URL(filePath: path)
-            if !dirs.contains(url) { dirs.append(url) }
-        }
-        return dirs
-    }
-
     /// Registers a user-selected model directory: mints a security-scoped bookmark
     /// while the `NSOpenPanel` grant is live so the folder survives relaunch.
     func addModelDirectory(_ url: URL) {
@@ -848,24 +818,6 @@ final class AppState {
         promptDirectories.removeAll { $0 == url }
         promptDirectoryBookmarks[url] = nil
         refreshPrompts()
-        scheduleSave()
-    }
-
-    /// Registers a user-selected workspace for the built-in Forge commander tools.
-    func addCommanderDirectory(_ url: URL) {
-        if let bookmark = try? url.bookmarkData(options: .withSecurityScope) {
-            commanderDirectoryBookmarks[url] = bookmark
-        }
-        _ = url.startAccessingSecurityScopedResource()
-        if !commanderDirectories.contains(url) {
-            commanderDirectories.append(url)
-        }
-        scheduleSave()
-    }
-
-    func removeCommanderDirectory(_ url: URL) {
-        commanderDirectories.removeAll { $0 == url }
-        commanderDirectoryBookmarks[url] = nil
         scheduleSave()
     }
 
@@ -1158,10 +1110,15 @@ final class AppState {
         guard !tools.isEmpty else { return base }
         let toolLines = tools.prefix(80).map { binding in
             let description = Self.clippedForPrompt(binding.tool.description, max: 160)
-            if description.isEmpty {
-                return "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\""
+            var line = "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\""
+            if !description.isEmpty { line += ": \(description)" }
+            // Local models only see tools as prompt text, so the argument schema
+            // must ride along or parameters like read_file's "offset" are invisible
+            // and the model cannot page long results.
+            if let schema = binding.tool.inputSchemaJSON, !schema.isEmpty {
+                line += "\n  arguments schema: \(Self.clippedForPrompt(schema, max: 800))"
             }
-            return "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\": \(description)"
+            return line
         }.joined(separator: "\n")
         let overflow =
             tools.count > 80 ? "\n- ... \(tools.count - 80) more enabled MCP tools hidden." : ""
@@ -1177,11 +1134,16 @@ final class AppState {
         Rules:
         - Use the exact server id and tool name from the list (e.g. server "sequential-thinking", tool "sequentialthinking").
         - Put tool arguments inside "arguments" as a JSON object matching the tool schema.
+        - Match "arguments" to the tool's arguments schema shown above. When a result says more \
+        data remains (e.g. a file read that stops at a line limit), call the tool again with its \
+        paging parameters (such as "offset") instead of repeating the same arguments.
         - Example: FORGE_MCP_CALL {"server":"desktop-commander","tool":"read_file","arguments":{"path":"/path/to/file"}}
         - Never write FORGE_MCP_CALL inside <think>...</think> — Forge ignores everything inside \
         <think> and the call will silently fail. Close </think> first, then write FORGE_MCP_CALL \
         as the first line of your visible answer.
-        - After Forge returns the MCP result in the chat, answer the user using that result.
+        - After Forge returns the MCP result in the chat, continue the task: call the next \
+        tool when one is needed (for example write_file to save output the user asked to be \
+        saved, once per file); answer the user only when the whole task is complete.
         """
         let trimmedInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1342,6 +1304,7 @@ final class AppState {
                         settings: self.settings,
                         systemInstructions: systemInstructions,
                         targetModelID: target.modelID,
+                        mcpTools: self.mcp.selectedConnectedTools(),
                         onChunk: { [weak self] delta in
                             guard self?.cancellationGeneration == generation else { return }
                             self?.enqueueStreamDelta(
@@ -1428,6 +1391,7 @@ final class AppState {
                 images: images,
                 settings: self.settings,
                 systemInstructions: systemInstructions,
+                mcpTools: self.mcp.selectedConnectedTools(),
                 onChunk: { [weak self] delta in
                     guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(delta, conversationID: conversationID, messageID: messageID)
@@ -1912,6 +1876,14 @@ final class AppState {
     /// that never manages a clean call can't spin forever.
     private var mcpParseRetryCount = 0
 
+    /// The last text-format MCP call executed in the current turn chain, plus a
+    /// signature of it. Catches a model that re-sends the byte-identical call
+    /// instead of paging or answering, and lets a label-less arguments-only JSON
+    /// turn be recognized as a tool-call attempt rather than a final answer.
+    private var lastMCPCallRequest: MCPCallRequest?
+    private var lastMCPCallSignature: String?
+    private var mcpRepeatCallCount = 0
+
     @discardableResult
     private func handleMCPToolRequestIfNeeded(
         backend: ResponseBackend,
@@ -1938,13 +1910,20 @@ final class AppState {
         }
         guard let content = messageContent(conversationID: conversationID, messageID: messageID)
         else { return false }
-        if mcpDepth == 0 { mcpParseRetryCount = 0 }
+        if mcpDepth == 0 {
+            mcpParseRetryCount = 0
+            lastMCPCallRequest = nil
+            lastMCPCallSignature = nil
+            mcpRepeatCallCount = 0
+        }
         guard var request = Self.parseMCPCallRequest(from: content) else {
             // The model tried to call a tool but in a shape no parser understands —
             // usually a stream cut off mid-JSON or a call emitted inside <think>.
             // Don't kill the run: quietly hand the problem back to the model so it
             // can re-send the call. mcpParseRetryCount bounds the loop.
-            if content.contains("FORGE_MCP_CALL") || content.contains("MCP request:") {
+            if content.contains("FORGE_MCP_CALL") || content.contains("MCP request:")
+                || looksLikeBareMCPArguments(content, mcpDepth: mcpDepth)
+            {
                 if mcpParseRetryCount < 3 {
                     mcpParseRetryCount += 1
                     continueAfterMCPToolResult(
@@ -1978,8 +1957,55 @@ final class AppState {
         }
         mcpParseRetryCount = 0
 
+        if request.serverID.isEmpty {
+            guard let inferred = mcp.serverID(forToolNamed: request.toolName) else {
+                appendSystemMessage(
+                    conversationID: conversationID,
+                    content: """
+                        MCP failed: no single connected server exposes a tool named \
+                        '\(request.toolName)'. Include the server id in the call.
+                        """
+                )
+                return true
+            }
+            request.serverID = inferred
+        }
         request.serverID = mcp.resolveEntryID(request.serverID)
         let requestLabel = "\(request.serverID).\(request.toolName)"
+
+        // A byte-identical repeat of the previous call returns the same data the
+        // model already has; hand the problem back instead of burning a turn.
+        let signature =
+            "\(request.serverID)|\(request.toolName)|\(Self.prettyJSONString(request.arguments))"
+        if signature == lastMCPCallSignature {
+            if mcpRepeatCallCount < 2 {
+                mcpRepeatCallCount += 1
+                continueAfterMCPToolResult(
+                    backend: backend,
+                    originalPrompt: originalPrompt,
+                    images: images,
+                    requestLabel: requestLabel,
+                    resultText: """
+                        NOT executed: this is the byte-identical call you just made, and its \
+                        result is already above in this conversation. Re-running it returns \
+                        the same data. Either change the arguments (for example, page a long \
+                        file with the tool's "offset"/"length" parameters) or answer the \
+                        user's original request using the result you already have.
+                        """,
+                    conversationID: conversationID,
+                    mcpDepth: mcpDepth + 1,
+                    cancellationGeneration: generation)
+                return true
+            }
+            appendSystemMessage(
+                conversationID: conversationID,
+                content: """
+                    The model repeated the identical MCP call \(requestLabel) after two \
+                    corrections, so the tool loop stopped here. Reply "continue" to let it retry.
+                    """
+            )
+            return false
+        }
 
         do {
             try await mcp.ensureConnected(entryID: request.serverID)
@@ -2005,6 +2031,10 @@ final class AppState {
             scheduleSave()
             return true
         }
+
+        lastMCPCallRequest = request
+        lastMCPCallSignature = signature
+        mcpRepeatCallCount = 0
 
         activeMCPCallCount += 1
         defer {
@@ -2050,6 +2080,7 @@ final class AppState {
                 resultText: resultText,
                 conversationID: conversationID,
                 mcpDepth: mcpDepth + 1,
+                resultPersisted: true,
                 cancellationGeneration: generation)
             return true
         } catch {
@@ -2069,6 +2100,7 @@ final class AppState {
         resultText: String,
         conversationID: UUID,
         mcpDepth: Int,
+        resultPersisted: Bool = false,
         cancellationGeneration generation: UInt64
     ) {
         guard generation == cancellationGeneration else { return }
@@ -2086,15 +2118,28 @@ final class AppState {
         let messageID = assistant.id
         beginStreaming(messageID: messageID)
 
-        let prompt = """
+        // Executed results are persisted as "MCP result:" system messages, which
+        // local models replay from history (see modelReplayTurns) — re-embedding
+        // a large result here would double its tokens every chain turn. Cloud
+        // backends and correction nudges (never persisted) embed the text.
+        let embeddedPrompt = """
             The MCP tool \(requestLabel) returned this result:
 
             \(resultText)
 
-            Use this result to continue. If another MCP tool call is needed to fully answer, \
-            call it now; otherwise answer the user's original request. Original request:
+            Use this result to continue the task. If another MCP tool call is needed \
+            (for example write_file to save output the user asked to be saved), call it \
+            now; otherwise answer the user's original request. Original request:
             \(originalPrompt)
             """
+        let referencePrompt = """
+            The MCP tool \(requestLabel) returned its result above in this conversation. \
+            Use it to continue the task. If another MCP tool call is needed (for example \
+            write_file to save output the user asked to be saved), call it now; otherwise \
+            answer the user's original request. Original request:
+            \(originalPrompt)
+            """
+        let prompt = embeddedPrompt
 
         switch backend {
         case .local(let modelID, _):
@@ -2105,11 +2150,12 @@ final class AppState {
                 self.engine.generate(
                     conversation: self.historyWithMCPInstructions(
                         liveHistory, mcpSystemPrompt: systemInstructions),
-                    prompt: prompt,
+                    prompt: resultPersisted ? referencePrompt : prompt,
                     images: images,
                     settings: self.settings,
                     systemInstructions: systemInstructions,
                     targetModelID: modelID,
+                    mcpTools: self.mcp.selectedConnectedTools(),
                 onChunk: { [weak self] delta in
                     guard self?.cancellationGeneration == generation else { return }
                     self?.enqueueStreamDelta(
@@ -2418,11 +2464,10 @@ final class AppState {
         conversations[ci] = conversation
     }
 
-    private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
-        // Never treat hidden reasoning as an instruction to execute a process or
-        // network tool. Only explicit Forge call formats in visible answer text
-        // are executable; arbitrary JSON in prose is data, not authority.
-        let visible = content.replacingOccurrences(
+    /// Strips <think> blocks (closed or dangling to end-of-text) so hidden
+    /// reasoning is never treated as executable call text.
+    private static func visibleAnswerText(_ content: String) -> String {
+        content.replacingOccurrences(
             of: #"(?is)<think\b[^>]*>.*?</think>"#,
             with: "",
             options: .regularExpression)
@@ -2430,14 +2475,137 @@ final class AppState {
                 of: #"(?is)<think\b[^>]*>.*$"#,
                 with: "",
                 options: .regularExpression)
+    }
+
+    /// A mid-chain turn that is nothing but a JSON object whose keys all belong
+    /// to the previous tool call's argument schema is a tool-call attempt that
+    /// lost its label (models imitate the transcript's arguments fence), not a
+    /// final answer. Without this the agent loop ends silently on such a turn.
+    private func looksLikeBareMCPArguments(_ content: String, mcpDepth: Int) -> Bool {
+        guard mcpDepth > 0, let last = lastMCPCallRequest else { return false }
+        let visible = Self.visibleAnswerText(content)
+        guard let json = Self.firstJSONObject(in: visible),
+            let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8)))
+                as? [String: Any],
+            !object.isEmpty
+        else { return false }
+        let remainder = visible
+            .replacingOccurrences(of: json, with: "")
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard remainder.count < 40 else { return false }
+        var knownKeys = Set(last.arguments.keys)
+        if let schemaJSON = mcp.tools(for: last.serverID)
+            .first(where: { $0.name == last.toolName })?.inputSchemaJSON,
+            let schema = (try? JSONSerialization.jsonObject(with: Data(schemaJSON.utf8)))
+                as? [String: Any],
+            let properties = schema["properties"] as? [String: Any]
+        {
+            knownKeys.formUnion(properties.keys)
+        }
+        return Set(object.keys).isSubset(of: knownKeys)
+    }
+
+    private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
+        // Never treat hidden reasoning as an instruction to execute a process or
+        // network tool. Only explicit Forge call formats in visible answer text
+        // are executable; arbitrary JSON in prose is data, not authority.
+        let visible = visibleAnswerText(content)
         if let marker = visible.range(of: "FORGE_MCP_CALL"),
            let request = parseMCPCallJSONObject(from: String(visible[marker.upperBound...]))
         {
             return request
         }
         if let request = parseMCPInvokeXML(from: visible) { return request }
+        if let request = parseMCPToolCallTag(from: visible) { return request }
         if let request = parseMCPDisplayFormat(from: visible) { return request }
         return nil
+    }
+
+    /// Parses the Hermes/Qwen native tool-call format:
+    /// `<tool_call>{"name":"...","arguments":{...}}</tool_call>`. Tool-trained
+    /// local models emit this shape from their chat-template training even when
+    /// prompted to use FORGE_MCP_CALL. A missing server id ("read_file" instead
+    /// of "desktop-commander.read_file") is left empty and inferred by the
+    /// caller from the connected tool catalog.
+    private static func parseMCPToolCallTag(from content: String) -> MCPCallRequest? {
+        guard let open = content.range(of: "<tool_call>") else { return nil }
+        let tail = String(content[open.upperBound...])
+        let body: String
+        if let close = tail.range(of: "</tool_call>") {
+            body = String(tail[..<close.lowerBound])
+        } else {
+            body = tail  // stream may have stopped before the closing tag
+        }
+        if let json = firstJSONObject(in: body),
+            let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8)))
+                as? [String: Any],
+            let rawName = (object["name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawName.isEmpty
+        {
+            let arguments = (object["arguments"] as? [String: Any]) ?? [:]
+            return callRequest(rawName: rawName, arguments: arguments)
+        }
+        // Qwen3.5/Qwen3-Coder XML body: <function=name><parameter=key>value</parameter>.
+        return parseXMLFunctionBody(body)
+    }
+
+    /// Splits "server.tool" / "server__tool" / bare "tool" into an MCPCallRequest
+    /// (empty server is inferred later from the connected catalog).
+    private static func callRequest(
+        rawName: String, arguments: [String: Any]
+    ) -> MCPCallRequest? {
+        var serverID = ""
+        var toolName = rawName
+        if let sep = rawName.range(of: "__") {
+            serverID = String(rawName[..<sep.lowerBound])
+            toolName = String(rawName[sep.upperBound...])
+        } else if let dot = rawName.firstIndex(of: ".") {
+            serverID = String(rawName[..<dot])
+            toolName = String(rawName[rawName.index(after: dot)...])
+        }
+        guard !toolName.isEmpty else { return nil }
+        return MCPCallRequest(serverID: serverID, toolName: toolName, arguments: arguments)
+    }
+
+    private static func parseXMLFunctionBody(_ body: String) -> MCPCallRequest? {
+        guard let nameStart = body.range(of: "<function=") else { return nil }
+        let afterName = body[nameStart.upperBound...]
+        guard let nameEnd = afterName.firstIndex(of: ">") else { return nil }
+        let rawName = String(afterName[..<nameEnd])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawName.isEmpty else { return nil }
+
+        var arguments: [String: Any] = [:]
+        var search = afterName[nameEnd...]
+        while let paramStart = search.range(of: "<parameter=") {
+            let afterParam = search[paramStart.upperBound...]
+            guard let keyEnd = afterParam.firstIndex(of: ">") else { break }
+            let key = String(afterParam[..<keyEnd])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueRegion = afterParam[afterParam.index(after: keyEnd)...]
+            let closeRange = valueRegion.range(of: "</parameter>")
+            let rawValue = String(
+                closeRange.map { valueRegion[..<$0.lowerBound] } ?? valueRegion
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty {
+                // Typed values (numbers, bools, arrays, objects) arrive as JSON
+                // text; everything else stays a plain string.
+                if let parsed = try? JSONSerialization.jsonObject(
+                    with: Data(rawValue.utf8), options: [.fragmentsAllowed]),
+                    !(parsed is String)
+                {
+                    arguments[key] = parsed
+                } else {
+                    arguments[key] = rawValue
+                }
+            }
+            guard let closeRange else { break }
+            search = valueRegion[closeRange.upperBound...]
+        }
+        return callRequest(rawName: rawName, arguments: arguments)
     }
 
     /// Parses the transcript display format Forge itself writes for executed calls
@@ -2789,10 +2957,6 @@ final class AppState {
                 promptDirectories: promptDirectories.map(\.path),
                 promptDirectoryBookmarks: promptDirectories.compactMap {
                     promptDirectoryBookmarks[$0]
-                },
-                commanderDirectories: commanderDirectories.map(\.path),
-                commanderDirectoryBookmarks: commanderDirectories.compactMap {
-                    commanderDirectoryBookmarks[$0]
                 },
                 lastPromptContent: lastPromptContent,
                 activePromptPresetID: activePromptPresetID,

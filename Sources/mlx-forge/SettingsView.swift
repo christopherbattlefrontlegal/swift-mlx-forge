@@ -497,52 +497,11 @@ private struct MCPSettings: View {
             Label("MCP Servers", systemImage: "server.rack")
                 .font(.headline)
             Text(
-                "Forge includes a small built-in forge-commander fallback for workspace file tools. Full MCP servers, including Desktop Commander and memory graph, are declared in the local mcp.json."
+                "MCP servers, including Desktop Commander and memory graph, are declared in the local mcp.json. Enable a server below and Forge calls its tools directly."
             )
             .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
-
-            VStack(alignment: .leading, spacing: Theme.s2) {
-                HStack {
-                    Label("Built-in Forge Commander", systemImage: "desktopcomputer")
-                        .font(.caption.weight(.semibold))
-                    Spacer()
-                    Text("\(app.commanderDirectories.count + 1) root\(app.commanderDirectories.isEmpty ? "" : "s")")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                Text("Available out of the box as MCP server \"forge-commander\". It can list, read, write, inspect, and search files under Forge's app-support folder and any workspace folders you grant here.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                VStack(alignment: .leading, spacing: Theme.s1) {
-                    commanderRootRow(ForgePaths.appSupport, removable: false)
-                    ForEach(app.commanderDirectories, id: \.self) { dir in
-                        commanderRootRow(dir, removable: true)
-                    }
-                }
-
-                Button {
-                    let panel = NSOpenPanel()
-                    panel.canChooseDirectories = true
-                    panel.canChooseFiles = false
-                    panel.allowsMultipleSelection = false
-                    panel.prompt = "Add Workspace"
-                    panel.message = "Select a folder that Forge's built-in forge-commander tools may access."
-                    if panel.runModal() == .OK, let url = panel.url {
-                        app.addCommanderDirectory(url)
-                    }
-                } label: {
-                    Label("Add Workspace Folder", systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.ember)
-            }
-            .padding(Theme.s2)
-            .background(.white.opacity(0.04))
-            .clipShape(.rect(cornerRadius: Theme.radiusSmall))
 
             VStack(alignment: .leading, spacing: Theme.s2) {
                 Text("Add HTTP/SSE Server")
@@ -599,7 +558,7 @@ private struct MCPSettings: View {
                 }
             }
 
-            Text("stdio command servers run in the local developer build. Mac App Store sandbox builds must use built-in tools or HTTP/SSE bridges.")
+            Text("stdio command servers run in the local developer build. Mac App Store sandbox builds must use HTTP/SSE bridges.")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
@@ -629,32 +588,6 @@ private struct MCPSettings: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-    private func commanderRootRow(_ url: URL, removable: Bool) -> some View {
-        HStack(spacing: Theme.s2) {
-            Image(systemName: removable ? "folder" : "app.badge")
-                .foregroundStyle(.secondary)
-            Text(url.path)
-                .font(.caption2.monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            Spacer()
-            Button("Reveal") {
-                NSWorkspace.shared.activateFileViewerSelecting([url])
-            }
-            .buttonStyle(.borderless)
-            if removable {
-                Button(role: .destructive) {
-                    app.removeCommanderDirectory(url)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove workspace folder")
-            }
-        }
-    }
 }
 
 private struct MCPServerRow: View {
@@ -675,13 +608,11 @@ private struct MCPServerRow: View {
             }
             Spacer()
             statusText
-            if !entry.isBuiltIn {
-                Button(role: .destructive, action: remove) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove from Forge MCP config")
+            Button(role: .destructive, action: remove) {
+                Image(systemName: "trash")
             }
+            .buttonStyle(.borderless)
+            .help("Remove from Forge MCP config")
         }
         .padding(Theme.s2)
         .frame(maxWidth: .infinity, alignment: .leading)
