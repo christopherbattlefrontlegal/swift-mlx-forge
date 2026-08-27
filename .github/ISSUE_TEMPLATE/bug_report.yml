@@ -12,7 +12,7 @@ body:
     id: forge-version
     attributes:
       label: Forge version or commit
-      placeholder: v2.1.0 or a commit SHA
+      placeholder: v2.1.1 or a commit SHA
     validations:
       required: true
   - type: input
