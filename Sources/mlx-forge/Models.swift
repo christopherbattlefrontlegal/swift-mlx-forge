@@ -630,9 +630,13 @@ struct GenerationSettings: Codable, Equatable {
 }
 
 enum LocalReasoningEffort: String, CaseIterable, Identifiable, Codable {
-    case none, minimal, low, medium, high, max
+    case none, minimal, low, medium, high, xhigh, max
     var id: String { rawValue }
-    var label: String { rawValue.capitalized }
+    var label: String { self == .xhigh ? "Extra high" : rawValue.capitalized }
+
+    /// Inkling's template maps these names to numeric effort; `xhigh` is Qwen3.8
+    /// vocabulary and is not offered there.
+    static let inklingLevels: [LocalReasoningEffort] = allCases.filter { $0 != .xhigh }
 }
 
 extension GenerationSettings {

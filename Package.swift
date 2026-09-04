@@ -72,6 +72,9 @@ let package = Package(
             dependencies: [
                 "mlx-forge",
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Tests/mlx-forgeTests"
         )

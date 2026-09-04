@@ -509,10 +509,21 @@ struct TuningInspector: View {
             }
         } else if let active = app.engine.activeModel {
             if active.chatTemplateSupportsReasoningEffort {
+                let levels = active.chatTemplateReasoningEffortLevels
                 Toggle("Thinking mode", isOn: localThinkingEnabledBinding)
-                    .help("Sets Inkling's reasoning_effort to the selected level; off sends none (0.0).")
+                    .disabled(!levels.isEmpty && !active.chatTemplateSupportsThinkingToggle)
+                    .help(
+                        levels.isEmpty
+                            ? "Sets Inkling's reasoning_effort to the selected level; off sends none (0.0)."
+                            : "On: passes enable_thinking and the selected reasoning_effort into the chat "
+                                + "template. Off: enable_thinking=false, so the model answers directly.")
                 if app.settings.localThinkingEnabled {
-                    inklingReasoningEffortPicker
+                    if levels.isEmpty {
+                        inklingReasoningEffortPicker
+                    } else {
+                        templateReasoningEffortPicker(
+                            levels: levels, defaultLevel: active.chatTemplateReasoningEffortDefault)
+                    }
                     localThinkingEffortPicker
                 }
             } else if active.chatTemplateSupportsThinkingToggle {
@@ -560,12 +571,38 @@ struct TuningInspector: View {
                 get: { LocalReasoningEffort(rawValue: app.settings.localReasoningEffort) ?? .high },
                 set: { app.settings.localReasoningEffort = $0.rawValue })
         ) {
-            ForEach(LocalReasoningEffort.allCases) { level in
+            ForEach(LocalReasoningEffort.inklingLevels) { level in
                 Text(level.label).tag(level)
             }
         }
         .pickerStyle(.menu)
         .help("Inkling mapping: none 0.0, minimal 0.1, low 0.2, medium 0.7, high 0.9, max 0.99.")
+    }
+
+    /// Picker for templates that enumerate their own `reasoning_effort` levels
+    /// (Qwen3.8: xhigh, medium, low). The strings are the template's own; anything
+    /// else makes the template raise, so an unknown stored value shows the default.
+    private func templateReasoningEffortPicker(levels: [String], defaultLevel: String?)
+        -> some View
+    {
+        let fallback = defaultLevel ?? levels[0]
+        return Picker(
+            "Reasoning effort",
+            selection: Binding(
+                get: {
+                    levels.contains(app.settings.localReasoningEffort)
+                        ? app.settings.localReasoningEffort : fallback
+                },
+                set: { app.settings.localReasoningEffort = $0 })
+        ) {
+            ForEach(levels, id: \.self) { level in
+                Text(LocalReasoningEffort(rawValue: level)?.label ?? level.capitalized).tag(level)
+            }
+        }
+        .pickerStyle(.menu)
+        .help(
+            "Passes reasoning_effort into the chat template. The levels are read from the "
+                + "template itself; Qwen3.8 defines xhigh (default), medium, and low.")
     }
 
     private var localThinkingBudgetBinding: Binding<Int> {

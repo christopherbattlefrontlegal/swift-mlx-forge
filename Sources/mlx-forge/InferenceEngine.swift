@@ -42,8 +42,13 @@ final class InferenceEngine {
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
         let chatTemplateSupportsThinkingToggle: Bool
-        /// Sniffed at load: template defines `reasoning_effort` (Inkling).
+        /// Sniffed at load: template defines `reasoning_effort` (Inkling, Qwen3.8).
         let chatTemplateSupportsReasoningEffort: Bool
+        /// Sniffed at load: levels the template enumerates for `reasoning_effort`
+        /// (Qwen3.8: xhigh, medium, low); empty for Inkling-style templates.
+        let chatTemplateReasoningEffortLevels: [String]
+        /// Sniffed at load: the template's declared default `reasoning_effort`.
+        let chatTemplateReasoningEffortDefault: String?
         /// Sniffed at load: template has no off-branch for `enable_thinking`.
         let chatTemplateThinkingOnly: Bool
         /// Sniffed at load: generation prompt always opens a `` block.
@@ -64,6 +69,8 @@ final class InferenceEngine {
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
             self.chatTemplateSupportsReasoningEffort = templateCaps.supportsReasoningEffort
+            self.chatTemplateReasoningEffortLevels = templateCaps.reasoningEffortLevels
+            self.chatTemplateReasoningEffortDefault = templateCaps.reasoningEffortDefault
             self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
             self.chatTemplateThinkingBuiltIn = templateCaps.thinkingBuiltIntoTemplate
         }
@@ -195,10 +202,11 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
 
-        // Qwen MTP requires Forge's combined target+sidecar weight loader;
-        // upstream's factory sees only the target repository.
-        let hasQwenMTPSidecar = qwenMTPDrafterDirectory(for: model.directory) != nil
-        let useFactoryLoader = !hasQwenMTPSidecar
+        // Qwen MTP requires Forge's weight loader: it keeps the head packaged
+        // inside a Qwen3.8 checkpoint, or merges a sidecar drafter; upstream's
+        // factory drops both.
+        let hasQwenMTP = qwenNativeMTPAvailable(for: model.directory)
+        let useFactoryLoader = !hasQwenMTP
             && (policy == .eager || model.prefersStandardMLXLoad)
         let task: Task<ModelContainer, Error>
         let generation: UInt64
@@ -287,7 +295,7 @@ final class InferenceEngine {
             let entry = Loaded(
                 model: model, container: container,
                 weightLoadPolicy: recordedPolicy,
-                qwenMTPEnabled: hasQwenMTPSidecar,
+                qwenMTPEnabled: hasQwenMTP,
                 templateCaps: templateCaps)
             loadedModels.append(entry)
             if activeModelID == nil { activeModelID = entry.id }
@@ -1507,8 +1515,23 @@ final class InferenceEngine {
         for entry: Loaded, enabled: Bool, effort: String = "high"
     ) -> [String: any Sendable]? {
         if entry.chatTemplateSupportsReasoningEffort {
-            let normalized = LocalReasoningEffort(rawValue: effort)?.rawValue ?? "high"
-            return ["reasoning_effort": enabled ? normalized : "none"]
+            let levels = entry.chatTemplateReasoningEffortLevels
+            if levels.isEmpty {
+                // Inkling-style: the effort value doubles as the off switch.
+                let normalized = LocalReasoningEffort(rawValue: effort)?.rawValue ?? "high"
+                return ["reasoning_effort": enabled ? normalized : "none"]
+            }
+            // Template-enumerated levels (Qwen3.8: xhigh, medium, low). The template
+            // raises on anything else, so clamp to its own list; thinking off goes
+            // through `enable_thinking`, which the same templates also read.
+            let level =
+                levels.contains(effort)
+                ? effort : (entry.chatTemplateReasoningEffortDefault ?? levels[0])
+            var context: [String: any Sendable] = ["reasoning_effort": level]
+            if entry.chatTemplateSupportsThinkingToggle {
+                context["enable_thinking"] = enabled
+            }
+            return context
         }
         guard entry.chatTemplateSupportsThinkingToggle else { return nil }
         return ["enable_thinking": enabled]

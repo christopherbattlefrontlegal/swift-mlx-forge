@@ -72,6 +72,58 @@ func qwenMTPDrafterDirectory(for targetDirectory: URL) -> URL? {
     return nil
 }
 
+/// True when the checkpoint packages Qwen's native MTP head in its own shards
+/// (Qwen3.8): the text config declares MTP layers and a shard holds an `mtp.`
+/// tensor. Reads the safetensors index, or only the shard headers; no weights.
+func qwenCheckpointHasNativeMTPHead(at directory: URL) -> Bool {
+    guard let config = qwenConfiguration(at: directory),
+        qwenModelType(in: config).hasPrefix("qwen3_5"),
+        qwenModelType(in: config) != "qwen3_5_mtp"
+    else { return false }
+    let text = qwenTextConfiguration(in: config)
+    let declared =
+        (text["mtp_num_hidden_layers"] as? Int)
+        ?? (text["num_nextn_predict_layers"] as? Int) ?? 0
+    guard declared > 0 else { return false }
+    return checkpointTensorNames(in: directory).contains { $0.contains("mtp.") }
+}
+
+/// Whether Forge can drive native MTP for this checkpoint: a head inside the
+/// shards, or a compatible sidecar drafter.
+func qwenNativeMTPAvailable(for directory: URL) -> Bool {
+    qwenCheckpointHasNativeMTPHead(at: directory) || qwenMTPDrafterDirectory(for: directory) != nil
+}
+
+/// Tensor names across the checkpoint without loading any weights: the
+/// safetensors index when present, otherwise each shard's JSON header.
+private func checkpointTensorNames(in directory: URL) -> [String] {
+    let indexURL = directory.appending(component: "model.safetensors.index.json")
+    if let data = try? Data(contentsOf: indexURL),
+        let index = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let weightMap = index["weight_map"] as? [String: Any]
+    {
+        return Array(weightMap.keys)
+    }
+    guard let shards = try? safetensorsShardURLs(in: directory) else { return [] }
+    return shards.flatMap(safetensorsHeaderTensorNames)
+}
+
+private func safetensorsHeaderTensorNames(_ url: URL) -> [String] {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+    defer { try? handle.close() }
+    guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else {
+        return []
+    }
+    let length = lengthData.withUnsafeBytes {
+        UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self))
+    }
+    guard length > 0, length < 256 * 1024 * 1024,
+        let headerData = try? handle.read(upToCount: Int(length)),
+        let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+    else { return [] }
+    return header.keys.filter { $0 != "__metadata__" }
+}
+
 private func qwenConfiguration(at directory: URL) -> [String: Any]? {
     let url = directory.appending(component: "config.json")
     guard let data = try? Data(contentsOf: url) else { return nil }
@@ -222,11 +274,13 @@ func loadLLMContainerWithPolicy(
             configurationURL.lastPathComponent, configuration.name, error)
     }
 
+    // Keep the native MTP head while the model is built and sanitized: packaged
+    // inside the checkpoint (Qwen3.8) or merged from a sidecar drafter.
     let mtpDirectory = qwenMTPDrafterDirectory(for: modelDirectory)
-    if mtpDirectory != nil { setenv("FORGE_QWEN_MTP_ENABLE", "1", 1) }
-    defer {
-        if mtpDirectory != nil { unsetenv("FORGE_QWEN_MTP_ENABLE") }
+    if mtpDirectory != nil || qwenCheckpointHasNativeMTPHead(at: modelDirectory) {
+        QwenNativeMTPConfig.retainWeights = true
     }
+    defer { QwenNativeMTPConfig.resetRetainWeights() }
 
     let model: LanguageModel
     do {

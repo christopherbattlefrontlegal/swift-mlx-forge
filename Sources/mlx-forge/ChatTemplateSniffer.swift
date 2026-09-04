@@ -9,8 +9,14 @@ enum ChatTemplateSniffer {
         var hasChatTemplate = false
         /// Template reads `enable_thinking` from kwargs (Qwen3 README-style).
         var supportsThinkingToggle = false
-        /// Template reads Inkling-style `reasoning_effort` from kwargs.
+        /// Template reads `reasoning_effort` from kwargs (Inkling, Qwen3.8).
         var supportsReasoningEffort = false
+        /// Levels the template itself enumerates for `reasoning_effort`, in template
+        /// order (Qwen3.8: xhigh, medium, low). Empty when the template does not
+        /// enumerate them (Inkling), in which case Forge's own vocabulary applies.
+        var reasoningEffortLevels: [String] = []
+        /// The template's `reasoning_effort|default('…')` value, when declared.
+        var reasoningEffortDefault: String? = nil
         /// No off-branch in template — thinking cannot be disabled via kwargs.
         var thinkingOnly = false
         /// `add_generation_prompt` opens a `` block (always-on reasoning).
@@ -39,6 +45,10 @@ enum ChatTemplateSniffer {
             caps.thinkingOnly = !hasOffBranch
         }
         caps.supportsReasoningEffort = template.contains("reasoning_effort")
+        if caps.supportsReasoningEffort {
+            caps.reasoningEffortLevels = reasoningEffortLevels(in: template)
+            caps.reasoningEffortDefault = reasoningEffortDefault(in: template)
+        }
         if detectsBuiltInThinkingPrompt(in: template) {
             caps.thinkingBuiltIntoTemplate = true
         }
@@ -56,6 +66,27 @@ enum ChatTemplateSniffer {
         if template.contains("<function=") { return .xmlFunction }
         if template.contains("<tool_call>") { return .json }
         return nil
+    }
+
+    /// Levels a template enumerates for `reasoning_effort`. Qwen3.8 validates with
+    /// `{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}` and raises
+    /// on anything else, so the list has to come from the template rather than Forge.
+    nonisolated private static func reasoningEffortLevels(in template: String) -> [String] {
+        guard let listPattern = try? Regex(#"reasoning_effort\s+not\s+in\s*\(([^)]*)\)"#),
+            let list = template.firstMatch(of: listPattern)?.output[1].substring,
+            let namePattern = try? Regex(#"['"]([A-Za-z_][A-Za-z0-9_-]*)['"]"#)
+        else { return [] }
+        return list.matches(of: namePattern).compactMap { $0.output[1].substring.map(String.init) }
+    }
+
+    /// The template's declared default, e.g. `reasoning_effort|default('xhigh')`.
+    nonisolated private static func reasoningEffortDefault(in template: String) -> String? {
+        guard
+            let pattern = try? Regex(
+                #"reasoning_effort\s*\|\s*default\(\s*['"]([A-Za-z_][A-Za-z0-9_-]*)['"]\s*\)"#),
+            let match = template.firstMatch(of: pattern)
+        else { return nil }
+        return match.output[1].substring.map(String.init)
     }
 
     nonisolated private static func loadChatTemplateText(from directory: URL) -> String? {
