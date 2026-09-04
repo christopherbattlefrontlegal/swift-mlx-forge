@@ -39,8 +39,8 @@ let package = Package(
         // Match Forge's root override exactly; this keeps Prism's 1-bit kernels
         // and avoids resolving a second package with the same identity.
         .package(
-            url: "https://github.com/PrismML-Eng/mlx-swift.git",
-            revision: "e40e0a57a6f7ad08dc3fd87ad598a7aa6407d230"),
+            url: "https://github.com/ml-explore/mlx-swift.git",
+            revision: "ab924c82ead3b970caaa1c0ac11171de23f0305a"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.

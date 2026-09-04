@@ -28,12 +28,13 @@ let package = Package(
         // Qwen3.5/Qwen3.6 MTP implementation until it lands upstream.
         .package(path: "Vendor/mlx-swift-lm"),
 
-        // PrismML fork of mlx-swift: upstream main (>= 0.31.4) plus 1-bit affine
-        // quantization Metal kernels (Bonsai models). Root-package declaration
-        // overrides mlx-swift-lm's transitive ml-explore/mlx-swift dependency.
+        // Upstream mlx-swift at mlx 0.32.2: its small-batch quantized matmul keeps
+        // MTP verify passes at single-row cost (mlx 0.31.x doubled it). The PrismML
+        // fork's Swift-side 1-bit qmv tuning is not carried; Bonsai models may be
+        // slower. Root-package declaration overrides mlx-swift-lm's dependency.
         .package(
-            url: "https://github.com/PrismML-Eng/mlx-swift.git",
-            revision: "e40e0a57a6f7ad08dc3fd87ad598a7aa6407d230"),
+            url: "https://github.com/ml-explore/mlx-swift.git",
+            revision: "ab924c82ead3b970caaa1c0ac11171de23f0305a"),
 
         // Tokenizer + downloader integration packages required by the
         // MLXHuggingFace macros used in the tool sources.
