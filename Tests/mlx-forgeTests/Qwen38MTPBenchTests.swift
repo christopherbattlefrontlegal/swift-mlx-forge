@@ -8,11 +8,13 @@ import XCTest
 @testable import MLXLLM
 @testable import mlx_forge
 
-/// Decode-throughput and acceptance benchmark for the native MTP path. Runs
-/// only when `FORGE_BENCH_MODEL_DIR` points at a Qwen3.8 MLX checkpoint that
-/// carries its MTP head. The protocol matches the published oMLX recipes:
-/// thinking off, temperature 0, 320 generated tokens, one prose and one code
-/// prompt. `FORGE_BENCH_DEPTHS` (default `1,2,3,4`) and
+/// Decode-throughput and acceptance benchmark for the native MTP path and
+/// the DFlash2 drafter. Runs only when `FORGE_BENCH_MODEL_DIR` points at a
+/// Qwen3.8 MLX checkpoint; the MTP test needs the checkpoint's own head, the
+/// DFlash2 test a drafter Forge can resolve for it (see
+/// `dflash2DrafterDirectory`). The protocol matches the published oMLX
+/// recipes: thinking off, temperature 0, 320 generated tokens, one prose and
+/// one code prompt. `FORGE_BENCH_DEPTHS` (default `1,2,3,4`) and
 /// `FORGE_BENCH_MAX_TOKENS` (default 320) adjust the sweep.
 final class Qwen38MTPBenchTests: XCTestCase {
 
@@ -137,6 +139,73 @@ final class Qwen38MTPBenchTests: XCTestCase {
         }
     }
 
+    /// DFlash2 next to the plain iterator: throughput, acceptance per verify
+    /// pass, and greedy agreement with the baseline, at the drafter's block
+    /// size and at block size 4.
+    @MainActor
+    func testDFlash2ThroughputAndAcceptance() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let dir = env["FORGE_BENCH_MODEL_DIR"] else {
+            throw XCTSkip("FORGE_BENCH_MODEL_DIR not set")
+        }
+        let directory = URL(fileURLWithPath: dir)
+        guard let drafterDirectory = dflash2DrafterDirectory(for: directory) else {
+            throw XCTSkip("no DFlash2 drafter resolves for \(dir)")
+        }
+        let maxTokens = Int(env["FORGE_BENCH_MAX_TOKENS"] ?? "") ?? 320
+
+        let started = Date()
+        let tokenizerLoader = #huggingFaceTokenizerLoader()
+        let (container, _) = try await loadLLMContainerWithPolicy(
+            modelDirectory: directory, policy: .eager, tokenizerLoader: tokenizerLoader)
+        let drafter = try await loadDFlash2Drafter(
+            directory: drafterDirectory, tokenizerLoader: tokenizerLoader)
+        print(
+            "[bench] loaded target + drafter \(drafterDirectory.lastPathComponent) in "
+                + "\(Self.fmt(Date().timeIntervalSince(started))) s")
+
+        let prompts = Self.prompts
+        try await container.perform { context in
+            let eos = context.configuration.eosTokenIds
+            let parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+
+            for prompt in prompts {
+                let prepared = try await context.processor.prepare(
+                    input: UserInput(
+                        chat: [.user(prompt.text)],
+                        additionalContext: ["enable_thinking": false]))
+                let tokens = prepared.text.tokens
+                print("[bench] ---- \(prompt.label): prompt \(tokens.dim(0)) tokens ----")
+
+                let baseline = try Self.drive("\(prompt.label) baseline", eos: eos) {
+                    try TokenIterator(
+                        input: LMInput(text: .init(tokens: tokens)),
+                        model: context.model, parameters: parameters)
+                }
+                Self.report(baseline)
+
+                for blockSize in [drafter.model.blockSize, 4] {
+                    let run = try Self.drive(
+                        "\(prompt.label) dflash2 block=\(blockSize)", eos: eos
+                    ) {
+                        try DFlash2SpeculativeTokenIterator(
+                            input: LMInput(text: .init(tokens: tokens)),
+                            mainModel: context.model, drafter: drafter.model,
+                            parameters: parameters, blockSize: blockSize)
+                    }
+                    Self.report(run)
+                    let agree = Self.commonPrefix(baseline.tokens, run.tokens)
+                    let comparable = min(baseline.tokens.count, run.tokens.count)
+                    print("[bench]   greedy agreement with baseline: \(agree)/\(comparable) tokens")
+                    XCTAssertGreaterThanOrEqual(
+                        agree, min(16, comparable),
+                        "block=\(blockSize) \(prompt.label): diverged from the greedy baseline within 16 tokens"
+                    )
+                }
+            }
+        }
+    }
+
     /// Drive an iterator to completion. Decode throughput is measured from the
     /// first emitted token, so prefill and the standard iterator's prompt tail
     /// are excluded for both paths.
@@ -155,7 +224,9 @@ final class Qwen38MTPBenchTests: XCTestCase {
         let decoded = max(0, tokens.count - 1)
         let seconds = decodeStart.map { end - $0 } ?? 0
         let stats = iterator as? MTPStatsCollecting
-        let passes = (iterator as? QwenNativeMTPTokenIterator)?.backbonePasses ?? decoded
+        let passes =
+            (iterator as? QwenNativeMTPTokenIterator)?.backbonePasses
+            ?? iterator.speculativeDecodingTelemetry?.roundCount ?? decoded
         return Run(
             label: label, tokens: tokens,
             decodeTokensPerSecond: seconds > 0 ? Double(decoded) / seconds : 0,
