@@ -163,6 +163,7 @@ struct RootView: View {
     @Environment(AppState.self) private var app
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var initializedPanelVisibility = false
+    @State private var speechStudio = SpeechStudio()
 
     /// Three panes over the two underlying flags; Media wins when both are set.
     private var workbenchSelection: Binding<WorkbenchTab> {
@@ -188,7 +189,7 @@ struct RootView: View {
         } detail: {
             // Chat, Rivet, and Media share the detail column and the same model library.
             if app.showMediaStudio {
-                MediaView()
+                MediaView(speechStudio: speechStudio)
             } else if app.showRivet {
                 RivetView()
             } else {

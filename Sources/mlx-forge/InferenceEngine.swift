@@ -38,9 +38,6 @@ final class InferenceEngine {
         let gguf: GGUFRuntime?
         /// Target was loaded with the separate native Qwen MTP sidecar.
         let qwenMTPEnabled: Bool
-        /// DFlash2 block drafter loaded next to the target; preferred over
-        /// native MTP when present.
-        let dflash2Drafter: DFlash2DrafterBox?
         /// Sniffed at load: tokenizer ships a chat template.
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
@@ -62,7 +59,6 @@ final class InferenceEngine {
             weightLoadPolicy: WeightLoadPolicy? = nil,
             gguf: GGUFRuntime? = nil,
             qwenMTPEnabled: Bool = false,
-            dflash2Drafter: DFlash2DrafterBox? = nil,
             templateCaps: ChatTemplateSniffer.Capabilities = ChatTemplateSniffer.Capabilities()
         ) {
             self.model = model
@@ -70,7 +66,6 @@ final class InferenceEngine {
             self.weightLoadPolicy = weightLoadPolicy
             self.gguf = gguf
             self.qwenMTPEnabled = qwenMTPEnabled
-            self.dflash2Drafter = dflash2Drafter
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
             self.chatTemplateSupportsReasoningEffort = templateCaps.supportsReasoningEffort
@@ -151,7 +146,7 @@ final class InferenceEngine {
     /// requests) await the same task, so a model's weights are read and
     /// evaluated exactly once — and a waiter gets *that load's* error, not
     /// whatever `lastError` happens to hold by the time it wakes up.
-    private var loadTasks: [String: Task<(ModelContainer, DFlash2DrafterBox?), Error>] = [:]
+    private var loadTasks: [String: Task<ModelContainer, Error>] = [:]
     private var loadGenerations: [String: UInt64] = [:]
     private var loadTaskPolicies: [String: WeightLoadPolicy] = [:]
     /// Models that have passed admission and are queued/loading but are not yet
@@ -213,7 +208,7 @@ final class InferenceEngine {
         let hasQwenMTP = qwenNativeMTPAvailable(for: model.directory)
         let useFactoryLoader = !hasQwenMTP
             && (policy == .eager || model.prefersStandardMLXLoad)
-        let task: Task<(ModelContainer, DFlash2DrafterBox?), Error>
+        let task: Task<ModelContainer, Error>
         let generation: UInt64
         if let inFlight = loadTasks[model.id],
             loadTaskPolicies[model.id] == policy
@@ -282,7 +277,7 @@ final class InferenceEngine {
         }
 
         do {
-            let (container, dflash2Drafter) = try await task.value
+            let container = try await task.value
             if loadGenerations[model.id] != generation
                 || discardedLoads.remove(model.id) != nil
             {
@@ -301,14 +296,8 @@ final class InferenceEngine {
                 model: model, container: container,
                 weightLoadPolicy: recordedPolicy,
                 qwenMTPEnabled: hasQwenMTP,
-                dflash2Drafter: dflash2Drafter,
                 templateCaps: templateCaps)
             loadedModels.append(entry)
-            if let dflash2Drafter {
-                Self.log.info(
-                    "load(\(model.id, privacy: .public)): DFlash2 drafter \(dflash2Drafter.directory.lastPathComponent, privacy: .public)"
-                )
-            }
             if activeModelID == nil { activeModelID = entry.id }
             refreshMemory()
             if let policy = entry.weightLoadPolicy {
@@ -653,8 +642,7 @@ final class InferenceEngine {
             Self.thinkingBudgetApplies(to: entry, settings: settings)
             ? settings.localThinkingTokenLimit : nil
         let noThinkPrefill = Self.noThinkPrefillApplies(to: entry, settings: settings)
-        if budgetTarget != nil || noThinkPrefill || entry.qwenMTPEnabled
-            || entry.dflash2Drafter != nil,
+        if budgetTarget != nil || noThinkPrefill || entry.qwenMTPEnabled,
             entry.container != nil
         {
             sessions.removeValue(forKey: conversation.id)
@@ -812,14 +800,19 @@ final class InferenceEngine {
                     }
                 }
                 self.finishGeneration(generationID)
-                // llama.cpp's wrapper fails a turn with empty streams; ask it why
-                // rather than leaving the user a blank bubble or a guess.
+                // llama.cpp's wrapper fails a turn SILENTLY (empty streams) when the
+                // prompt doesn't fit the context — never leave the user a blank bubble.
                 let producedNothing =
                     fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         && self.liveTokenCount == 0
                 if producedNothing, !Task.isCancelled {
-                    let reason = await gguf.emptyTurnDiagnosis()
-                    onComplete(nil, "The model produced no output. \(reason)")
+                    onComplete(
+                        nil,
+                        "The model produced no output. The prompt (system prompt + history + message) "
+                            + "most likely exceeds the llama.cpp context window "
+                            + "(\(gguf.contextTokens) tokens). Raise Max KV cache in Tuning, "
+                            + "shorten the system prompt, or start a new chat — then reload the model."
+                    )
                 } else {
                     onComplete(nil, nil)
                 }
@@ -986,7 +979,7 @@ final class InferenceEngine {
         loadPolicy: WeightLoadPolicy,
         useFactoryLoader: Bool,
         reportProgress: @Sendable @escaping (Double) -> Void
-    ) async throws -> (ModelContainer, DFlash2DrafterBox?) {
+    ) async throws -> ModelContainer {
         try await Task.detached(priority: .userInitiated) {
             [directory, loadPolicy, useFactoryLoader, reportProgress] in
             try Task.checkCancellation()
@@ -996,10 +989,9 @@ final class InferenceEngine {
             }
             let downloader = ModelStore.makeDownloader()
             let tokenizerLoader = #huggingFaceTokenizerLoader()
-            let container: ModelContainer
             if useFactoryLoader {
                 do {
-                    container = try await LLMModelFactory.shared.loadContainer(
+                    return try await LLMModelFactory.shared.loadContainer(
                         from: downloader, using: tokenizerLoader,
                         configuration: configuration
                     ) { progress in
@@ -1007,34 +999,26 @@ final class InferenceEngine {
                     }
                 } catch let error as ModelFactoryError {
                     guard case .unsupportedModelType = error else { throw error }
-                    container = try await VLMModelFactory.shared.loadContainer(
-                        from: downloader, using: tokenizerLoader,
-                        configuration: configuration)
-                }
-            } else {
-                do {
-                    (container, _) = try await loadLLMContainerWithPolicy(
-                        modelDirectory: directory,
-                        policy: loadPolicy,
-                        tokenizerLoader: tokenizerLoader,
-                        progress: reportProgress
-                    )
-                } catch let error as ModelFactoryError {
-                    guard case .unsupportedModelType = error else { throw error }
-                    container = try await VLMModelFactory.shared.loadContainer(
+                    return try await VLMModelFactory.shared.loadContainer(
                         from: downloader, using: tokenizerLoader,
                         configuration: configuration)
                 }
             }
 
-            // A DFlash2 drafter rides next to a Qwen3.5-family target.
-            var drafter: DFlash2DrafterBox? = nil
-            if let drafterDirectory = dflash2DrafterDirectory(for: directory) {
-                try Task.checkCancellation()
-                drafter = try await loadDFlash2Drafter(
-                    directory: drafterDirectory, tokenizerLoader: tokenizerLoader)
+            do {
+                let (container, _) = try await loadLLMContainerWithPolicy(
+                    modelDirectory: directory,
+                    policy: loadPolicy,
+                    tokenizerLoader: tokenizerLoader,
+                    progress: reportProgress
+                )
+                return container
+            } catch let error as ModelFactoryError {
+                guard case .unsupportedModelType = error else { throw error }
+                return try await VLMModelFactory.shared.loadContainer(
+                    from: downloader, using: tokenizerLoader,
+                    configuration: configuration)
             }
-            return (container, drafter)
         }.value
     }
 
@@ -1055,7 +1039,6 @@ final class InferenceEngine {
             weightLoadPolicy: loadedModels[index].weightLoadPolicy,
             gguf: loadedModels[index].gguf,
             qwenMTPEnabled: loadedModels[index].qwenMTPEnabled,
-            dflash2Drafter: loadedModels[index].dflash2Drafter,
             templateCaps: caps)
     }
 
@@ -1283,8 +1266,7 @@ final class InferenceEngine {
             hardLimit: budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) },
             promptCapture: promptCapture,
             prefillText: noThinkPrefill ? Self.noThinkPrefillText : nil,
-            tools: Self.toolSpecs(from: mcpTools),
-            dflash2Drafter: entry.dflash2Drafter)
+            tools: Self.toolSpecs(from: mcpTools))
 
         for try await item in stream {
             if Task.isCancelled { break }
@@ -1333,13 +1315,12 @@ final class InferenceEngine {
         hardLimit: Int?,
         promptCapture: RenderedPromptCapture,
         prefillText: String? = nil,
-        tools: [ToolSpec]? = nil,
-        dflash2Drafter: DFlash2DrafterBox? = nil
+        tools: [ToolSpec]? = nil
     ) -> AsyncThrowingStream<Generation, Error> {
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
         let task = Task {
             [container, turns, additionalContext, parameters, hardLimit,
-                promptCapture, prefillText, tools, dflash2Drafter, continuation] in
+                promptCapture, prefillText, tools, continuation] in
             do {
                 try await container.perform { context in
                     let messages: [Chat.Message] = try turns.map { turn in
@@ -1377,20 +1358,7 @@ final class InferenceEngine {
                     // Phase 1 — decode until </think> closes naturally or the cap hits.
                     let phase1: AsyncStream<Generation>
                     let phase1Task: Task<Void, Never>
-                    if let dflash2Drafter {
-                        let iterator = try DFlash2SpeculativeTokenIterator(
-                            input: LMInput(text: .init(tokens: promptTokens)),
-                            mainModel: context.model,
-                            drafter: dflash2Drafter.model,
-                            parameters: parameters)
-                        (phase1, phase1Task) = MLXLMCommon.generateTask(
-                            promptTokenCount: promptTokens.size,
-                            modelConfiguration: context.configuration,
-                            tokenizer: context.tokenizer,
-                            iterator: iterator,
-                            tools: tools,
-                            toolCallStartsInReasoning: reasoningContext.startsInReasoning)
-                    } else if let qwenMTP = context.model as? any QwenNativeMTPModel {
+                    if let qwenMTP = context.model as? any QwenNativeMTPModel {
                         let iterator = try QwenNativeMTPTokenIterator(
                             input: LMInput(text: .init(tokens: promptTokens)),
                             model: qwenMTP,
@@ -1473,19 +1441,7 @@ final class InferenceEngine {
                     ])
                     let phase2: AsyncStream<Generation>
                     let phase2Task: Task<Void, Never>
-                    if let dflash2Drafter {
-                        let iterator = try DFlash2SpeculativeTokenIterator(
-                            input: LMInput(text: .init(tokens: phase2Tokens)),
-                            mainModel: context.model,
-                            drafter: dflash2Drafter.model,
-                            parameters: phase2Parameters)
-                        (phase2, phase2Task) = MLXLMCommon.generateTask(
-                            promptTokenCount: phase2Tokens.size,
-                            modelConfiguration: context.configuration,
-                            tokenizer: context.tokenizer,
-                            iterator: iterator,
-                            tools: tools)
-                    } else if let qwenMTP = context.model as? any QwenNativeMTPModel {
+                    if let qwenMTP = context.model as? any QwenNativeMTPModel {
                         let iterator = try QwenNativeMTPTokenIterator(
                             input: LMInput(text: .init(tokens: phase2Tokens)),
                             model: qwenMTP,

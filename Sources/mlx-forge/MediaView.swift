@@ -25,7 +25,26 @@ struct MediaView: View {
     @AppStorage("media.model.grokImage") private var grokImageModel = "grok-2-image"
     @AppStorage("media.model.video") private var videoModel = "sora-2"
 
+    @AppStorage("media.speechSelected") private var speechSelected = false
+    @Bindable var speechStudio: SpeechStudio
+
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("Media section", selection: $speechSelected) {
+                Text("Images & Video").tag(false)
+                Text("Text to Speech").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding()
+            if speechSelected {
+                SpeechStudioView(studio: speechStudio)
+            } else {
+                imageVideoStudio
+            }
+        }
+    }
+
+    private var imageVideoStudio: some View {
         HSplitView {
             generatePanel
                 .frame(minWidth: 300, maxWidth: 360)

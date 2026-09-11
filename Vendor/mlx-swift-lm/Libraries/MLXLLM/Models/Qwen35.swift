@@ -327,45 +327,6 @@ final class Qwen35GatedDeltaNet: Module {
         out = norm(out, gate: z)
         return outProj(out.reshaped(B, S, -1))
     }
-
-    /// The DFlash2 verify body: `callAsFunction` over an unmasked block that
-    /// leaves the cache alone and returns what a prefix replay needs.
-    func verifyForward(
-        _ x: MLXArray, convState: MLXArray, recState: MLXArray
-    ) -> (output: MLXArray, capture: GatedDeltaCapture) {
-        let B = x.dim(0)
-        let S = x.dim(1)
-
-        let qkv = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
-
-        let convInput = concatenated([convState, qkv], axis: 1)
-        let convOut = silu(conv1d(convInput))
-
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-        let (out, _) = gatedDeltaUpdate(
-            q: qNormed, k: kNormed, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-            state: recState)
-        let capture = GatedDeltaCapture(
-            convInput: convInput, q: qNormed, k: kNormed, v: v, a: a, b: b,
-            aLog: aLog, dtBias: dtBias, initialState: recState)
-        return (outProj(norm(out, gate: z).reshaped(B, S, -1)), capture)
-    }
 }
 
 // MARK: - Attention
@@ -444,44 +405,6 @@ final class Qwen35Attention: Module {
             cache: cache,
             scale: scale,
             mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
-
-        return oProj(sigmoidMultiply(output, gate))
-    }
-
-    /// The DFlash2 verify pass: rows land in `cache` at `position` (a `[1]`
-    /// int32 array, possibly lazy) without moving its offset. `mask` is
-    /// `[S, visibleLength]`.
-    func verifyForward(
-        _ x: MLXArray, position: MLXArray, cache: KVCacheSimple, visibleLength: Int,
-        mask: MLXArray
-    ) -> MLXArray {
-        let B = x.dim(0)
-        let L = x.dim(1)
-
-        let qProjOutput = qProj(x)
-        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qSplit[0]
-        let gate = qSplit[1].reshaped(B, L, -1)
-
-        var keys = kProj(x)
-        var values = vProj(x)
-
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
-        let offset = RoPEOffset.batch(position)
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
-
-        let (cachedKeys, cachedValues) = cache.writeRows(
-            keys: keys, values: values, position: position, visibleLength: visibleLength)
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-            mask: .array(mask)
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -603,27 +526,6 @@ final class Qwen35DecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
-
-    /// One layer of a DFlash2 verify pass. A linear layer reads its cache
-    /// state and returns a capture instead of writing; an attention layer
-    /// writes scratch rows at `position` without moving the cache offset.
-    func verify(
-        _ x: MLXArray, position: MLXArray, mask: MLXArray, visibleLength: Int, cache: KVCache
-    ) -> (out: MLXArray, capture: GatedDeltaCapture?) {
-        let r: MLXArray
-        var capture: GatedDeltaCapture? = nil
-        if isLinear {
-            let recurrent = cache as! MambaCache
-            (r, capture) = linearAttn!.verifyForward(
-                inputLayerNorm(x), convState: recurrent[0]!, recState: recurrent[1]!)
-        } else {
-            r = selfAttn!.verifyForward(
-                inputLayerNorm(x), position: position, cache: cache as! KVCacheSimple,
-                visibleLength: visibleLength, mask: mask)
-        }
-        let h = x + r
-        return (h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h)), capture)
-    }
 }
 
 /// One native Qwen multi-token-prediction block: fuse the backbone state at t
@@ -709,16 +611,7 @@ public class Qwen35TextModelInner: Module {
     /// Final-layer output before the closing norm. The native MTP head can
     /// consume this state (ml-explore/mlx-lm#990) or the normed one (vLLM).
     func hiddenStates(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        forwardLayers(inputs, cache: cache, captureLayers: []).hidden
-    }
-
-    /// The layer loop behind `hiddenStates`, also returning the outputs of
-    /// `captureLayers` in that order.
-    func forwardLayers(
-        _ inputs: MLXArray, cache: [KVCache?]?, captureLayers: [Int]
-    ) -> (hidden: MLXArray, captured: [MLXArray]) {
         var hiddenStates = embedTokens(inputs)
-        var captured: [Int: MLXArray] = [:]
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -736,9 +629,6 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
-            if captureLayers.contains(i) {
-                captured[i] = hiddenStates
-            }
             // Hand the layers built so far to the GPU while the rest of the
             // graph is still being constructed on the CPU.
             if pipelineInterval > 0, (i + 1) % pipelineInterval == 0, i + 1 < layers.count {
@@ -746,44 +636,7 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
-        return (hiddenStates, captureLayers.map { captured[$0]! })
-    }
-
-    // MARK: - DFlash2 verify pass
-
-    /// One verify pass over the block. Attention rows land in the cache
-    /// buffers at the request's position without moving any offset;
-    /// recurrent state comes back as captures. Nothing is committed.
-    func verifyStep(
-        _ request: DFlash2VerifyRequest, cache: [KVCache]
-    ) -> (hidden: MLXArray, captured: [MLXArray], recurrentCaptures: [GatedDeltaCapture]) {
-        precondition(cache.count == layers.count, "one cache entry per layer")
-        let length = request.tokens.dim(1)
-        let visibleLength = request.positionUpperBound + length
-
-        // Bool mask `[S, visibleLength]`: row `i` sees columns up to its own
-        // position, `position + i`, inclusive.
-        let columns = MLXArray(Int32(0) ..< Int32(visibleLength)).expandedDimensions(axis: 0)
-        let rows = (request.position.asType(.int32) + MLXArray(Int32(0) ..< Int32(length)))
-            .expandedDimensions(axis: 1)
-        let mask = columns .< (rows + 1)
-
-        var hiddenStates = embedTokens(request.tokens)
-        var captured: [Int: MLXArray] = [:]
-        var recurrentCaptures: [GatedDeltaCapture] = []
-        for (i, layer) in layers.enumerated() {
-            let (out, capture) = layer.verify(
-                hiddenStates, position: request.position, mask: mask,
-                visibleLength: visibleLength, cache: cache[i])
-            hiddenStates = out
-            if let capture {
-                recurrentCaptures.append(capture)
-            }
-            if request.captureLayers.contains(i) {
-                captured[i] = hiddenStates
-            }
-        }
-        return (hiddenStates, request.captureLayers.map { captured[$0]! }, recurrentCaptures)
+        return hiddenStates
     }
 }
 
@@ -898,43 +751,6 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
-extension Qwen35TextModel: DFlash2TargetModel {
-    public var dflash2LayerCount: Int { model.layers.count }
-    public var dflash2Embedding: Embedding { model.embedTokens }
-    public var dflash2Head: Linear? { lmHead }
-
-    public func dflash2SupportsCache(_ cache: [KVCache]) -> Bool {
-        cache.count == model.layers.count
-            && zip(model.layers, cache).allSatisfy { layer, entry in
-                if layer.isLinear {
-                    return entry is MambaCache
-                }
-                return type(of: entry) == KVCacheSimple.self
-            }
-    }
-
-    public func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
-    ) -> (logits: MLXArray, hidden: [MLXArray]) {
-        let (hidden, captured) = model.forwardLayers(
-            tokens, cache: cache, captureLayers: captureLayers)
-        return (dflash2Logits(model.norm(hidden)), captured)
-    }
-
-    public func dflash2Verify(
-        _ request: DFlash2VerifyRequest, cache: [KVCache]
-    ) -> DFlash2VerifyResult {
-        let (hidden, captured, recurrentCaptures) = model.verifyStep(request, cache: cache)
-        return DFlash2VerifyResult(
-            logits: dflash2Logits(model.norm(hidden)), hidden: captured,
-            recurrentCaptures: recurrentCaptures)
-    }
-
-    private func dflash2Logits(_ hidden: MLXArray) -> MLXArray {
-        lmHead?(hidden) ?? model.embedTokens.asLinear(hidden)
-    }
-}
-
 extension Qwen35TextModel: QwenNativeMTPModel {
     public var qwenMTPHeadCount: Int { nativeMTP.count }
 
@@ -1023,28 +839,6 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
-    }
-}
-
-extension Qwen35Model: DFlash2TargetModel {
-    public var dflash2LayerCount: Int { languageModel.dflash2LayerCount }
-    public var dflash2Embedding: Embedding { languageModel.dflash2Embedding }
-    public var dflash2Head: Linear? { languageModel.dflash2Head }
-
-    public func dflash2SupportsCache(_ cache: [KVCache]) -> Bool {
-        languageModel.dflash2SupportsCache(cache)
-    }
-
-    public func dflash2Prefill(
-        _ tokens: MLXArray, cache: [KVCache], captureLayers: [Int]
-    ) -> (logits: MLXArray, hidden: [MLXArray]) {
-        languageModel.dflash2Prefill(tokens, cache: cache, captureLayers: captureLayers)
-    }
-
-    public func dflash2Verify(
-        _ request: DFlash2VerifyRequest, cache: [KVCache]
-    ) -> DFlash2VerifyResult {
-        languageModel.dflash2Verify(request, cache: cache)
     }
 }
 

@@ -126,6 +126,31 @@ final class GGUFRuntime: @unchecked Sendable {
     func stop() {
         llm.stop()
     }
+
+    /// Why the last turn streamed nothing. LLM.swift used to fail silently and
+    /// Forge guessed "context overflow"; the wrapper now says which it was.
+    func emptyTurnDiagnosis() async -> String {
+        let logTail = LLM.recentDiagnostics().suffix(3).joined(separator: " | ")
+        let logNote = logTail.isEmpty ? "" : " Last llama.cpp messages: \(logTail)"
+        if llm.lastRespondSkippedBusy {
+            return "The previous turn was still running inside llama.cpp, so this one "
+                + "was skipped. Stop it, then send again."
+        }
+        switch await llm.lastFailure {
+        case .promptTooLong(let tokens, let limit):
+            return "The prompt (system prompt + history + message) is \(tokens) tokens, "
+                + "but this model was loaded with a \(limit)-token llama.cpp context. "
+                + "Raise Max KV cache in Tuning above \(tokens), shorten the system "
+                + "prompt, or start a new chat, then reload the model."
+        case .decodeFailed(let code):
+            return "llama.cpp could not process the prompt (llama_decode returned "
+                + "\(code)).\(logNote)"
+        case .emptyInput:
+            return "The prompt sent to llama.cpp was empty."
+        case nil:
+            return "The model returned no text.\(logNote)"
+        }
+    }
 }
 
 private final class GGUFResponseCapture: @unchecked Sendable {

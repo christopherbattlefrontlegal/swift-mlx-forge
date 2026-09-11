@@ -1624,8 +1624,7 @@ struct ComposerView: View {
             return "Loading \(name)…"
         }
         if app.isBraveSearchGenerating {
-            return app.braveSearchConfig.enableResearch
-                ? "Brave is researching…" : "Brave is answering…"
+            return app.braveSearchStatus
         }
         if app.isClaudeGenerating {
             return "Claude is responding…"

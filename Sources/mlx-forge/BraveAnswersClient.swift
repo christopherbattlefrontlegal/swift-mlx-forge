@@ -34,7 +34,7 @@ struct BraveSearchConfig: Codable, Equatable {
     var enableResearch: Bool = false
 }
 
-struct BraveCitation: Codable, Equatable {
+struct BraveCitation: Codable, Equatable, Sendable {
     let startIndex: Int
     let endIndex: Int
     let number: Int
@@ -43,7 +43,7 @@ struct BraveCitation: Codable, Equatable {
     let snippet: String?
 }
 
-struct BraveSearchUsage: Codable, Equatable {
+struct BraveSearchUsage: Codable, Equatable, Sendable {
     var requests: Int?
     var queries: Int?
     var tokensIn: Int?
@@ -54,13 +54,50 @@ struct BraveSearchUsage: Codable, Equatable {
 struct BraveAnswersClient {
     var apiKey: String
     var config: BraveSearchConfig = BraveSearchConfig()
+    var session: URLSession = .shared
 
     func stream(
         query: String,
+        history: [ChatMessage] = [],
         onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onCitation: (@MainActor (BraveCitation) -> Void)? = nil,
-        onUsage: (@MainActor (BraveSearchUsage) -> Void)? = nil
+        onUsage: (@MainActor (BraveSearchUsage) -> Void)? = nil,
+        onStatus: (@MainActor (String) -> Void)? = nil
     ) async throws {
+        let request = try makeRequest(query: query, history: history)
+        let (bytes, response) = try await session.bytes(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > 64_000 { break }
+            }
+            throw BraveAnswersError.http(status, Self.extractError(from: data) ?? "request failed")
+        }
+
+        @MainActor func deliver(_ events: [BraveAnswerEvent]) {
+            for event in events {
+                switch event {
+                case .content(let text): onChunk(.content(text))
+                case .status(let status): onStatus?(status)
+                case .citation(let citation): onCitation?(citation)
+                case .usage(let usage): onUsage?(usage)
+                }
+            }
+        }
+
+        var parser = BraveAnswerStreamParser(research: config.enableResearch)
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            await deliver(try parser.ingest(line: line))
+            if parser.isDone { break }
+        }
+        try Task.checkCancellation()
+        await deliver(try parser.finish())
+    }
+
+    func makeRequest(query: String, history: [ChatMessage] = []) throws -> URLRequest {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !apiKey.isEmpty else { throw BraveAnswersError.noKey }
         guard !trimmed.isEmpty else { throw BraveAnswersError.emptyQuery }
@@ -80,76 +117,63 @@ struct BraveAnswersClient {
             "model": "brave",
             "stream": true,
             "messages": [
-                ["role": "user", "content": trimmed]
+                ["role": "user", "content": Self.contextualQuery(trimmed, history: history)]
             ],
             "country": config.country,
             "language": config.language,
-            "enable_entities": config.enableEntities,
+            "enable_entities": config.enableEntities && !config.enableResearch,
             "enable_research": config.enableResearch,
         ]
         if !config.enableResearch {
             body["enable_citations"] = config.enableCitations
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else {
-            var data = Data()
-            for try await byte in bytes {
-                data.append(byte)
-                if data.count > 64_000 { break }
+    /// Brave accepts exactly one user message. Include the conversation as
+    /// context inside it so requests such as "give me that in paragraphs" keep
+    /// their subject. Exclude reasoning, errors, and internal status messages.
+    private static func contextualQuery(_ query: String, history: [ChatMessage]) -> String {
+        let turns = history.compactMap { message -> String? in
+            guard message.role != .system, message.isModelReplayable else { return nil }
+            var text = message.modelVisibleContent
+            if message.role == .assistant,
+                message.modelName?.hasPrefix("Brave Search") == true,
+                text.contains("<answer>") || text.contains("<queries>")
+            {
+                text = cleanedResearchAnswer(text)
             }
-            throw BraveAnswersError.http(status, Self.extractError(from: data) ?? "request failed")
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return "\(message.role == .user ? "User" : "Assistant"): \(text)"
         }
+        guard !turns.isEmpty else { return query }
+        return """
+            Previous conversation for context:
+            \(turns.joined(separator: "\n\n"))
 
-        var deliveredText = false
-        for try await line in bytes.lines {
-            try Task.checkCancellation()
-            guard line.hasPrefix("data:") else { continue }
-            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload.isEmpty || payload == "[DONE]" { continue }
-            guard
-                let obj = try? JSONSerialization.jsonObject(with: Data(payload.utf8))
-                    as? [String: Any]
-            else { continue }
+            Answer the current request using the context above:
+            \(query)
+            """
+    }
 
-            if let error = obj["error"] as? [String: Any] {
-                throw BraveAnswersError.stream((error["message"] as? String) ?? "stream error")
-            }
-            guard
-                let choices = obj["choices"] as? [[String: Any]],
-                let first = choices.first,
-                let delta = first["delta"] as? [String: Any],
-                let text = delta["content"] as? String,
-                !text.isEmpty
-            else { continue }
-
-            if let citation = Self.parseCitationTag(text) {
-                await onCitation?(citation)
-                continue
-            }
-            if let usage = Self.parseUsageTag(text) {
-                await onUsage?(usage)
-                continue
-            }
-            if text.hasPrefix("<enum_item>") { continue }
-
-            deliveredText = true
-            await onChunk(.content(text))
-        }
-
-        if !deliveredText {
-            throw BraveAnswersError.emptyAnswer
+    /// Decode old saved Research responses with the same protocol parser used
+    /// for live requests; keep the final answer and discard progress metadata.
+    static func cleanedResearchAnswer(_ raw: String) -> String {
+        var parser = BraveAnswerStreamParser(research: true)
+        do {
+            _ = try parser.ingest(content: raw)
+            return try parser.finishContent().compactMap { event in
+                if case .content(let text) = event { return text }
+                return nil
+            }.joined()
+        } catch {
+            return ""
         }
     }
 
-    /// Research mode may emit an intermediate writer draft, then repeat or
-    /// revise that draft before the final answer. Unlike ordinary Answers
-    /// mode, Forge buffers Research output and runs it through this cleanup so
-    /// internal drafting notes and superseded answers never become the saved
-    /// assistant response.
-    static func cleanedResearchAnswer(_ raw: String) -> String {
+    /// Compatibility with older responses that emitted untagged writer drafts.
+    static func cleanedPlainResearchAnswer(_ raw: String) -> String {
         let normalizedNewlines = raw
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -243,28 +267,6 @@ struct BraveAnswersClient {
         let denominator = min(left.count, right.count)
         guard denominator > 0 else { return 0 }
         return Double(left.intersection(right).count) / Double(denominator)
-    }
-
-    private static func parseCitationTag(_ text: String) -> BraveCitation? {
-        guard text.hasPrefix("<citation>"), text.hasSuffix("</citation>") else { return nil }
-        let json = text.dropFirst("<citation>".count).dropLast("</citation>".count)
-        guard let data = String(json).data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(BraveCitation.self, from: data)
-    }
-
-    private static func parseUsageTag(_ text: String) -> BraveSearchUsage? {
-        guard text.hasPrefix("<usage>"), text.hasSuffix("</usage>") else { return nil }
-        let json = text.dropFirst("<usage>".count).dropLast("</usage>".count)
-        guard
-            let data = String(json).data(using: .utf8),
-            let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        return BraveSearchUsage(
-            requests: raw["X-Request-Requests"] as? Int,
-            queries: raw["X-Request-Queries"] as? Int,
-            tokensIn: raw["X-Request-Tokens-In"] as? Int,
-            tokensOut: raw["X-Request-Tokens-Out"] as? Int,
-            totalCost: raw["X-Request-Total-Cost"] as? Double)
     }
 
     private static func extractError(from data: Data) -> String? {

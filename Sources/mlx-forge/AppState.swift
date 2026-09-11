@@ -519,6 +519,7 @@ final class AppState {
     }
 
     private(set) var isBraveSearchGenerating = false
+    private(set) var braveSearchStatus = ""
     private var braveSearchTask: Task<Void, Never>?
 
     var memoryBudgetSnapshot: ModelMemoryBudget.Snapshot {
@@ -655,7 +656,7 @@ final class AppState {
         }
     }
 
-    private struct MCPCallRequest {
+    struct MCPCallRequest {
         var serverID: String
         var toolName: String
         var arguments: [String: Any]
@@ -1267,7 +1268,8 @@ final class AppState {
             if let braveTarget {
                 streamBraveSearch(
                     history: historySnapshot, prompt: prompt,
-                    conversationID: conversationID, messageID: braveTarget)
+                    conversationID: conversationID, messageID: braveTarget,
+                    cancellationGeneration: generation)
             }
             scheduleSave()
             return
@@ -1785,7 +1787,8 @@ final class AppState {
     /// Routes a chat turn to Brave Search Answers and streams deltas into the message.
     private func streamBraveSearch(
         history: Conversation, prompt: String,
-        conversationID: UUID, messageID: UUID
+        conversationID: UUID, messageID: UUID,
+        cancellationGeneration generation: UInt64
     ) {
         guard let key = SecretsStore.braveSearchAPIKey, !key.isEmpty else {
             appendToMessage(conversationID: conversationID, messageID: messageID) {
@@ -1799,37 +1802,33 @@ final class AppState {
 
         let client = BraveAnswersClient(apiKey: key, config: braveSearchConfig)
         var citations: [BraveCitation] = []
-        let buffersResearchDrafts = braveSearchConfig.enableResearch
-        var researchText = ""
 
         isBraveSearchGenerating = true
+        braveSearchStatus = client.config.enableResearch
+            ? "Brave is researching…" : "Brave is answering…"
         braveSearchTask?.cancel()
         braveSearchTask = Task { [weak self] in
             do {
                 try await client.stream(
                     query: prompt,
+                    history: history.messages,
                     onChunk: { delta in
-                        if buffersResearchDrafts {
-                            if case .content(let text) = delta { researchText += text }
-                        } else {
-                            self?.enqueueStreamDelta(
-                                delta, conversationID: conversationID, messageID: messageID)
-                        }
+                        guard self?.cancellationGeneration == generation else { return }
+                        self?.enqueueStreamDelta(
+                            delta, conversationID: conversationID, messageID: messageID)
                     },
                     onCitation: { citation in
                         citations.append(citation)
                     },
-                    onUsage: { _ in }
+                    onStatus: { status in
+                        guard self?.cancellationGeneration == generation else { return }
+                        self?.braveSearchStatus = status
+                    }
                 )
-                if buffersResearchDrafts {
-                    let answer = BraveAnswersClient.cleanedResearchAnswer(researchText)
-                    guard !answer.isEmpty else { throw BraveAnswersError.emptyAnswer }
-                    self?.enqueueStreamDelta(
-                        .content(answer), conversationID: conversationID, messageID: messageID)
-                }
             } catch is CancellationError {
                 // User pressed stop — leave whatever streamed in place.
             } catch {
+                guard !Task.isCancelled, self?.cancellationGeneration == generation else { return }
                 self?.finishStreamBuffer(messageID)
                 self?.appendToMessage(conversationID: conversationID, messageID: messageID) {
                     if $0.content.isEmpty {
@@ -1841,6 +1840,7 @@ final class AppState {
                     }
                 }
             }
+            guard self?.cancellationGeneration == generation else { return }
             self?.finishStreamBuffer(messageID)
             if let footer = self?.formatBraveCitationsFooter(citations), !footer.isEmpty {
                 self?.appendToMessage(conversationID: conversationID, messageID: messageID) {
@@ -1850,6 +1850,7 @@ final class AppState {
                 }
             }
             self?.isBraveSearchGenerating = false
+            self?.braveSearchStatus = ""
             self?.braveSearchTask = nil
             self?.endStreaming(messageID: messageID)
             self?.scheduleSave()
@@ -2514,7 +2515,7 @@ final class AppState {
         return Set(object.keys).isSubset(of: knownKeys)
     }
 
-    private static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
+    static func parseMCPCallRequest(from content: String) -> MCPCallRequest? {
         // Never treat hidden reasoning as an instruction to execute a process or
         // network tool. Only explicit Forge call formats in visible answer text
         // are executable; arbitrary JSON in prose is data, not authority.
@@ -2833,6 +2834,7 @@ final class AppState {
         isOpenAIGenerating = false
         isZAIGenerating = false
         isBraveSearchGenerating = false
+        braveSearchStatus = ""
         streamingMessageID = nil
         streamingMessageIDs.removeAll()
         streamingTextByMessageID.removeAll()
