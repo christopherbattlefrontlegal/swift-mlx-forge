@@ -537,8 +537,26 @@ struct GenerationSettings: Codable, Equatable {
     var minP: Double = 0.0
     var maxTokens: Int = 4096
     var repetitionPenalty: Double = 1.0
+    /// Tokens the repetition penalty looks back over (MLX default 20).
+    var repetitionContextSize: Int = 20
+    /// Additive penalty on any token already seen in the window. 0 = off. Negative encourages reuse.
+    var presencePenalty: Double = 0.0
+    var presenceContextSize: Int = 20
+    /// Additive penalty scaled by how many times a token appeared in the window. 0 = off.
+    var frequencyPenalty: Double = 0.0
+    var frequencyContextSize: Int = 20
+    /// Sampling seed. 0 = fresh entropy each turn; any other value makes sampling reproducible.
+    var seed: Int = 0
     var systemPrompt: String = ""
     var maxKVSize: Int = 0  // 0 = unlimited
+    /// KV cache quantization: "" = off, "affine4", "affine8", or "custom" (uses kvBits/kvGroupSize).
+    var kvScheme: String = ""
+    var kvBits: Int = 4
+    var kvGroupSize: Int = 64
+    /// Token offset after which the KV cache starts being quantized.
+    var quantizedKVStart: Int = 0
+    /// Prompt tokens processed per prefill step (MLX default 512).
+    var prefillStepSize: Int = 512
     /// When true, surface reasoning blocks in chat (local `` + Anthropic adaptive thinking).
     var reasoningEnabled: Bool = true
     /// For Qwen/QwQ MLX models: pass `enable_thinking` into `applyChatTemplate`.
@@ -571,7 +589,18 @@ struct GenerationSettings: Codable, Equatable {
         minP = defaults.minP
         maxTokens = defaults.maxTokens
         repetitionPenalty = defaults.repetitionPenalty
+        repetitionContextSize = defaults.repetitionContextSize
+        presencePenalty = defaults.presencePenalty
+        presenceContextSize = defaults.presenceContextSize
+        frequencyPenalty = defaults.frequencyPenalty
+        frequencyContextSize = defaults.frequencyContextSize
+        seed = defaults.seed
         maxKVSize = defaults.maxKVSize
+        kvScheme = defaults.kvScheme
+        kvBits = defaults.kvBits
+        kvGroupSize = defaults.kvGroupSize
+        quantizedKVStart = defaults.quantizedKVStart
+        prefillStepSize = defaults.prefillStepSize
     }
 
     // Tolerant decoding so new fields never invalidate an older settings file.
@@ -588,9 +617,27 @@ struct GenerationSettings: Codable, Equatable {
         maxTokens = (try? c.decodeIfPresent(Int.self, forKey: .maxTokens)).flatMap { $0 } ?? 4096
         repetitionPenalty =
             (try? c.decodeIfPresent(Double.self, forKey: .repetitionPenalty)).flatMap { $0 } ?? 1.0
+        repetitionContextSize =
+            (try? c.decodeIfPresent(Int.self, forKey: .repetitionContextSize)).flatMap { $0 } ?? 20
+        presencePenalty =
+            (try? c.decodeIfPresent(Double.self, forKey: .presencePenalty)).flatMap { $0 } ?? 0.0
+        presenceContextSize =
+            (try? c.decodeIfPresent(Int.self, forKey: .presenceContextSize)).flatMap { $0 } ?? 20
+        frequencyPenalty =
+            (try? c.decodeIfPresent(Double.self, forKey: .frequencyPenalty)).flatMap { $0 } ?? 0.0
+        frequencyContextSize =
+            (try? c.decodeIfPresent(Int.self, forKey: .frequencyContextSize)).flatMap { $0 } ?? 20
+        seed = (try? c.decodeIfPresent(Int.self, forKey: .seed)).flatMap { $0 } ?? 0
         systemPrompt =
             (try? c.decodeIfPresent(String.self, forKey: .systemPrompt)).flatMap { $0 } ?? ""
         maxKVSize = (try? c.decodeIfPresent(Int.self, forKey: .maxKVSize)).flatMap { $0 } ?? 0
+        kvScheme = (try? c.decodeIfPresent(String.self, forKey: .kvScheme)).flatMap { $0 } ?? ""
+        kvBits = (try? c.decodeIfPresent(Int.self, forKey: .kvBits)).flatMap { $0 } ?? 4
+        kvGroupSize = (try? c.decodeIfPresent(Int.self, forKey: .kvGroupSize)).flatMap { $0 } ?? 64
+        quantizedKVStart =
+            (try? c.decodeIfPresent(Int.self, forKey: .quantizedKVStart)).flatMap { $0 } ?? 0
+        prefillStepSize =
+            (try? c.decodeIfPresent(Int.self, forKey: .prefillStepSize)).flatMap { $0 } ?? 512
         reasoningEnabled =
             (try? c.decodeIfPresent(Bool.self, forKey: .reasoningEnabled)).flatMap { $0 } ?? true
         localThinkingEnabled =

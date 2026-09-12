@@ -15,6 +15,7 @@ struct TuningInspector: View {
     @AppStorage("inspector.modelsExpanded") private var modelsExpanded = true
     @AppStorage("inspector.mcpExpanded") private var mcpExpanded = true
     @AppStorage("inspector.runtimesExpanded") private var runtimesExpanded = false
+    @AppStorage("inspector.kvCacheExpanded") private var kvCacheExpanded = false
 
     var body: some View {
         @Bindable var app = app
@@ -29,17 +30,25 @@ struct TuningInspector: View {
                 ) {
                     ParameterSlider(
                         label: "Temperature", value: $app.settings.temperature,
-                        range: 0...1, hardLimit: 0...2, fractionDigits: 2)
-                        .help("Usual range 0–1. MLX allows up to 2 if you type it in.")
+                        range: 0...2, hardLimit: 0...5, fractionDigits: 2)
+                        .help(
+                            "Divides the logits before sampling. 1.0 samples the model's own distribution; "
+                                + "below sharpens toward its top picks, above flattens. "
+                                + "Slider to 2, type up to 5. 0 = greedy (argmax).")
                     ParameterSlider(
                         label: "Top P", value: $app.settings.topP,
                         range: 0...1, hardLimit: 0...1, fractionDigits: 2)
                     ParameterSlider(
                         label: "Min P", value: $app.settings.minP,
                         range: 0...1, hardLimit: 0...1, fractionDigits: 2)
+                        .help(
+                            "Keeps tokens at least this fraction as likely as the top token. "
+                                + "Scales with confidence, so it pairs well with temperature ≥ 1. "
+                                + "MLX applies filters in order: top-p → min-p → top-k.")
                     IntField(
                         label: "Top K", value: $app.settings.topK,
                         limit: 0...100_000, zeroMeans: "off")
+                        .help("Keeps only the K most likely tokens. 0 = off.")
                     IntField(
                         label: "Max tokens", value: $app.settings.maxTokens,
                         limit: 0...10_000_000, zeroMeans: "∞",
@@ -51,6 +60,34 @@ struct TuningInspector: View {
                             "Caps how many past tokens stay in GPU memory (the KV cache). "
                                 + "0 = unlimited. Lower this if long chats run out of RAM.")
                     RepetitionPenaltySlider(value: $app.settings.repetitionPenalty)
+                    IntField(
+                        label: "Repetition window", value: $app.settings.repetitionContextSize,
+                        limit: 1...100_000, presets: [20, 64, 256, 1024])
+                        .help("How many recent tokens the repetition penalty looks back over (MLX default 20).")
+                    ParameterSlider(
+                        label: "Presence penalty", value: $app.settings.presencePenalty,
+                        range: 0...2, hardLimit: -2...2, fractionDigits: 2)
+                        .help(
+                            "Subtracts a flat amount from the logit of every token already in the window. "
+                                + "0 = off. Milder than repetition penalty; negative values encourage reuse.")
+                    IntField(
+                        label: "Presence window", value: $app.settings.presenceContextSize,
+                        limit: 1...100_000, presets: [20, 64, 256, 1024])
+                    ParameterSlider(
+                        label: "Frequency penalty", value: $app.settings.frequencyPenalty,
+                        range: 0...2, hardLimit: -2...2, fractionDigits: 2)
+                        .help(
+                            "Subtracts penalty × (times the token appeared in the window). "
+                                + "0 = off. Targets tokens that recur, not tokens that merely appeared once.")
+                    IntField(
+                        label: "Frequency window", value: $app.settings.frequencyContextSize,
+                        limit: 1...100_000, presets: [20, 64, 256, 1024])
+                    IntField(
+                        label: "Seed", value: $app.settings.seed,
+                        limit: 0...Int(Int32.max), zeroMeans: "random")
+                        .help(
+                            "Fixes the sampler's random state so the same prompt and settings reproduce "
+                                + "the same output. 0 = fresh entropy each turn.")
                     Button("Reset sampling to defaults") {
                         var next = app.settings
                         next.resetSamplingToDefaults()
@@ -60,13 +97,52 @@ struct TuningInspector: View {
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
                     .help(
-                        "Temperature 0.7, top-p 0.95, repetition 1.0 (off), max tokens 4096, KV cache unlimited.")
+                        "Temperature 0.7, top-p 0.95, min-p 0, top-k off, all penalties off, seed random, "
+                            + "max tokens 4096, KV cache unlimited and unquantized, prefill step 512.")
                     Picker("API auto-load policy", selection: $app.settings.weightLoadPolicy) {
                         ForEach(WeightLoadPolicy.allCases) { policy in
                             Text(policy.label).tag(policy)
                         }
                     }
                     .help(WeightLoadPolicy.eager.help)
+                }
+
+                collapsibleSection(
+                    "KV Cache & Prefill", icon: "memorychip", expanded: $kvCacheExpanded,
+                    detail: kvCacheSectionDetail
+                ) {
+                    Picker("KV cache quantization", selection: $app.settings.kvScheme) {
+                        Text("Off").tag("")
+                        Text("affine4 (4-bit, group 64)").tag("affine4")
+                        Text("affine8 (8-bit, group 64)").tag("affine8")
+                        Text("Custom bits / group").tag("custom")
+                    }
+                    .pickerStyle(.menu)
+                    .help(
+                        "Quantizes the KV cache during generation to cut memory on long contexts. "
+                            + "Named schemes fix bits and group size; Custom passes your own through.")
+                    if app.settings.kvScheme == "custom" {
+                        IntField(
+                            label: "KV bits", value: $app.settings.kvBits,
+                            limit: 2...8, presets: [2, 3, 4, 6, 8])
+                        IntField(
+                            label: "KV group size", value: $app.settings.kvGroupSize,
+                            limit: 32...128, presets: [32, 64, 128])
+                    }
+                    if !app.settings.kvScheme.isEmpty {
+                        IntField(
+                            label: "Quantize after tokens", value: $app.settings.quantizedKVStart,
+                            limit: 0...10_000_000, zeroMeans: "start",
+                            presets: [0, 1024, 4096, 16384])
+                            .help(
+                                "Cache stays full precision until this many tokens are in it, then quantizes.")
+                    }
+                    IntField(
+                        label: "Prefill step", value: $app.settings.prefillStepSize,
+                        limit: 64...65_536, presets: [256, 512, 1024, 2048, 4096])
+                        .help(
+                            "Prompt tokens processed per prefill chunk (MLX default 512). Larger is faster "
+                                + "on long prompts and uses more peak memory.")
                 }
 
                 collapsibleSection(
@@ -641,6 +717,14 @@ struct TuningInspector: View {
                 + "to the model at the start of the turn so it wraps up its own thinking; if it "
                 + "overruns by more than ~10%, Forge closes </think> and the answer continues — "
                 + "the run is never cut off.")
+    }
+
+    private var kvCacheSectionDetail: String {
+        switch app.settings.kvScheme {
+        case "": return "fp"
+        case "custom": return "\(app.settings.kvBits)-bit/\(app.settings.kvGroupSize)"
+        default: return app.settings.kvScheme
+        }
     }
 
     private var reasoningSectionDetail: String {

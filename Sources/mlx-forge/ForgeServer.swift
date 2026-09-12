@@ -413,6 +413,20 @@ final class ForgeServer {
         var parameters = InferenceEngine.parameters(from: defaultSettings())
         if let temperature = chat.temperature { parameters.temperature = Float(temperature) }
         if let topP = chat.top_p { parameters.topP = Float(topP) }
+        // Extended sampling fields (OpenAI names where they exist, llama.cpp/vLLM names
+        // for the rest). Each overrides the Forge default only when present.
+        if let topK = chat.top_k { parameters.topK = max(0, topK) }
+        if let minP = chat.min_p { parameters.minP = Float(minP) }
+        if let seed = chat.seed { parameters.seed = UInt64(max(0, seed)) }
+        if let presence = chat.presence_penalty {
+            parameters.presencePenalty = presence == 0 ? nil : Float(presence)
+        }
+        if let frequency = chat.frequency_penalty {
+            parameters.frequencyPenalty = frequency == 0 ? nil : Float(frequency)
+        }
+        if let repetition = chat.repetition_penalty {
+            parameters.repetitionPenalty = repetition <= 1.0 ? nil : Float(repetition)
+        }
         if let maxTokens = chat.max_tokens ?? chat.max_completion_tokens {
             parameters.maxTokens = maxTokens > 0 ? min(maxTokens, 32_768) : nil
         }
@@ -969,6 +983,12 @@ private struct ChatCompletionRequest: Decodable {
     var stream: Bool?
     var temperature: Double?
     var top_p: Double?
+    var top_k: Int?
+    var min_p: Double?
+    var seed: Int?
+    var presence_penalty: Double?
+    var frequency_penalty: Double?
+    var repetition_penalty: Double?
     var max_tokens: Int?
     var max_completion_tokens: Int?
     var tools: [JSONValue]?

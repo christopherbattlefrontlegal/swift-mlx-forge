@@ -1553,12 +1553,41 @@ final class InferenceEngine {
             : settings.reasoningEnabled
                 ? max(settings.maxTokens, 16_384)
                 : settings.maxTokens
+        // Penalties. MLX treats nil / 0 as off; each has its own look-back window.
         if settings.repetitionPenalty > 1.0 {
             parameters.repetitionPenalty = Float(settings.repetitionPenalty)
-            parameters.repetitionContextSize = 20
+            parameters.repetitionContextSize = max(1, settings.repetitionContextSize)
+        }
+        if settings.presencePenalty != 0 {
+            parameters.presencePenalty = Float(settings.presencePenalty)
+            parameters.presenceContextSize = max(1, settings.presenceContextSize)
+        }
+        if settings.frequencyPenalty != 0 {
+            parameters.frequencyPenalty = Float(settings.frequencyPenalty)
+            parameters.frequencyContextSize = max(1, settings.frequencyContextSize)
+        }
+        // Seed: 0 keeps MLX's entropy-seeded sampler; anything else is reproducible.
+        if settings.seed != 0 {
+            parameters.seed = UInt64(max(0, settings.seed))
         }
         if settings.maxKVSize > 0 {
             parameters.maxKVSize = settings.maxKVSize
+        }
+        // KV cache quantization. A named scheme overrides kvBits inside MLX
+        // (resolveAffineScheme); "custom" passes kvBits/kvGroupSize through directly.
+        switch settings.kvScheme {
+        case "affine4", "affine8":
+            parameters.kvScheme = settings.kvScheme
+            parameters.quantizedKVStart = max(0, settings.quantizedKVStart)
+        case "custom":
+            parameters.kvBits = settings.kvBits
+            parameters.kvGroupSize = settings.kvGroupSize
+            parameters.quantizedKVStart = max(0, settings.quantizedKVStart)
+        default:
+            break
+        }
+        if settings.prefillStepSize > 0 {
+            parameters.prefillStepSize = settings.prefillStepSize
         }
         return parameters
     }
