@@ -360,11 +360,27 @@ struct MarkdownText: View {
             ForEach(Self.blocks(in: text)) { block in
                 switch block.kind {
                 case .prose:
-                    Text(Self.inline(block.text))
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Prose(text: block.text)
                 case .code(let language):
                     CodeBlock(code: block.text, language: language)
+                }
+            }
+        }
+    }
+
+    /// Selectable inline-markdown prose. AppKit exposes every link in a
+    /// selectable Text as an accessibility child and re-lays out the whole
+    /// string for each one it sorts, so a link-heavy Text hangs the main thread
+    /// for seconds on any accessibility hit-test; this keeps links per Text small.
+    struct Prose: View {
+        let text: String
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(MarkdownText.linkBoundedChunks(text)) { chunk in
+                    Text(MarkdownText.cappingLinks(MarkdownText.inline(chunk.text)))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -424,6 +440,50 @@ struct MarkdownText: View {
             flushProse()
         }
         return blocks
+    }
+
+    /// Max links per selectable Text; see the prose case in `body`.
+    private static let maxLinksPerText = 8
+
+    /// Splits link-heavy prose at line boundaries so no single Text carries
+    /// more than a handful of links. Ordinary prose stays one chunk.
+    static func linkBoundedChunks(_ text: String) -> [Block] {
+        func linkCount(_ s: String) -> Int { s.components(separatedBy: "://").count - 1 }
+        guard linkCount(text) > maxLinksPerText else {
+            return [Block(id: 0, kind: .prose, text: text)]
+        }
+        var chunks: [Block] = []
+        var lines: [String] = []
+        var links = 0
+        func flush() {
+            guard !lines.isEmpty else { return }
+            chunks.append(Block(id: chunks.count, kind: .prose, text: lines.joined(separator: "\n")))
+            lines = []
+            links = 0
+        }
+        for line in text.components(separatedBy: "\n") {
+            lines.append(line)
+            links += linkCount(line)
+            if links >= maxLinksPerText { flush() }
+        }
+        flush()
+        return chunks
+    }
+
+    /// One line can still hold hundreds of links; past the cap they render as
+    /// plain text so the chunk stays cheap.
+    static func cappingLinks(_ attributed: AttributedString) -> AttributedString {
+        var result = attributed
+        var excess: [Range<AttributedString.Index>] = []
+        var seen = 0
+        for run in result.runs where run.link != nil {
+            seen += 1
+            if seen > maxLinksPerText * 2 { excess.append(run.range) }
+        }
+        for range in excess {
+            result[range].link = nil
+        }
+        return result
     }
 
     static func inline(_ text: String) -> AttributedString {

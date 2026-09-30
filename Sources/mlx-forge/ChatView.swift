@@ -358,8 +358,7 @@ struct MessageView: View {
                 // very large content and opens the popup without blocking send.
                 VStack(alignment: .leading, spacing: Theme.s2) {
                     ScrollView(.vertical, showsIndicators: true) {
-                        Text(MarkdownText.inline(message.content))
-                            .textSelection(.enabled)
+                        MarkdownText.Prose(text: message.content)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 280)
