@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Observation
 import PDFKit
@@ -38,6 +39,22 @@ enum SpeechStudioError: LocalizedError {
     var errorDescription: String? { if case .message(let text) = self { text } else { nil } }
 }
 
+/// Which synthesizer narrates: xAI's Grok voices (cloud) or the Mac's own voices.
+enum SpeechEngine {
+    case grok
+    case system
+}
+
+struct GrokVoice: Identifiable, Hashable {
+    let id: String
+    let name: String
+
+    /// Shown until the live list loads from the API.
+    static let builtIn = ["eve", "ara", "leo", "rex", "sal"].map {
+        GrokVoice(id: $0, name: $0.capitalized)
+    }
+}
+
 @MainActor
 @Observable
 final class SpeechStudio: NSObject, NSSpeechSynthesizerDelegate {
@@ -56,11 +73,23 @@ final class SpeechStudio: NSObject, NSSpeechSynthesizerDelegate {
     private var pendingURL: URL?
     private var cancelled = false
 
+    /// Grok whenever an xAI key exists; Mac voices are only the no-key fallback.
+    var engine: SpeechEngine { SecretsStore.hasXAIKey ? .grok : .system }
+    var grokVoiceID = UserDefaults.standard.string(forKey: "speech.grokVoice") ?? "eve"
+    var grokSpeed: Double = 1.0
+    private(set) var grokVoices = GrokVoice.builtIn
+    private var cloudTask: Task<Void, Never>?
+    private var player: AVAudioPlayer?
+
     var wordCount: Int { text.split(whereSeparator: { $0.isWhitespace }).count }
 
     func start(preview: Bool = false, export: Bool = false) {
         guard !busy, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         error = ""
+        if engine == .grok {
+            startGrok(preview: preview, export: export)
+            return
+        }
         guard let speaker = NSSpeechSynthesizer(voice: .init(rawValue: voiceID)) else {
             error = "This voice is unavailable. Select another voice or install one in System Settings."
             return
@@ -100,7 +129,13 @@ final class SpeechStudio: NSObject, NSSpeechSynthesizerDelegate {
 
     func togglePause() {
         guard busy, !exporting else { return }
-        if paused { synthesizer?.continueSpeaking() } else { synthesizer?.pauseSpeaking(at: .immediateBoundary) }
+        if let player {
+            if paused { player.play() } else { player.pause() }
+        } else if paused {
+            synthesizer?.continueSpeaking()
+        } else {
+            synthesizer?.pauseSpeaking(at: .immediateBoundary)
+        }
         paused.toggle()
         status = paused ? "Paused" : "Reading…"
     }
@@ -112,11 +147,83 @@ final class SpeechStudio: NSObject, NSSpeechSynthesizerDelegate {
         synthesizer = nil
         speaker?.delegate = nil
         speaker?.stopSpeaking()
+        cloudTask?.cancel()
+        cloudTask = nil
+        player?.stop()
+        player = nil
         cleanupPending()
         busy = false
         paused = false
         exporting = false
         status = "Stopped."
+    }
+
+    // MARK: - Grok (xAI) voices
+
+    func refreshGrokVoices() {
+        guard SecretsStore.hasXAIKey else { return }
+        Task {
+            guard let voices = try? await MediaGenClient.grokVoices(), !voices.isEmpty else { return }
+            grokVoices = voices.map { GrokVoice(id: $0.id, name: $0.name) }
+            if !grokVoices.contains(where: { $0.id == grokVoiceID }) {
+                grokVoiceID = grokVoices[0].id
+            }
+        }
+    }
+
+    /// Cloud speech arrives as a finished file, so reading aloud is
+    /// generate-then-play; `exporting` covers the generation phase.
+    private func startGrok(preview: Bool, export: Bool) {
+        let script = preview ? String(text.prefix(500)) : text
+        let voice = grokVoiceID
+        let speed = grokSpeed
+        cancelled = false
+        busy = true
+        paused = false
+        exporting = true
+        status = "Generating Grok audio…"
+        cloudTask = Task { [weak self] in
+            do {
+                let audio = try await MediaGenClient.grokSpeech(
+                    text: script, voiceID: voice, speed: speed
+                ) { part, total in
+                    guard total > 1 else { return }
+                    Task { @MainActor in self?.status = "Generating part \(part) of \(total)…" }
+                }
+                guard let self, !Task.isCancelled else { return }
+                if export {
+                    let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("Forge/Media", isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    let url = directory.appendingPathComponent("narration-\(UUID().uuidString).mp3")
+                    try audio.write(to: url, options: .atomic)
+                    self.savedURL = url
+                    self.status = "Audio saved."
+                } else {
+                    let player = try AVAudioPlayer(data: audio)
+                    player.volume = Float(self.volume)
+                    self.player = player
+                    self.exporting = false
+                    self.status = preview ? "Previewing the first 500 characters…" : "Reading…"
+                    player.play()
+                    while !Task.isCancelled, self.player === player, player.isPlaying || self.paused {
+                        try? await Task.sleep(for: .milliseconds(200))
+                    }
+                    guard !Task.isCancelled, self.player === player else { return }
+                    self.player = nil
+                    self.status = "Finished reading."
+                }
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.error = error.localizedDescription
+                self.status = "Speech failed."
+            }
+            guard let self else { return }
+            self.busy = false
+            self.paused = false
+            self.exporting = false
+            self.cloudTask = nil
+        }
     }
 
     private func cleanupPending() {
@@ -165,14 +272,21 @@ struct SpeechStudioView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     Label("Text to Speech", systemImage: "waveform").font(.title2.bold())
-                    Text("Turn a document into spoken narration using voices on your Mac.")
+                    Text(studio.engine == .grok
+                        ? "Turn a document into spoken narration with xAI’s Grok voices."
+                        : "Turn a document into spoken narration using voices on your Mac.")
                         .font(.callout).foregroundStyle(.secondary)
+                    if studio.engine == .grok {
+                        grokControls
+                    } else {
                     Picker("Reader’s voice", selection: $studio.voiceID) {
                         ForEach(voices, id: \.rawValue) { voice in
                             Text(voiceLabel(voice)).tag(voice.rawValue)
                         }
                     }
                     Button("Refresh installed voices") { voices = NSSpeechSynthesizer.availableVoices }
+                    Text("Add an xAI API key in Settings to narrate with Grok voices instead.")
+                        .font(.caption).foregroundStyle(.orange)
                     Text("Add voices in System Settings → Accessibility → Read & Speak (Spoken Content on older macOS versions).")
                         .font(.caption).foregroundStyle(.secondary)
                     Picker("Reading pace preset", selection: $style) {
@@ -192,6 +306,7 @@ struct SpeechStudioView: View {
                         Slider(value: $studio.rate, in: 80...400, step: 5)
                             .accessibilityLabel("Words per minute")
                         Text("Actual pace varies by voice and punctuation.").font(.caption).foregroundStyle(.secondary)
+                    }
                     }
                     VStack(alignment: .leading) {
                         Text("Volume: \(Int(studio.volume * 100))%")
@@ -252,7 +367,7 @@ struct SpeechStudioView: View {
                 }
                 if let url = studio.savedURL {
                     HStack {
-                        Label("Saved narration (AIFF)", systemImage: "waveform")
+                        Label("Saved narration (\(url.pathExtension.uppercased()))", systemImage: "waveform")
                         Button("Play Audio") { NSWorkspace.shared.open(url) }
                         Button("Save a Copy…") { saveCopy(url) }
                         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
@@ -278,13 +393,35 @@ struct SpeechStudioView: View {
             case .failure(let error): studio.error = error.localizedDescription
             }
         }
-        .onAppear { refreshRecordings() }
+        .onAppear {
+            refreshRecordings()
+            if studio.engine == .grok { studio.refreshGrokVoices() }
+        }
         .onChange(of: studio.savedURL) { _, _ in refreshRecordings() }
+        .onChange(of: studio.grokVoiceID) { _, voice in
+            UserDefaults.standard.set(voice, forKey: "speech.grokVoice")
+        }
         .onDisappear { studio.stop() }
     }
 
+    @ViewBuilder
+    private var grokControls: some View {
+        Picker("Grok voice", selection: $studio.grokVoiceID) {
+            ForEach(studio.grokVoices) { Text($0.name).tag($0.id) }
+        }
+        Button("Refresh Grok voices") { studio.refreshGrokVoices() }
+        VStack(alignment: .leading) {
+            Text("Speed: \(studio.grokSpeed.formatted(.number.precision(.fractionLength(2))))×")
+            Slider(value: $studio.grokSpeed, in: 0.7...1.5, step: 0.05)
+                .accessibilityLabel("Speech speed")
+        }
+        Text("Long documents are generated in parts and joined into one MP3. Delivery tags work inline: [pause], [laugh], <whisper>…</whisper>, <slow>…</slow>.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
     private var estimatedDuration: String {
-        let seconds = Int(ceil(Double(studio.wordCount) / studio.rate * 60))
+        let wordsPerMinute = studio.engine == .grok ? 150 * studio.grokSpeed : studio.rate
+        let seconds = Int(ceil(Double(studio.wordCount) / wordsPerMinute * 60))
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 
@@ -292,7 +429,7 @@ struct SpeechStudioView: View {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Forge/Media", isDirectory: true)
         recordings = ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.creationDateKey])) ?? [])
-            .filter { $0.pathExtension.lowercased() == "aiff" }
+            .filter { ["aiff", "mp3"].contains($0.pathExtension.lowercased()) }
             .sorted {
                 ((try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast)
                     > ((try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast)
@@ -300,7 +437,8 @@ struct SpeechStudioView: View {
     }
 
     private var canStart: Bool {
-        !studio.busy && !readingDocument && !voices.isEmpty && studio.wordCount > 0
+        !studio.busy && !readingDocument && studio.wordCount > 0
+            && (studio.engine == .grok ? SecretsStore.hasXAIKey : !voices.isEmpty)
     }
 
     private func voiceLabel(_ voice: NSSpeechSynthesizer.VoiceName) -> String {
@@ -312,8 +450,9 @@ struct SpeechStudioView: View {
 
     private func saveCopy(_ url: URL) {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.aiff]
-        panel.nameFieldStringValue = "\((studio.documentName as NSString).deletingPathExtension).aiff"
+        panel.allowedContentTypes = [UTType(filenameExtension: url.pathExtension) ?? .audio]
+        panel.nameFieldStringValue =
+            "\((studio.documentName as NSString).deletingPathExtension).\(url.pathExtension)"
         panel.begin { response in
             guard response == .OK, let destination = panel.url, destination != url else { return }
             do { try Data(contentsOf: url).write(to: destination, options: .atomic) }

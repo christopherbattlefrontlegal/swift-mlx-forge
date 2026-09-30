@@ -1,9 +1,9 @@
 // Forge — cloud media generation clients and the on-disk media library.
 //
 // One home for every generation API the Media Studio speaks: OpenAI images
-// (gpt-image-1), xAI Grok images, and OpenAI Sora video jobs. Video is an
-// async job API; the client polls until the render completes and returns the
-// MP4 bytes. Generated assets land in Application Support/Forge/Media.
+// (gpt-image-1), xAI Grok images, OpenAI Sora video jobs, and xAI Grok
+// text-to-speech. Video is an async job API; the client polls until the render
+// completes and returns the MP4 bytes. Generated assets land in Application Support/Forge/Media.
 
 import Foundation
 import Observation
@@ -177,6 +177,65 @@ enum MediaGenClient {
         throw MediaGenError.timeout
     }
 
+    // MARK: - Speech (xAI Grok TTS)
+
+    /// xAI caps one /v1/tts request at 60,000 characters; stay under it so
+    /// multi-scalar characters cannot push a chunk over.
+    static let grokSpeechChunkLimit = 48_000
+
+    /// Built-in voices from `GET /v1/tts/voices`.
+    static func grokVoices() async throws -> [(id: String, name: String)] {
+        guard let key = SecretsStore.xaiAPIKey else { throw MediaGenError.noKey("xAI") }
+        let json = try await getJSON(url: "https://api.x.ai/v1/tts/voices", key: key)
+        guard let voices = json["voices"] as? [[String: Any]] else {
+            throw MediaGenError.badResponse("no voices array")
+        }
+        return voices.compactMap { voice in
+            guard let id = voice["voice_id"] as? String else { return nil }
+            return (id, (voice["name"] as? String) ?? id.capitalized)
+        }
+    }
+
+    /// Narrates `text` as one MP3. Text past the per-request cap is sent in
+    /// parts and the MP3 frames are joined; `onPart` reports (part, total).
+    static func grokSpeech(
+        text: String, voiceID: String, speed: Double,
+        onPart: @escaping @Sendable (Int, Int) -> Void
+    ) async throws -> Data {
+        guard let key = SecretsStore.xaiAPIKey else { throw MediaGenError.noKey("xAI") }
+        let chunks = speechChunks(text, limit: grokSpeechChunkLimit)
+        var audio = Data()
+        for (index, chunk) in chunks.enumerated() {
+            try Task.checkCancellation()
+            onPart(index + 1, chunks.count)
+            let body: [String: Any] = [
+                "text": chunk, "voice_id": voiceID, "language": "auto",
+                "speed": min(max(speed, 0.7), 1.5),
+                "output_format": ["codec": "mp3", "sample_rate": 44100, "bit_rate": 128000],
+            ]
+            audio.append(try await postForData(url: "https://api.x.ai/v1/tts", key: key, body: body))
+        }
+        guard !audio.isEmpty else { throw MediaGenError.badResponse("no audio returned") }
+        return audio
+    }
+
+    /// Splits at the last paragraph break, else sentence end, inside each window.
+    static func speechChunks(_ text: String, limit: Int) -> [String] {
+        var chunks: [String] = []
+        var rest = Substring(text)
+        while rest.count > limit {
+            let window = rest.prefix(limit)
+            let cut =
+                window.lastIndex(of: "\n").map { window.index(after: $0) }
+                ?? window.range(of: ". ", options: .backwards)?.upperBound
+                ?? window.endIndex
+            chunks.append(String(rest[..<cut]))
+            rest = rest[cut...]
+        }
+        chunks.append(String(rest))
+        return chunks.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
     // MARK: - HTTP primitives
 
     private static func postJSON(
@@ -190,6 +249,23 @@ enum MediaGenClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: request)
         return try decodeJSON(data: data, response: response)
+    }
+
+    /// POST that returns the raw response body (audio bytes), with API errors decoded.
+    private static func postForData(
+        url: String, key: String, body: [String: Any]
+    ) async throws -> Data {
+        var request = URLRequest(url: URL(string: url)!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 600
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode >= 300 {
+            _ = try decodeJSON(data: data, response: response)
+        }
+        return data
     }
 
     private static func getJSON(url: String, key: String) async throws -> [String: Any] {
