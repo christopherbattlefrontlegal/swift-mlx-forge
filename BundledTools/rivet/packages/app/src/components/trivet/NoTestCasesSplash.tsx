@@ -69,7 +69,7 @@ export const NoTestCasesSplash: FC<{
             Create Test Case
           </Button>
           <Button appearance="default" onClick={syncWrapper(viewDocumentation)}>
-            View Trivet Documentation
+            View Test Documentation
           </Button>
         </div>
       </div>

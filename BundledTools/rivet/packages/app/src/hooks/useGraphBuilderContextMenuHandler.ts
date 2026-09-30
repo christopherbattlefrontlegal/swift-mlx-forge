@@ -48,6 +48,15 @@ export function useGraphBuilderContextMenuHandler({ onAutoLayoutGraph }: { onAut
             position: clientToCanvasPosition(meta.x, meta.y),
           });
         })
+        .with(P.string.startsWith('add-ai-model:'), () => {
+          const { model, title } = data as { model: string; title: string };
+          addNode({
+            nodeType: 'chat',
+            position: clientToCanvasPosition(meta.x, meta.y),
+            data: { model },
+            title,
+          });
+        })
         .with('node-delete', () => {
           const { nodeId: toDeleteNodeId } = context.data as { nodeId: NodeId };
           const node = nodesById[toDeleteNodeId] as BuiltInNodes;

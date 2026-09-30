@@ -79,9 +79,6 @@ export const CommunityOverlay: FC = () => {
               My Templates
             </ButtonItem>
           </Section>
-          <Section title="Links">
-            <ButtonItem>Discord</ButtonItem>
-          </Section>
         </SideNavigation>
         <div className="selected-nav-area">
           {match(selectedNav)

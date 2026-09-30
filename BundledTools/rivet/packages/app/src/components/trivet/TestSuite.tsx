@@ -331,7 +331,7 @@ export const TestSuite: FC<{ testSuite: TrivetTestSuite; tryRunTests: TryRunTest
       <div className="view-documentation">
         <a onClick={syncWrapper(viewDocumentation)}>
           {/* TODO wrong icon, want external url icon */}
-          <BrowserLineIcon /> Trivet Documentation
+          <BrowserLineIcon /> Test Documentation
         </a>
       </div>
     </div>

@@ -358,7 +358,7 @@ final class ForgeServer {
 
     private func handleModels(on connection: NWConnection, allowOrigin: String?) async {
         let loadedNames = Set(engine?.loadedModels.map(\.model.name) ?? [])
-        let models = (store?.localModels ?? []).map { model -> [String: Any] in
+        var models = (store?.localModels ?? []).map { model -> [String: Any] in
             [
                 "id": model.name,
                 "object": "model",
@@ -366,8 +366,156 @@ final class ForgeServer {
                 "loaded": loadedNames.contains(model.name),
             ]
         }
+        // Cloud models the user has a key for, under provider-prefixed ids that
+        // /v1/chat/completions forwards (see `cloudRoute`). Lists come from the
+        // live provider catalogs, so graph clients never carry a stale model list.
+        for provider in CloudProvider.allCases where provider.apiKey != nil {
+            for model in CloudModelCatalog.chatModels(provider) {
+                models.append([
+                    "id": "\(Self.gatewayPrefix(provider))/\(model.id)", "object": "model",
+                    "owned_by": provider.label, "name": model.label,
+                ])
+            }
+        }
+        if SecretsStore.hasOpenRouterKey {
+            for id in UserDefaults.standard.stringArray(forKey: "openrouter.models") ?? [] {
+                models.append([
+                    "id": "openrouter/\(id)", "object": "model",
+                    "owned_by": "OpenRouter", "name": OpenRouterClient.label(for: id),
+                ])
+            }
+        }
         await HTTPResponse.sendJSON(
             on: connection, object: ["object": "list", "data": models], allowOrigin: allowOrigin)
+    }
+
+    // MARK: - Cloud gateway
+
+    private struct CloudGateway {
+        let provider: String
+        let url: String
+        let key: String?
+        let model: String
+    }
+
+    nonisolated private static func gatewayPrefix(_ provider: CloudProvider) -> String {
+        switch provider {
+        case .openAI: return "openai"
+        case .anthropic: return "anthropic"
+        case .xAI: return "xai"
+        }
+    }
+
+    /// Maps a provider-prefixed model id to that provider's OpenAI-compatible
+    /// chat endpoint. Nil for anything that is not a cloud id.
+    nonisolated private static func cloudGateway(for model: String) -> CloudGateway? {
+        var parts = model.split(separator: "/", maxSplits: 1).map(String.init)
+        if parts.count == 1 {
+            // Graphs saved before the gateway carry bare provider ids ("gpt-5").
+            let bare = model.lowercased()
+            if bare.hasPrefix("gpt-") || bare.hasPrefix("chatgpt-")
+                || bare.range(of: #"^o\d"#, options: .regularExpression) != nil
+            {
+                parts = ["openai", model]
+            } else if bare.hasPrefix("claude-") {
+                parts = ["anthropic", model]
+            } else if bare.hasPrefix("grok-") {
+                parts = ["xai", model]
+            }
+        }
+        guard parts.count == 2, !parts[1].isEmpty else { return nil }
+        switch parts[0] {
+        case "openai":
+            return CloudGateway(
+                provider: "OpenAI", url: "https://api.openai.com/v1/chat/completions",
+                key: SecretsStore.openAIAPIKey, model: parts[1])
+        case "anthropic":
+            return CloudGateway(
+                provider: "Anthropic", url: "https://api.anthropic.com/v1/chat/completions",
+                key: SecretsStore.anthropicAPIKey, model: parts[1])
+        case "xai":
+            return CloudGateway(
+                provider: "xAI", url: "https://api.x.ai/v1/chat/completions",
+                key: SecretsStore.xaiAPIKey, model: parts[1])
+        case "openrouter":
+            return CloudGateway(
+                provider: "OpenRouter", url: "https://openrouter.ai/api/v1/chat/completions",
+                key: SecretsStore.openRouterAPIKey, model: parts[1])
+        default:
+            return nil
+        }
+    }
+
+    /// Forwards the request body unchanged (apart from the bare model id) and
+    /// relays the provider's response, so the key never leaves Forge.
+    private func handleCloudChat(
+        _ request: HTTPRequest, gateway: CloudGateway, stream: Bool,
+        on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard let key = gateway.key else {
+            await HTTPResponse.sendError(
+                on: connection, status: "401 Unauthorized",
+                message: "No \(gateway.provider) API key set. Add one in Forge Settings.",
+                allowOrigin: allowOrigin)
+            return
+        }
+        guard var body = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
+        else {
+            await HTTPResponse.sendError(
+                on: connection, status: "400 Bad Request",
+                message: "Invalid request body.", allowOrigin: allowOrigin)
+            return
+        }
+        body["model"] = gateway.model
+        var upstream = URLRequest(url: URL(string: gateway.url)!)
+        upstream.httpMethod = "POST"
+        upstream.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        upstream.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        upstream.timeoutInterval = 600
+        upstream.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        var headSent = false
+        do {
+            guard stream else {
+                let (data, response) = try await URLSession.shared.data(for: upstream)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 502
+                await HTTPResponse.send(
+                    on: connection, status: Self.statusLine(code),
+                    contentType: "application/json", body: data, allowOrigin: allowOrigin)
+                return
+            }
+            let (bytes, response) = try await URLSession.shared.bytes(for: upstream)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 502
+            guard code < 300 else {
+                var data = Data()
+                for try await byte in bytes { data.append(byte) }
+                await HTTPResponse.send(
+                    on: connection, status: Self.statusLine(code),
+                    contentType: "application/json", body: data, allowOrigin: allowOrigin)
+                return
+            }
+            await HTTPResponse.sendHead(
+                on: connection, status: "200 OK", contentType: "text/event-stream",
+                allowOrigin: allowOrigin)
+            headSent = true
+            // `lines` drops the blank separators SSE needs; restore one after
+            // every field line that ends an event.
+            for try await line in bytes.lines {
+                let terminator = line.hasPrefix("event:") ? "\n" : "\n\n"
+                guard await HTTPResponse.sendRaw(on: connection, line + terminator) else { break }
+            }
+        } catch {
+            // Mid-stream failures just end the stream; a second head would corrupt it.
+            guard !headSent else { return }
+            await HTTPResponse.sendError(
+                on: connection, status: "502 Bad Gateway",
+                message: "\(gateway.provider) request failed: \(error.localizedDescription)",
+                allowOrigin: allowOrigin)
+        }
+    }
+
+    nonisolated private static func statusLine(_ code: Int) -> String {
+        "\(code) \(HTTPURLResponse.localizedString(forStatusCode: code).capitalized)"
     }
 
     private func handleChat(
@@ -380,6 +528,15 @@ final class ForgeServer {
             await HTTPResponse.sendError(
                 on: connection, status: "400 Bad Request",
                 message: "Invalid request body.", allowOrigin: allowOrigin)
+            return
+        }
+
+        if store?.localModels.contains(where: { $0.name == chat.model }) != true,
+            let gateway = Self.cloudGateway(for: chat.model)
+        {
+            await handleCloudChat(
+                request, gateway: gateway, stream: chat.stream ?? false,
+                on: connection, allowOrigin: allowOrigin)
             return
         }
 

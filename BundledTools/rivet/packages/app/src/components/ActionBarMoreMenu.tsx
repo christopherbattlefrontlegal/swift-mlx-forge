@@ -140,7 +140,7 @@ export const ActionBarMoreMenu: FC<{
         <ForwardCircleIcon /> Load Recording
       </div>
       <div className="menu-item menu-item-button copy-inputs-as-trivet-json" onClick={onCopyAsTestCase}>
-        <CopyIcon /> Copy Inputs for Trivet
+        <CopyIcon /> Copy Inputs for Forge Tests
       </div>
       <div className="menu-item menu-item-button settings" onClick={openSettings}>
         <GearIcon /> Settings
