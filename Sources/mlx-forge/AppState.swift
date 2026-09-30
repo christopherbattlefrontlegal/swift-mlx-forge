@@ -1010,7 +1010,7 @@ final class AppState {
     private func mcpEnrichedSystemPrompt(for conversation: Conversation) async -> String {
         let base = baseSystemPrompt(for: conversation)
         let tools = await mcp.prepareToolCatalogForPrompt()
-        return systemPromptWithMCPInstructions(base: base, tools: tools)
+        return systemPromptWithMCPInstructions(base: baseWithServerInstructions(base), tools: tools)
     }
 
     /// System prompt plus the live tool bindings, for backends with native tool
@@ -1028,9 +1028,15 @@ final class AppState {
             Use them when they help answer the user; after a tool result arrives, answer \
             the user's question in normal prose — do not echo raw JSON unless asked.
             """
-        let system = base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? note : base + "\n\n" + note
+        let enriched = baseWithServerInstructions(base)
+        let system = enriched.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? note : enriched + "\n\n" + note
         return (system, tools)
+    }
+
+    private func baseWithServerInstructions(_ base: String) -> String {
+        let guidance = mcp.instructionsForPrompt()
+        return [base, guidance].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     /// Active system instructions for UI delineation and new turns.
@@ -1102,7 +1108,7 @@ final class AppState {
     private func systemPrompt(for conversation: Conversation, includeMCP: Bool) -> String {
         let base = baseSystemPrompt(for: conversation)
         guard includeMCP else { return base }
-        return systemPromptWithMCPInstructions(base: base, tools: mcp.selectedPromptTools())
+        return systemPromptWithMCPInstructions(base: baseWithServerInstructions(base), tools: mcp.selectedPromptTools())
     }
 
     private func systemPromptWithMCPInstructions(
@@ -1110,14 +1116,14 @@ final class AppState {
     ) -> String {
         guard !tools.isEmpty else { return base }
         let toolLines = tools.prefix(80).map { binding in
-            let description = Self.clippedForPrompt(binding.tool.description, max: 160)
+            let description = binding.tool.description
             var line = "- server: \"\(binding.serverID)\", tool: \"\(binding.tool.name)\""
             if !description.isEmpty { line += ": \(description)" }
             // Local models only see tools as prompt text, so the argument schema
             // must ride along or parameters like read_file's "offset" are invisible
             // and the model cannot page long results.
             if let schema = binding.tool.inputSchemaJSON, !schema.isEmpty {
-                line += "\n  arguments schema: \(Self.clippedForPrompt(schema, max: 800))"
+                line += "\n  arguments schema: \(schema)"
             }
             return line
         }.joined(separator: "\n")

@@ -125,6 +125,19 @@ final class MCPManager {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// Instructions returned by a trusted server's MCP initialize response.
+    private var serverInstructions: [String: String] = [:]
+
+    func instructionsForPrompt() -> String {
+        entries.compactMap { entry in
+            guard isServerEnabled(entry.id), case .connected = entry.status,
+                  !effectiveSelectedTools(for: entry.id).isEmpty,
+                  let instructions = serverInstructions[entry.id], !instructions.isEmpty
+            else { return nil }
+            return "MCP server \(entry.id) guidance:\n" + instructions
+        }.joined(separator: "\n\n")
+    }
+
     private var watcher: DispatchSourceFileSystemObject?
     /// Live stdio MCP processes keyed by mcp.json server id (e.g. desktop-commander).
     private var stdioSessions: [String: MCPStdioSession] = [:]
@@ -567,11 +580,12 @@ final class MCPManager {
         let generation = beginConnection(entryID)
         Task {
             do {
-                let tools = try await MCPHTTPClient(endpoint: url, extraHeaders: headers)
-                    .listTools()
+                let discovery = try await MCPHTTPClient(endpoint: url, extraHeaders: headers)
+                    .discover()
                 guard self.connectionIsCurrent(entryID, generation: generation) else { return }
-                self.configureDefaultTool(for: entryID, tools: tools)
-                self.setStatus(entryID, .connected(tools: tools))
+                self.serverInstructions[entryID] = discovery.instructions
+                self.configureDefaultTool(for: entryID, tools: discovery.tools)
+                self.setStatus(entryID, .connected(tools: discovery.tools))
             } catch {
                 guard self.connectionIsCurrent(entryID, generation: generation) else { return }
                 self.setStatus(entryID, .failed(error.localizedDescription))
@@ -593,6 +607,7 @@ final class MCPManager {
                     return
                 }
                 self.stdioSessions[entryID] = launched.0
+                self.serverInstructions[entryID] = launched.2
                 self.configureDefaultTool(for: entryID, tools: launched.1)
                 self.setStatus(entryID, .connected(tools: launched.1))
             } catch {
@@ -605,6 +620,7 @@ final class MCPManager {
 
     private func beginConnection(_ entryID: String) -> UInt64 {
         let generation = (connectionGenerations[entryID] ?? 0) &+ 1
+        serverInstructions[entryID] = nil
         connectionGenerations[entryID] = generation
         return generation
     }
@@ -631,13 +647,15 @@ final class MCPManager {
 
     private func openStdioSession(
         entryID: String, command: String, args: [String], env: [String: String]
-    ) async throws -> (MCPStdioSession, [MCPTool]) {
+    ) async throws -> (MCPStdioSession, [MCPTool], String?) {
         let commandCopy = command
         let argsCopy = args
         let envCopy = env
         let launched = try await Task.detached {
             let session = try MCPStdioSession(command: commandCopy, args: argsCopy, env: envCopy)
-            _ = try session.request(
+            var connected = false
+            defer { if !connected { session.stop() } }
+            let initialized = try session.request(
                 id: 1,
                 method: "initialize",
                 params: [
@@ -655,7 +673,8 @@ final class MCPManager {
                     description: (tool["description"] as? String) ?? "",
                     inputSchemaJSON: Self.serializedInputSchema(from: tool))
             }
-            return (session, tools)
+            connected = true
+            return (session, tools, initialized["instructions"] as? String)
         }.value
         return launched
     }
@@ -1102,6 +1121,10 @@ struct MCPHTTPClient {
     let extraHeaders: [String: String]
 
     func listTools() async throws -> [MCPTool] {
+        try await discover().tools
+    }
+
+    func discover() async throws -> (tools: [MCPTool], instructions: String?) {
         let (initialized, sessionID) = try await rpc(
             id: 1, method: "initialize",
             params: [
@@ -1116,14 +1139,15 @@ struct MCPHTTPClient {
         let (result, _) = try await rpc(
             id: 2, method: "tools/list", params: [String: String](),
             sessionID: sessionID)
-        guard let tools = result["tools"] as? [[String: Any]] else { return [] }
-        return tools.compactMap { tool in
+        let tools = result["tools"] as? [[String: Any]] ?? []
+        let catalog = tools.compactMap { tool -> MCPTool? in
             guard let name = tool["name"] as? String else { return nil }
             return MCPTool(
                 name: name,
                 description: (tool["description"] as? String) ?? "",
                 inputSchemaJSON: MCPManager.serializedInputSchema(from: tool))
         }
+        return (catalog, initialized["instructions"] as? String)
     }
 
     /// Perform a full initialize + tools/call in one go (stateless per-invocation).
