@@ -38,26 +38,23 @@ enum MLXGenRoute: String, CaseIterable, Sendable {
         }
     }
 
-    /// WIDTHxHEIGHT choices, fastest first. Bernini's official canvas is
-    /// 848x480 at 81 frames and 40 steps; measured on an M3 Ultra that ran past
-    /// 30 minutes, while 480x272 at 49 frames and 20 steps took three minutes
-    /// with the reference likeness intact. H3 needs multiples of 32 and
+    /// WIDTHxHEIGHT choices. Bernini renders 480x272 at 49 frames and 20 steps
+    /// in three minutes on an M3 Ultra with the reference likeness intact; its
+    /// official 848x480, 81-frame, 40-step profile ran past 30 minutes here
+    /// without finishing, so it is not offered. H3 needs multiples of 32 and
     /// validates at 960x544.
     var sizes: [String] {
         switch self {
-        case .berniniReference: return ["480x272", "272x480", "848x480", "480x848"]
+        case .berniniReference: return ["480x272", "272x480"]
         case .h3FirstFrame: return ["960x544", "544x960"]
         }
     }
 
-    /// Clip length and denoise steps for a canvas: Bernini's official profile
-    /// on its official canvas, the three-minute profile on the smaller ones.
+    /// Clip length and denoise steps for the route.
     func profile(width: Int, height: Int) -> (frames: Int, steps: Int) {
         switch self {
-        case .berniniReference:
-            return max(width, height) >= 848 ? (81, 40) : (49, 20)
-        case .h3FirstFrame:
-            return (124, 8)
+        case .berniniReference: return (49, 20)
+        case .h3FirstFrame: return (124, 8)
         }
     }
 
