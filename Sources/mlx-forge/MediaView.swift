@@ -73,8 +73,25 @@ struct MediaView: View {
 
     private var generatePanel: some View {
         VStack(alignment: .leading, spacing: Theme.s4) {
-            Label("Media Studio", systemImage: "wand.and.stars")
-                .font(.headline)
+            HStack {
+                Label("Media Studio", systemImage: "wand.and.stars")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    do {
+                        try StudioLauncher.open()
+                    } catch {
+                        errorText = error.localizedDescription
+                    }
+                } label: {
+                    Label("Music Video Studio", systemImage: "music.mic")
+                }
+                .controlSize(.small)
+                .help(
+                    StudioLauncher.isAvailable
+                        ? "Open Claude Code in the music video workspace (\(StudioLauncher.launcherPath()))"
+                        : "No launcher at \(StudioLauncher.launcherPath()); set it in Settings, Local Video")
+            }
 
             Picker("Provider", selection: $provider) {
                 ForEach(MediaProvider.allCases) { p in
