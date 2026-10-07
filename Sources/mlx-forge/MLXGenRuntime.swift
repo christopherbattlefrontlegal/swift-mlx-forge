@@ -75,7 +75,15 @@ enum MLXGenRoute: String, CaseIterable, Sendable {
             // package; its smaller bf16 repack downloads but cannot be selected.
             return ["ByteDance/Bernini-R-1.3B-Diffusers"]
         case .h3FirstFrame:
-            return ["MiniMaxAI/MiniMax-H3", "lightx2v/Minimax-h3-Turbo"]
+            return ["MiniMaxAI/MiniMax-H3"]
+        }
+    }
+
+    /// Adapter files mlx-gen keeps in its own LoRA cache, relative to that cache.
+    var requiredLoRAs: [String] {
+        switch self {
+        case .berniniReference: return []
+        case .h3FirstFrame: return ["minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors"]
         }
     }
 
@@ -99,8 +107,12 @@ struct MLXGenPaths: Equatable, Sendable {
         return NSHomeDirectory() + "/.cache/huggingface"
     }
 
+    /// Where `mlxgen download` puts Turbo adapters (mflux's LoRA cache).
+    static let defaultLoRACache = NSHomeDirectory() + "/Library/Caches/mflux/loras"
+
     var executable: String
     var hfHome: String
+    var loraCache: String = MLXGenPaths.defaultLoRACache
 
     static func load(defaults: UserDefaults = .standard) -> MLXGenPaths {
         func value(_ key: String, _ fallback: String) -> String {
@@ -145,6 +157,9 @@ struct MLXGenPaths: Equatable, Sendable {
         }
         for repo in route.requiredRepos where !isDownloaded(repo, fileManager: fileManager) {
             items.append("\(hubDirectory)/\(Self.cacheFolder(for: repo)) (run: \(route.downloadCommand))")
+        }
+        for lora in route.requiredLoRAs where !fileManager.fileExists(atPath: loraCache + "/" + lora) {
+            items.append("\(loraCache)/\(lora) (run: \(route.downloadCommand))")
         }
         return items
     }
