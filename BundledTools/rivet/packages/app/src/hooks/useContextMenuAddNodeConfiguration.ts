@@ -16,54 +16,67 @@ export const addContextMenuGroups = [
   {
     id: 'add-node-group:common',
     label: 'Common',
+    infoBox: { title: 'Common', description: 'The blocks most flows start with: text, AI chat, and graph inputs and outputs.' },
   },
   {
     id: 'add-node-group:text',
     label: 'Text',
+    infoBox: { title: 'Text', description: 'Write, combine, split, and search text — prompts, templates, and extraction.' },
   },
   {
     id: 'add-node-group:ai',
     label: 'AI',
+    infoBox: { title: 'AI', description: 'Blocks that call a model or shape what goes into one.' },
   },
   {
     id: 'add-node-group:lists',
     label: 'Lists',
+    infoBox: { title: 'Lists', description: 'Work with many items at once: filter, join, slice, shuffle.' },
   },
   {
     id: 'add-node-group:numbers',
     label: 'Numbers',
+    infoBox: { title: 'Numbers', description: 'Math, comparisons, and random numbers.' },
   },
   {
     id: 'add-node-group:objects',
     label: 'Objects',
+    infoBox: { title: 'Objects', description: 'Build and pick apart structured data (JSON).' },
   },
   {
     id: 'add-node-group:data',
     label: 'Data',
+    infoBox: { title: 'Data', description: 'Read and write data sets, files, and saved values.' },
   },
   {
     id: 'add-node-group:logic',
     label: 'Logic',
+    infoBox: { title: 'Logic', description: 'Make decisions: if/else, match, loops, and waiting.' },
   },
   {
     id: 'add-node-group:input-output',
     label: 'Input/Output',
+    infoBox: { title: 'Input/Output', description: 'Bring things in and send things out: files, web requests, user questions.' },
   },
   {
     id: 'add-node-group:convenience',
     label: 'Convenience',
+    infoBox: { title: 'Convenience', description: 'Shortcuts that bundle several steps into one block.' },
   },
   {
     id: 'add-node-group:advanced',
     label: 'Advanced',
+    infoBox: { title: 'Advanced', description: 'Code, subgraphs, and other power tools.' },
   },
   {
     id: 'add-node-group:custom',
     label: 'Custom',
+    infoBox: { title: 'Custom', description: 'Blocks added by your own code.' },
   },
   {
     id: 'add-node-group:mcp',
     label: 'MCP',
+    infoBox: { title: 'MCP', description: 'Tools from the servers connected in Forge — Gmail, files, search, and more.' },
   },
 ] as const satisfies readonly ContextMenuItem[] & {
   items?: readonly ContextMenuItem[];

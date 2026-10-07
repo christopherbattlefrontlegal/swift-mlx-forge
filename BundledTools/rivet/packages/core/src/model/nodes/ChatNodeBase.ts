@@ -1,3 +1,4 @@
+import { fetchForgeModels, forgeLoadedLocalModel, isForgeEmbedded } from '../../utils/forgeModels.js';
 import { match } from 'ts-pattern';
 import { coerceType, coerceTypeOptional } from '../../utils/coerceType.js';
 import { getError } from '../../utils/errors.js';
@@ -101,7 +102,7 @@ const cache = new Map<string, Outputs>();
 
 export const ChatNodeBase = {
   defaultData: (): ChatNodeData => ({
-    model: 'gpt-5',
+    model: isForgeEmbedded() ? forgeLoadedLocalModel : 'gpt-5',
     useModelInput: false,
     temperature: 0.5,
     useTemperatureInput: false,
@@ -466,6 +467,28 @@ export const ChatNodeBase = {
     }
 
     return outputs;
+  },
+
+  /** `getEditors`, with the model dropdown swapped for Forge's live catalog when embedded in Forge. */
+  getLiveEditors: async (): Promise<EditorDefinition<ChatNode>[]> => {
+    const editors = ChatNodeBase.getEditors();
+    if (!isForgeEmbedded()) {
+      return editors;
+    }
+
+    const models = await fetchForgeModels();
+    return editors.map((editor) =>
+      editor.type === 'dropdown' && editor.dataKey === 'model'
+        ? {
+            ...editor,
+            label: 'Model',
+            options: [
+              { value: forgeLoadedLocalModel, label: 'Local: whichever model is loaded' },
+              ...models.map((model) => ({ value: model.id, label: `${model.provider}: ${model.name}` })),
+            ],
+          }
+        : editor,
+    );
   },
 
   getEditors: (): EditorDefinition<ChatNode>[] => {
@@ -964,11 +987,10 @@ export const ChatNodeBase = {
 
     const { messages } = getChatNodeMessages(inputs);
 
-    const isModernModel =
-      finalModel.startsWith('o1') ||
-      finalModel.startsWith('o3') ||
-      finalModel.startsWith('o4') ||
-      finalModel.startsWith('gpt-5');
+    // Forge gateway ids are provider-prefixed ("openai/gpt-5"); these OpenAI-only
+    // heuristics must see the bare model name and skip other providers.
+    const openAiModelName = finalModel.startsWith('openai/') ? finalModel.slice('openai/'.length) : finalModel;
+    const isModernModel = /^(o\d|gpt-([5-9]|\d{2,}))/.test(openAiModelName);
 
     let isReasoningModel = false;
     if (data.reasoningMode === 'reasoning') {
@@ -992,7 +1014,8 @@ export const ChatNodeBase = {
 
     const openaiModel = {
       ...(openaiModels[model as keyof typeof openaiModels] ?? {
-        maxTokens: data.overrideMaxTokens ?? 8192,
+        // Unknown models (local weights, other providers): let the server enforce its own limit.
+        maxTokens: data.overrideMaxTokens ?? (isForgeEmbedded() ? 1_000_000 : 8192),
         cost: {
           completion: 0,
           prompt: 0,

@@ -18,8 +18,6 @@ import { SortableContext, horizontalListSortingStrategy, useSortable, arrayMove 
 import { useLoadProjectWithFileBrowser } from '../hooks/useLoadProjectWithFileBrowser';
 import { graphNavigationStackState } from '../state/graphBuilder';
 import { newProjectModalOpenState } from '../state/ui';
-import DiscordLogo from '../assets/vendor_logos/discord-mark-white.svg?react';
-import { useOpenUrl } from '../hooks/useOpenUrl';
 import { keys } from '../../../core/src/utils/typeSafety';
 import { syncWrapper } from '../utils/syncWrapper';
 
@@ -275,8 +273,6 @@ export const ProjectSelector: FC = () => {
     }
   };
 
-  const openDiscord = useOpenUrl('https://discord.gg/qT8B2gv9Mg');
-
   return (
     <div className="forge-project-selector" css={styles}>
       <div className="projects-container">
@@ -303,9 +299,6 @@ export const ProjectSelector: FC = () => {
         </button>
         <button className="open-project" onClick={syncWrapper(loadProjectWithFileBrowser)} title="Open Project">
           <FolderIcon />
-        </button>
-        <button className="get-help" onClick={syncWrapper(openDiscord)}>
-          <DiscordLogo /> Discord
         </button>
       </div>
     </div>

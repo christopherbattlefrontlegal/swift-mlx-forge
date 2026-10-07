@@ -1,4 +1,4 @@
-export const modelSelectorOptions = [
+const standaloneModelSelectorOptions = [
   { label: 'Local Model', value: 'openai:local-model' },
   { label: 'OpenAI: GPT-4.1', value: 'openai:gpt-4.1' },
   { label: 'OpenAI: GPT-4.1 Mini', value: 'openai:gpt-4.1-mini' },
@@ -8,8 +8,14 @@ export const modelSelectorOptions = [
   { label: 'Anthropic: Claude 3.7 Sonnet', value: 'anthropic:claude-3-7-sonnet-latest' },
 ] as const;
 
+const forgeModelSelectorOptions = [{ label: 'Loaded Local Model', value: 'openai:forge/local' }] as const;
+
+export const modelSelectorOptions = globalThis.location?.pathname.startsWith('/rivet/')
+  ? forgeModelSelectorOptions
+  : standaloneModelSelectorOptions;
+
 export type ModelSelectorValue = (typeof modelSelectorOptions)[number]['value'];
 
-export const defaultModelSelectorOption = modelSelectorOptions[4]; // Default to Claude Sonnet 4
+export const defaultModelSelectorOption = modelSelectorOptions[0];
 
 export const defaultModelSelectorValue = defaultModelSelectorOption.value;

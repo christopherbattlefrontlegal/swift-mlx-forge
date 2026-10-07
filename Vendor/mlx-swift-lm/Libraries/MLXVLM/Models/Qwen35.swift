@@ -23,6 +23,12 @@ private let ropeDeltasKey = LMOutput.Key<MLXArray>(
 
 // MARK: - Configuration
 
+/// Decoded outside `TextConfiguration.CodingKeys` so the synthesized encoder
+/// does not expect a matching stored property.
+private enum LegacyRoPEScalingCodingKey: String, CodingKey {
+    case ropeScaling = "rope_scaling"
+}
+
 public struct Qwen35Configuration: Codable, Sendable {
 
     public struct TextConfiguration: Codable, Sendable {
@@ -141,6 +147,10 @@ public struct Qwen35Configuration: Codable, Sendable {
 
             var decodedRope = try container.decodeIfPresent(
                 [String: StringOrNumber].self, forKey: .ropeParameters)
+            // Legacy top-level `rope_scaling`; see `resolveRoPEParameters`.
+            let legacyRopeScaling = try decoder.container(
+                keyedBy: LegacyRoPEScalingCodingKey.self
+            ).decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
 
             if decodedRope == nil {
                 let ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta)
@@ -157,18 +167,11 @@ public struct Qwen35Configuration: Codable, Sendable {
                 }
             }
 
-            if var decodedRope {
-                if decodedRope["type"] == nil, let ropeType = decodedRope["rope_type"] {
-                    decodedRope["type"] = ropeType
-                }
-                self.ropeParameters = decodedRope
-                self.ropeTheta = decodedRope["rope_theta"]?.asFloat() ?? 100_000.0
-                self.partialRotaryFactor = decodedRope["partial_rotary_factor"]?.asFloat() ?? 0.25
-            } else {
-                self.ropeParameters = defaultRopeParameters
-                self.ropeTheta = 100_000.0
-                self.partialRotaryFactor = 0.25
-            }
+            let resolvedRope = resolveRoPEParameters(
+                decodedRope ?? defaultRopeParameters, legacyScaling: legacyRopeScaling)
+            self.ropeParameters = resolvedRope
+            self.ropeTheta = resolvedRope["rope_theta"]?.asFloat() ?? 100_000.0
+            self.partialRotaryFactor = resolvedRope["partial_rotary_factor"]?.asFloat() ?? 0.25
 
             if self.headDim == nil {
                 self.headDim = self.hiddenSize / self.attentionHeads
@@ -223,12 +226,23 @@ enum Qwen35Language {
     final class RotaryEmbedding {
         private let invFreq: MLXArray
         private let mropeSection: [Int]
+        /// YaRN attention scale applied to cos/sin; 1 for plain RoPE.
+        private let attentionScale: Float
 
-        init(dim: Int, base: Float, mropeSection: [Int]) {
+        init(
+            dim: Int, base: Float, mropeSection: [Int],
+            scalingConfig: [String: StringOrNumber]? = nil
+        ) {
             let safeDim = max(1, dim)
-            var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
-            freq = freq / Float(safeDim)
-            self.invFreq = 1.0 / pow(MLXArray(base), freq)
+            if let yarn = YarnRoPEParameters(scalingConfig: scalingConfig), safeDim % 2 == 0 {
+                self.invFreq = 1.0 / yarn.frequencies(dimensions: safeDim, base: base)
+                self.attentionScale = yarn.attentionScale
+            } else {
+                var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
+                freq = freq / Float(safeDim)
+                self.invFreq = 1.0 / pow(MLXArray(base), freq)
+                self.attentionScale = 1
+            }
             self.mropeSection =
                 mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
         }
@@ -269,7 +283,13 @@ enum Qwen35Language {
             freqs = applyInterleavedMRope(freqs)
 
             let emb = concatenated([freqs, freqs], axis: -1)
-            return (cos(emb).asType(x.dtype), sin(emb).asType(x.dtype))
+            var cosValues = cos(emb)
+            var sinValues = sin(emb)
+            if attentionScale != 1 {
+                cosValues = cosValues * attentionScale
+                sinValues = sinValues * attentionScale
+            }
+            return (cosValues.asType(x.dtype), sinValues.asType(x.dtype))
         }
     }
 
@@ -365,7 +385,8 @@ enum Qwen35Language {
             let mrope = args.ropeParameters?["mrope_section"]?.asInts() ?? [11, 11, 10]
             let rotaryDim = Int(Float(headDim) * args.partialRotaryFactor)
             self.rotaryEmbedding = RotaryEmbedding(
-                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope)
+                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope,
+                scalingConfig: args.ropeParameters)
             super.init()
         }
 
@@ -1071,6 +1092,15 @@ public class Qwen35: Module, VLMModel {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Raw HuggingFace checkpoints store the GDN conv1d as [C, 1, K] and their
+        // RMSNorm weights as offsets from one. A converted checkpoint has neither
+        // property, so the conv1d layout alone decides whether the norms get shifted.
+        // MTP tensors are not a signal (upstream ml-explore/mlx-swift-lm #598).
+        let hasUnsanitizedConv1d = weights.contains { key, value in
+            key.contains("conv1d.weight") && value.dim(-1) != 1
+        }
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
+
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
         if config.textConfiguration.tieWordEmbeddings {
@@ -1111,7 +1141,9 @@ public class Qwen35: Module, VLMModel {
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
             }
-            if normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
+            if shouldShiftNormWeights
+                && normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1
+            {
                 value = value + MLXArray(1, dtype: value.dtype)
             }
 

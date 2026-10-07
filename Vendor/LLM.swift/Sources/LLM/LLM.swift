@@ -68,7 +68,22 @@ public actor LLMCore {
     
     private var shouldContinuePredicting = false
     private var currentTokenCount: Int32 = 0
+    /// Every token llama.cpp currently holds for sequence 0, in position order.
+    /// `prepareContext` reuses the longest common prefix with the next prompt and
+    /// drops the rest, so the context never accumulates across turns.
+    private var contextTokens: [Token] = []
     private var debugLastGeneratedTokens: [Token] = []
+
+    /// Why the most recent `prepareContext` refused a turn (nil when it succeeded).
+    public enum PrepareFailure: Sendable, Equatable {
+        case emptyInput
+        case promptTooLong(tokens: Int, limit: Int)
+        case decodeFailed(code: Int32)
+    }
+    public private(set) var lastPrepareFailure: PrepareFailure?
+
+    /// Number of tokens the llama context currently holds.
+    public var contextTokenCount: Int { contextTokens.count }
     
     private var sampler: UnsafeMutablePointer<llama_sampler>?
     
@@ -134,7 +149,11 @@ public actor LLMCore {
         contextParams.n_batch = contextParams.n_ctx
         contextParams.n_threads = processorCount
         contextParams.n_threads_batch = processorCount
-        contextParams.embeddings = true
+        // Chat only needs logits for the last prompt token. With `embeddings` on,
+        // llama.cpp marks EVERY prompt token as an output and keeps full-vocab
+        // logits for each one (about 1 MB per token on a 248k vocab: 34 GB for a
+        // 34k prompt). `getEmbeddings` switches it on for its own call.
+        contextParams.embeddings = false
         self.params = contextParams
         
         guard let context = llama_init_from_model(model, params) else {
@@ -207,23 +226,64 @@ public actor LLMCore {
     
     
     func prepareContext(for input: String) -> Bool {
-        guard !input.isEmpty else { return false }
-        
+        lastPrepareFailure = nil
+        guard !input.isEmpty else {
+            lastPrepareFailure = .emptyInput
+            return false
+        }
+
         tokenBuffer.removeAll()
-        
+
         var tokens = encode(input)
         if tokens.last == nullToken { tokens.removeLast() }
-        
-        let initialCount = tokens.count
-        guard maxTokenCount > initialCount + Int(currentTokenCount) else { return false }
-        
-        clearBatch()
-        for (i, token) in tokens.enumerated() {
-            addToBatch(token: token, pos: currentTokenCount + Int32(i), isLogit: i == initialCount - 1)
+
+        // The prompt alone must fit; what the context already holds is reused or
+        // dropped below, never counted against the new turn.
+        guard !tokens.isEmpty, maxTokenCount > tokens.count else {
+            lastPrepareFailure = .promptTooLong(tokens: tokens.count, limit: maxTokenCount)
+            return false
         }
-        guard llama_decode(context, batch) == 0 else { return false }
-        
-        currentTokenCount += Int32(initialCount)
+
+        // Keep the KV/recurrent state for the longest common prefix and remove
+        // everything after it. Hybrid and recurrent models (Mamba, Qwen3-Next,
+        // Qwen3.5) refuse a partial removal, so fall back to a full clear and a
+        // full re-prefill rather than decoding onto stale state.
+        let memory = llama_get_memory(context)
+        var reusableCount = 0
+        while reusableCount < min(tokens.count, contextTokens.count),
+            tokens[reusableCount] == contextTokens[reusableCount]
+        {
+            reusableCount += 1
+        }
+        // Always decode at least one token so fresh logits exist for sampling.
+        if reusableCount == tokens.count { reusableCount -= 1 }
+        if reusableCount < contextTokens.count {
+            if reusableCount > 0, llama_memory_seq_rm(memory, 0, Int32(reusableCount), -1) {
+                contextTokens.removeSubrange(reusableCount..<contextTokens.count)
+            } else {
+                llama_memory_clear(memory, true)
+                contextTokens.removeAll()
+                reusableCount = 0
+            }
+        }
+
+        let newTokens = Array(tokens[reusableCount...])
+        clearBatch()
+        for (i, token) in newTokens.enumerated() {
+            addToBatch(token: token, pos: Int32(reusableCount + i), isLogit: i == newTokens.count - 1)
+        }
+        let code = llama_decode(context, batch)
+        guard code == 0 else {
+            // The context state is now unknown: start the next turn from empty.
+            llama_memory_clear(memory, true)
+            contextTokens.removeAll()
+            currentTokenCount = 0
+            lastPrepareFailure = .decodeFailed(code: code)
+            return false
+        }
+
+        contextTokens = tokens
+        currentTokenCount = Int32(tokens.count)
         shouldContinuePredicting = true
         return true
     }
@@ -286,6 +346,7 @@ public actor LLMCore {
             return endToken
         }
         
+        contextTokens.append(token)
         currentTokenCount += 1
         return token
     }
@@ -305,6 +366,7 @@ public actor LLMCore {
                 shouldContinuePredicting = false
                 return false
             }
+            contextTokens.append(token)
             currentTokenCount += 1
         }
         return true
@@ -313,9 +375,11 @@ public actor LLMCore {
     func resetContext() {
         currentTokenCount = 0
         tokenBuffer.removeAll()
+        contextTokens.removeAll()
+        lastPrepareFailure = nil
         shouldContinuePredicting = false
         // Clear all sequences to ensure clean state
-        llama_memory_seq_rm(llama_get_memory(context), -1, -1, -1)
+        llama_memory_clear(llama_get_memory(context), true)
     }
     
     func generateResponseStream(from input: String, thinking: ThinkingMode = .none) -> AsyncStream<String> {
@@ -458,6 +522,9 @@ public actor LLMCore {
         let embeddings = try extractEmbeddingsFromContext()
         
         llama_memory_clear(llama_get_memory(context), false)
+        contextTokens.removeAll()
+        currentTokenCount = 0
+        shouldContinuePredicting = false
         
         return embeddings
     }
@@ -600,6 +667,7 @@ public actor LLMCore {
             shouldContinuePredicting = false
             throw LLMError.decodingFailed
         }
+        contextTokens.append(token)
         currentTokenCount += 1
         output += decode(token)
         debugLastGeneratedTokens.append(token)
@@ -1196,53 +1264,53 @@ open class LLM: ObservableObject {
         didSet {
             guard let template else {
                 preprocess = { input, _, _ in return input }
-                Task {
-                    await core.setStopSequence(nil)
-                    await core.setThinkingTokens(start: nil, end: nil, startMarker: nil, endMarker: nil)
+                configure {
+                    await self.core.setStopSequence(nil)
+                    await self.core.setThinkingTokens(start: nil, end: nil, startMarker: nil, endMarker: nil)
                 }
                 return
             }
             preprocess = template.preprocess
-            Task {
-                await core.setStopSequence(template.stopSequence)
-                await setupThinkingTokens(from: template)
+            configure {
+                await self.core.setStopSequence(template.stopSequence)
+                await self.setupThinkingTokens(from: template)
             }
         }
     }
     
     public var seed: UInt32 {
         didSet {
-            Task { await core.setParameters(seed: seed) }
+            configure { await self.core.setParameters(seed: self.seed) }
         }
     }
     
     public var topK: Int32 {
         didSet {
-            Task { await core.setParameters(topK: topK) }
+            configure { await self.core.setParameters(topK: self.topK) }
         }
     }
     
     public var topP: Float {
         didSet {
-            Task { await core.setParameters(topP: topP) }
+            configure { await self.core.setParameters(topP: self.topP) }
         }
     }
     
     public var temp: Float {
         didSet {
-            Task { await core.setParameters(temp: temp) }
+            configure { await self.core.setParameters(temp: self.temp) }
         }
     }
 
     public var repeatPenalty: Float {
         didSet {
-            Task { await core.setParameters(repeatPenalty: repeatPenalty) }
+            configure { await self.core.setParameters(repeatPenalty: self.repeatPenalty) }
         }
     }
     
     public var repetitionLookback: Int32 {
         didSet {
-            Task { await core.setParameters(repetitionLookback: repetitionLookback) }
+            configure { await self.core.setParameters(repetitionLookback: self.repetitionLookback) }
         }
     }
     
@@ -1252,6 +1320,29 @@ open class LLM: ObservableObject {
     public let core: LLMCore
     
     private var isAvailable = true
+
+    /// Set when `respond` was called while a previous turn was still running;
+    /// that call returns immediately with no output.
+    public private(set) var lastRespondSkippedBusy = false
+
+    /// Why the most recent turn produced nothing, if llama.cpp refused the prompt.
+    public var lastFailure: LLMCore.PrepareFailure? {
+        get async { await core.lastPrepareFailure }
+    }
+
+    /// Tokens currently held in the llama context (prompt plus generated so far).
+    public var contextTokenCount: Int {
+        get async { await core.contextTokenCount }
+    }
+    private var configuration: Task<Void, Never>? = nil
+
+    private func configure(_ apply: @Sendable @escaping () async -> Void) {
+        let previous = configuration
+        configuration = Task {
+            await previous?.value
+            await apply()
+        }
+    }
     private var input: String = ""
     
     static var isLogSilenced = false
@@ -1268,9 +1359,19 @@ open class LLM: ObservableObject {
     static func silenceLogging() {
         guard !isLogSilenced else { return }
         isLogSilenced = true
-        let noopCallback: @convention(c) (ggml_log_level, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { _, _, _ in }
-        llama_log_set(noopCallback, nil)
-        ggml_log_set(noopCallback, nil)
+        // Info output stays quiet; warnings and errors are kept in a small ring
+        // so an empty turn can be explained instead of guessed at.
+        let callback: @convention(c) (ggml_log_level, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { level, text, _ in
+            guard let text else { return }
+            LLMLogCapture.shared.record(level: level, text: String(cString: text))
+        }
+        llama_log_set(callback, nil)
+        ggml_log_set(callback, nil)
+    }
+
+    /// Most recent llama.cpp/ggml warning and error lines, oldest first.
+    public static func recentDiagnostics() -> [String] {
+        LLMLogCapture.shared.lines()
     }
     
     
@@ -1347,8 +1448,8 @@ open class LLM: ObservableObject {
             )
             
             if let stopSequence {
-                Task {
-                    await core.setStopSequence(stopSequence)
+                configure {
+                    await self.core.setStopSequence(stopSequence)
                 }
             }
         } catch {
@@ -1457,7 +1558,7 @@ open class LLM: ObservableObject {
         let (endTokens, endMarker) = await convertToTokensAndMarker(template.thinkingEnd)
         await core.setThinkingTokens(start: startTokens, end: endTokens, startMarker: startMarker, endMarker: endMarker)
     }
-    
+
     private func convertToTokensAndMarker(_ sequence: TokenSequence?) async -> ([Token]?, String?) {
         guard let sequence else { return (nil, nil) }
         switch sequence {
@@ -1482,7 +1583,7 @@ open class LLM: ObservableObject {
     
     public func reset() {
         history.removeAll()
-        Task { await core.resetContext() }
+        configure { await self.core.resetContext() }
     }
     
     open func recoverFromLengthy(_ input: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
@@ -1494,6 +1595,7 @@ open class LLM: ObservableObject {
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         let response = await core.generateResponseStream(from: input)
         var output = ""
@@ -1510,6 +1612,7 @@ open class LLM: ObservableObject {
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         self.input = input
         let processedInput = preprocess(input, history, thinking)
@@ -1525,12 +1628,14 @@ open class LLM: ObservableObject {
         
         postprocess(output)
     }
-    
+
     open func respond(to input: String, thinking: ThinkingMode = .none) async {
+        lastRespondSkippedBusy = !isAvailable
         guard isAvailable else { return }
         
         isAvailable = false
         defer { isAvailable = true }
+        await configuration?.value
         
         self.input = input
         let processedInput = preprocess(input, history, thinking)
@@ -1584,6 +1689,7 @@ open class LLM: ObservableObject {
         as type: T.Type,
         thinking: ThinkingMode = .none
     ) async throws -> StructuredOutput<T> {
+        await configuration?.value
         let schemaPrompt = """
         \(prompt)
         
@@ -1950,5 +2056,47 @@ extension Character {
     var isValidStringCharacter: Bool {
         guard self != "\"" && self != "\\" else { return false }
         return isLetter || self == " " || isNumber || isLowercase || isUppercase || isASCII && isPunctuation || isASCII && isSymbol
+    }
+}
+
+/// Ring buffer of llama.cpp warning/error log lines. llama.cpp logs from its own
+/// threads and the C callback cannot capture context, so this is a lock-guarded
+/// singleton.
+final class LLMLogCapture: @unchecked Sendable {
+    static let shared = LLMLogCapture()
+    private let lock = NSLock()
+    private var buffer: [String] = []
+    private var partial = ""
+    private var keeping = false
+    private let capacity = 32
+
+    func record(level: ggml_log_level, text: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch level.rawValue {
+        case GGML_LOG_LEVEL_WARN.rawValue, GGML_LOG_LEVEL_ERROR.rawValue:
+            keeping = true
+        case GGML_LOG_LEVEL_CONT.rawValue:
+            // Continuation fragments belong to the previous message.
+            guard keeping else { return }
+        default:
+            keeping = false
+            return
+        }
+        partial += text
+        guard partial.hasSuffix("\n") else { return }
+        let line = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        partial = ""
+        guard !line.isEmpty else { return }
+        buffer.append(line)
+        if buffer.count > capacity {
+            buffer.removeFirst(buffer.count - capacity)
+        }
+    }
+
+    func lines() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
     }
 }

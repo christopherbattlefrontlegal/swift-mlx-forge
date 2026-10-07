@@ -1,321 +1,359 @@
 import Foundation
 import MLX
 
-public struct QwenNativeMTPTokenIterator: TokenIteratorProtocol {
+/// Speculative decoding on Qwen's native multi-token-prediction (MTP) head.
+///
+/// Each round is one backbone pass over the last confirmed token plus `k`
+/// drafts. The drafts come from the checkpoint's single MTP head chained `k`
+/// deep: the first fuses the backbone state at the confirmed position with the
+/// confirmed token's embedding (the head predicts t+2 from h(t) and token t+1,
+/// as in ml-explore/mlx-lm#990 and vLLM's `qwen3_next_mtp`); each further draft
+/// fuses the head's own output state with the previous draft's embedding.
+///
+/// After verification the backbone caches drop the rejected tail. Attention
+/// caches shorten; the Gated DeltaNet caches replay their recurrence over the
+/// accepted prefix from the state recorded before the window
+/// (``MambaCache/trim(_:)``). The head's cache drops its in-flight drafts and is
+/// re-synchronised with exact backbone states for the accepted positions in the
+/// same batched call that proposes the next first draft, so the head only ever
+/// attends over exact history plus its own current drafts.
+public struct QwenNativeMTPTokenIterator: TokenIteratorProtocol, MTPStatsCollecting {
 
-    var y: LMInput.Text
     let model: any QwenNativeMTPModel
-
-    var state: LMOutput.State?
     var cache: [KVCache]
-    var mtpCaches: [[KVCache]]
+    var headCache: [KVCache]
     let quantizeKVCache: (inout [KVCache]) -> Void
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
     let parameters: GenerateParameters
 
+    /// Drafts proposed per round (k), clamped to the tokens still allowed.
+    public let numDraftTokens: Int
+
     public var tokenCount = 0
     public let maxTokens: Int?
+    public var promptPrefillTime: TimeInterval = 0
 
-    // Number of tokens the MTP heads predict (k)
-    let numMTPTokens: Int
+    public private(set) var proposedDraftTokens = 0
+    public private(set) var acceptedDraftTokens = 0
+    public private(set) var passthroughReason: String?
 
-    // Logits from the previous step's MTP heads
-    var mtpLogits: [MLXArray]?
+    /// Backbone passes run after prefill, for tokens-per-pass reporting.
+    public private(set) var backbonePasses = 0
 
-    // Buffer of accepted tokens from the current speculation round
+    // Last confirmed token, not yet fed to the backbone, and the backbone state
+    // at the position whose logits produced it.
+    private var y: MLXArray
+    private var yValue: Int
+    private var lastHidden: MLXArray
+
+    // Exact (state, next token) pairs the head cache is still owed: the
+    // accepted window positions of the previous round.
+    private var pendingHeadHidden: MLXArray?
+    private var pendingHeadTokens = [Int32]()
+
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
 
-    // Internal metrics
-    public var acceptedDraftTokens: Int = 0
-    public var totalDraftTokens: Int = 0
-    public var promptPrefillTime: TimeInterval = 0.0
-
-    /// Initialize a `QwenNativeMTPTokenIterator` with the given input.
     public init(
         input: LMInput,
         model: any QwenNativeMTPModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        numMTPTokens: Int = 1
+        numMTPTokens: Int = 3
     ) throws {
-        self.y = input.text
         self.model = model
         self.cache = cache ?? model.newCache(parameters: parameters)
-        self.mtpCaches = model.makeQwenMTPCaches(parameters: parameters)
-
-        guard canTrimPromptCache(self.cache) else {
-            throw KVCacheError(message: "MTP Speculative decoding requires trimmable KV caches.")
+        self.headCache = model.makeQwenMTPCache(parameters: parameters)
+        guard canTrimPromptCache(self.cache), canTrimPromptCache(self.headCache) else {
+            throw KVCacheError(message: "MTP speculative decoding requires trimmable KV caches.")
         }
 
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
         self.parameters = parameters
-
         self.maxTokens = parameters.maxTokens
-        self.numMTPTokens = numMTPTokens
-
+        self.numDraftTokens = Swift.max(0, numMTPTokens)
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
-            )
+                quantizedKVStart: parameters.quantizedKVStart)
+        }
+        if model.qwenMTPHeadCount == 0 {
+            self.passthroughReason = "checkpoint has no native MTP head loaded"
         }
 
-        let prefillStart = Date.timeIntervalSinceReferenceDate
-        try prepare(input: input, windowSize: parameters.prefillStepSize)
-        self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+        // Placeholders until the prompt has been consumed.
+        self.y = MLXArray(Int32(0))
+        self.yValue = 0
+        self.lastHidden = MLXArray(Float(0))
+
+        let start = Date.timeIntervalSinceReferenceDate
+        try prefill(input.text, windowSize: parameters.prefillStepSize)
+        self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - start
     }
 
-    /// Prefill the main model with the prompt, priming caches for generation
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
-        processor?.prompt(input.text.tokens)
-
-        // Prefill main model
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
-        case .tokens(let tokens):
-            y = tokens
-        case .logits(let result):
-            var logits = result.logits[0..., -1, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let token = sampler.sample(logits: logits)
-            processor?.didSample(token: token)
-            y = .init(tokens: token)
-            state = result.state
+    /// Consume the prompt in windows, priming the head's cache with exact
+    /// (state, next token) pairs for every prompt position whose successor is
+    /// known, and sample the first token.
+    private mutating func prefill(_ text: LMInput.Text, windowSize: Int?) throws {
+        let tokens = text.tokens
+        let count = tokens.dim(0)
+        guard count > 0 else {
+            throw KVCacheError(message: "MTP decoding needs at least one prompt token.")
         }
+        processor?.prompt(tokens)
+
+        let step = Swift.max(1, windowSize ?? 512)
+        let useHead = passthroughReason == nil
+        var carried: MLXArray? = nil
+        var lastLogits: MLXArray? = nil
+        var start = 0
+        while start < count {
+            let end = Swift.min(count, start + step)
+            let length = end - start
+            let chunk = tokens[start ..< end]
+            let out = model.qwenMTPBackbone(
+                chunk[.newAxis], cache: cache, logitsForLastPositionOnly: true)
+            if useHead {
+                // The carried state pairs with this window's first token; each
+                // state in the window pairs with the token after it. The last
+                // state waits for the token that will be sampled.
+                var states = [MLXArray]()
+                var nextTokens = [MLXArray]()
+                if let carried {
+                    states.append(carried)
+                    nextTokens.append(chunk[0 ..< 1])
+                }
+                if length > 1 {
+                    states.append(out.hidden[0..., ..<(length - 1), 0...])
+                    nextTokens.append(chunk[1 ..< length])
+                }
+                if !states.isEmpty {
+                    let hidden = states.count == 1 ? states[0] : concatenated(states, axis: 1)
+                    let next =
+                        (nextTokens.count == 1 ? nextTokens[0] : concatenated(nextTokens))[.newAxis]
+                    _ = model.qwenMTPHead(hidden: hidden, nextTokens: next, cache: headCache)
+                }
+            }
+            let tail = out.hidden[0..., (length - 1)..., 0...]
+            carried = tail
+            lastLogits = out.logits
+            eval(cacheArrays(cache) + cacheArrays(headCache) + [tail])
+            start = end
+        }
+
+        var logits = lastLogits![0..., -1, 0...]
+        logits = processor?.process(logits: logits) ?? logits
+        let token = sampler.sample(logits: logits)
+        processor?.didSample(token: token)
+        y = token
+        yValue = token.item(Int.self)
+        lastHidden = carried!
+        pendingTokens = [yValue]
+        pendingIndex = 0
     }
 
-    /// Run one round of MTP speculative decoding: draft from MTP heads, verify via main, accept/reject
-    mutating func speculateRound() {
-        let remaining = maxTokens.map { $0 - tokenCount } ?? numMTPTokens
-        let numDraft = Swift.min(remaining, numMTPTokens)
-        guard numDraft > 0 else {
+    private func cacheArrays(_ caches: [KVCache]) -> [MLXArray] {
+        caches.flatMap { $0.innerState() }
+    }
+
+    /// Exact head inputs owed from the previous round, followed by the input
+    /// for the first draft of this round.
+    private func commitHidden() -> MLXArray {
+        if let pendingHeadHidden {
+            return concatenated([pendingHeadHidden, lastHidden], axis: 1)
+        }
+        return lastHidden
+    }
+
+    private func commitTokens() -> MLXArray {
+        MLXArray(pendingHeadTokens + [Int32(yValue)])[.newAxis]
+    }
+
+    /// One round: draft k tokens through the head, verify them in a single
+    /// backbone pass, accept a prefix, roll back the rest.
+    private mutating func speculateRound() {
+        let remaining = maxTokens.map { $0 - tokenCount } ?? Int.max
+        let k = Swift.min(numDraftTokens, Swift.max(0, remaining - 1))
+        guard passthroughReason == nil, k > 0 else {
+            plainStep()
             return
         }
 
-        // Draft generation: Use MTP logits from the previous step
+        // 1. Drafts. The first head call also commits the exact entries owed
+        //    from the previous round; the rest chain through the head.
+        var draftProcessor = processor
         var draftTokens = [MLXArray]()
-        var draftProcessedLogits = [MLXArray]()
-        if let previousMTP = mtpLogits, !previousMTP.isEmpty {
-            let countToSample = Swift.min(numDraft, previousMTP.count)
-            var draftProcessor = processor
-            for i in 0 ..< countToSample {
-                var draftLogit = previousMTP[i]
-                draftLogit = draftProcessor?.process(logits: draftLogit) ?? draftLogit
-                let draftToken = sampler.sample(logits: draftLogit)
-                draftProcessor?.didSample(token: draftToken)
-                draftTokens.append(draftToken)
-                draftProcessedLogits.append(draftLogit)
-            }
-        }
-
-        // If no draft tokens were generated (e.g. first step), fallback to regular generation
-        if draftTokens.isEmpty {
-            let mtpResult = model.callQwenMTP(y.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
-            guard !mtpResult.isEmpty else { return }
-
-            let mainLogits = mtpResult[0]
-            var logits = mainLogits[0..., -1, 0...]
-            logits = processor?.process(logits: logits) ?? logits
+        var draftLogits = [MLXArray]()
+        var step = model.qwenMTPHead(
+            hidden: commitHidden(), nextTokens: commitTokens(), cache: headCache)
+        pendingHeadHidden = nil
+        pendingHeadTokens.removeAll()
+        for depth in 0 ..< k {
+            var logits = step.logits[0..., -1, 0...]
+            logits = draftProcessor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
-            processor?.didSample(token: token)
-
-            pendingTokens.append(token.item(Int.self))
-            y = .init(tokens: token)
-
-            // Save future MTP logits for next iteration (slice to single position)
-            self.mtpLogits = mtpResult.count > 1 ? mtpResult.dropFirst().map { $0[0..., -1, 0...] } : nil
-
-            // Force evaluation of MTP state to prevent graph collapse
-            var evalArrays = [token]
-            if let mtpLogits = self.mtpLogits { evalArrays.append(contentsOf: mtpLogits) }
-            eval(evalArrays)
-
-            quantizeKVCache(&cache)
-            for i in mtpCaches.indices {
-                quantizeKVCache(&mtpCaches[i])
+            draftProcessor?.didSample(token: token)
+            draftTokens.append(token)
+            draftLogits.append(logits)
+            if depth + 1 < k {
+                let depthState = step.hidden
+                step = model.qwenMTPHead(
+                    hidden: depthState[0..., (depthState.dim(1) - 1)..., 0...],
+                    nextTokens: token[.newAxis],
+                    cache: headCache)
             }
-            return
         }
 
-        // Verification: main model processes proposals in one pass
-        for layer in cache {
-            if let mamba = layer as? MambaCache { mamba.checkpointForMTP() }
+        // Let the GPU start on the head chain while the CPU builds the much
+        // larger verify graph.
+        asyncEval(draftTokens)
+
+        // 2. Verify every draft in one backbone pass. Linear-attention caches
+        //    record the state after every position so a rejected tail rolls back.
+        for layerCache in cache {
+            (layerCache as? MambaCache)?.speculativeWindowArmed = true
         }
+        let window = concatenated([y] + draftTokens)[.newAxis]
+        let out = model.qwenMTPBackbone(window, cache: cache, logitsForLastPositionOnly: false)
+        backbonePasses += 1
 
-        let verifyTokens = [y.tokens] + draftTokens
-        let verifyInput = LMInput.Text(tokens: concatenated(verifyTokens))
-        let verifyStart = verifyInput.tokens.dim(0) - (draftTokens.count + 1)
-
-        let mtpResult = model.callQwenMTP(verifyInput.tokens[.newAxis], cache: cache, mtpCaches: mtpCaches)
-        guard !mtpResult.isEmpty else { return }
-
-        let mainLogits = mtpResult[0]
-
-        let mainTokens: MLXArray
-        var mainProcessedLogits = [MLXArray]()
+        var mainTokens = [MLXArray]()
+        var mainLogits = [MLXArray]()
         if var verifyProcessor = processor {
-            // Process sequentially
-            var sampled = [MLXArray]()
-            for i in 0 ..< (draftTokens.count + 1) {
-                var logits = mainLogits[0..., verifyStart + i, 0...]
+            for i in 0 ... k {
+                var logits = out.logits[0..., i, 0...]
                 logits = verifyProcessor.process(logits: logits)
                 let token = sampler.sample(logits: logits)
                 verifyProcessor.didSample(token: token)
-                sampled.append(token)
-                mainProcessedLogits.append(logits)
+                mainTokens.append(token)
+                mainLogits.append(logits)
             }
-            mainTokens = concatenated(sampled)
         } else {
-            // Batch sample
-            let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
-            mainTokens = sampler.sample(logits: verifyLogits)
-            for i in 0 ..< (draftTokens.count + 1) {
-                mainProcessedLogits.append(verifyLogits[i ..< i + 1])
+            let logits = out.logits[0]
+            let sampled = sampler.sample(logits: logits)
+            for i in 0 ... k {
+                mainTokens.append(sampled[i ..< i + 1])
+                mainLogits.append(logits[i ..< i + 1])
             }
         }
+        let mainValues = concatenated(mainTokens).asArray(Int.self)
+        let draftValues = concatenated(draftTokens).asArray(Int.self)
 
-        // We defer eval() until after we compute mtpLogits to force the graph
-        let mainTokensList = mainTokens.asArray(Int.self)
-        let draftTokensList = concatenated(draftTokens).asArray(Int.self)
+        // 3. Accept a prefix of the drafts. The backbone's own token after it
+        //    is always emitted: the correction, or the bonus token.
         var accepted = 0
-
-        let temp = parameters.temperature
-        let finalTokenOut: MLXArray
-
-        if temp == 0.0 {
-            // Greedy Decoding (Exact Match = Rejection Sampling at temp 0)
-            for i in 0 ..< draftTokens.count {
-                guard mainTokensList[i] == draftTokensList[i] else {
-                    break
-                }
-                processor?.didSample(token: draftTokens[i])
-                pendingTokens.append(mainTokensList[i])
+        let finalToken: MLXArray
+        let finalValue: Int
+        let temperature = parameters.temperature
+        if temperature == 0 {
+            while accepted < k, mainValues[accepted] == draftValues[accepted] {
                 accepted += 1
             }
-            finalTokenOut = mainTokens[accepted ... accepted]
-            processor?.didSample(token: finalTokenOut)
-            pendingTokens.append(mainTokensList[accepted])
+            finalToken = mainTokens[accepted]
+            finalValue = mainValues[accepted]
         } else {
-            // Probabilistic Speculative Rejection Sampling (Leviathan et al.)
-            var finalToken: MLXArray? = nil
-            for i in 0 ..< draftTokens.count {
-                let x = draftTokensList[i]
-
-                // Force evaluation of distributions for this step
-                let pTarget = MLX.softmax(mainProcessedLogits[i] / temp, axis: -1)
-                let pDraft = MLX.softmax(draftProcessedLogits[i] / temp, axis: -1)
-                eval(pTarget, pDraft)
-
-                // Access scalar probability (assuming logits are [1, Vocab] or [Vocab])
-                let pTargetX: Float
-                let pDraftX: Float
-                if pTarget.ndim == 2 {
-                    pTargetX = pTarget[0, x].item(Float.self)
-                    pDraftX = pDraft[0, x].item(Float.self)
-                } else {
-                    pTargetX = pTarget[x].item(Float.self)
-                    pDraftX = pDraft[x].item(Float.self)
-                }
-
-                let acceptProb = Swift.min(1.0, pTargetX / Swift.max(pDraftX, 1e-9))
-                let u = Float.random(in: 0..<1)
-
-                if u < acceptProb {
-                    processor?.didSample(token: draftTokens[i])
-                    pendingTokens.append(x)
+            // Rejection sampling against the draft distribution (Leviathan et al.).
+            var resampled: MLXArray? = nil
+            while accepted < k {
+                let x = draftValues[accepted]
+                let pTarget = MLX.softmax(mainLogits[accepted] / temperature, axis: -1)
+                let pDraft = MLX.softmax(draftLogits[accepted] / temperature, axis: -1)
+                let pTargetX = pTarget[0, x].item(Float.self)
+                let pDraftX = pDraft[0, x].item(Float.self)
+                if Float.random(in: 0 ..< 1) < Swift.min(1, pTargetX / Swift.max(pDraftX, 1e-9)) {
                     accepted += 1
-                } else {
-                    // Rejected! Resample from the corrected distribution
-                    var pResample = MLX.maximum(pTarget - pDraft, MLXArray(0.0))
-                    let sum = pResample.sum().item(Float.self)
-                    if sum > 1e-6 {
-                        pResample = pResample / sum
-                        // categorical takes raw logits, so we convert back
-                        let resampleLogits = MLX.log(MLX.maximum(pResample, MLXArray(1e-9)))
-                        finalToken = MLXRandom.categorical(resampleLogits)
-                    } else {
-                        // Fallback
-                        finalToken = MLXArray(mainTokensList[i])
-                    }
-                    break
+                    continue
                 }
+                var residual = MLX.maximum(pTarget - pDraft, MLXArray(Float(0)))
+                let mass = residual.sum().item(Float.self)
+                if mass > 1e-6 {
+                    residual = residual / mass
+                    resampled = MLXRandom.categorical(
+                        MLX.log(MLX.maximum(residual, MLXArray(Float(1e-9)))))
+                } else {
+                    resampled = mainTokens[accepted]
+                }
+                break
             }
-
-            if finalToken == nil {
-                // All drafts accepted!
-                finalToken = mainTokens[accepted ... accepted]
-            }
-            finalTokenOut = finalToken!
-            processor?.didSample(token: finalTokenOut)
-            pendingTokens.append(finalTokenOut.item(Int.self))
+            finalToken = resampled ?? mainTokens[accepted]
+            finalValue = finalToken.item(Int.self)
         }
-        self.acceptedDraftTokens += accepted
-        self.totalDraftTokens += draftTokens.count
-
-        // Rewind caches for rejected tokens
-        let rejectedCount = draftTokens.count - accepted
-        trimPromptCache(cache, numTokens: rejectedCount)
-        for mtpCache in mtpCaches {
-            trimPromptCache(mtpCache, numTokens: rejectedCount)
+        for i in 0 ..< accepted {
+            processor?.didSample(token: draftTokens[i])
         }
+        processor?.didSample(token: finalToken)
+        proposedDraftTokens += k
+        acceptedDraftTokens += accepted
+        pendingTokens.append(contentsOf: draftValues[0 ..< accepted])
+        pendingTokens.append(finalValue)
 
-        // Apply dynamic cache quantization after rewind
+        // 4. Roll back the rejected tail: backbone caches by k - accepted, the
+        //    head cache by its k - 1 in-flight drafts.
+        trimPromptCache(cache, numTokens: k - accepted)
+        for layerCache in cache {
+            (layerCache as? MambaCache)?.clearSpeculativeWindow()
+        }
+        trimPromptCache(headCache, numTokens: k - 1)
         quantizeKVCache(&cache)
-        for i in mtpCaches.indices {
-            quantizeKVCache(&mtpCaches[i])
+        quantizeKVCache(&headCache)
+
+        // 5. Carry state into the next round.
+        y = finalToken
+        yValue = finalValue
+        lastHidden = out.hidden[0..., accepted ... accepted, 0...]
+        if accepted > 0 {
+            pendingHeadHidden = out.hidden[0..., ..<accepted, 0...]
+            pendingHeadTokens = draftValues[0 ..< accepted].map { Int32($0) }
         }
-
-        // Set y for the next round
-        y = .init(tokens: finalTokenOut)
-
-        // Update mtpLogits from the verification pass for the NEXT speculation round.
-        // mtpResult[1..N] contains the MTP head outputs for each depth.
-        // Each head output is [B, 1, vocab] — extract directly (no position indexing needed).
-        // Only keep them if ALL drafts were accepted, otherwise they are invalid due to cache rewind.
-        if accepted == draftTokens.count && mtpResult.count > 1 {
-            self.mtpLogits = mtpResult.dropFirst().map { headLogits in
-                // headLogits shape: [B, 1, vocab] — squeeze to [B, vocab] for the sampler
-                headLogits[0..., headLogits.dim(1) - 1, 0...]
-            }
-        } else {
-            self.mtpLogits = nil
-        }
-
-        // Force evaluation of MTP state to prevent graph collapse
-        var evalArrays = [mainTokens] + draftTokens
-        if let mtpLogits = self.mtpLogits { evalArrays.append(contentsOf: mtpLogits) }
-        eval(evalArrays)
+        // Everything this round produced was materialised by the token readback;
+        // the trimmed states are slices that the next round's graph picks up.
     }
 
-    mutating public func next() -> Int? {
+    /// One token without drafting: passthrough for checkpoints without a head,
+    /// and the last token before `maxTokens`.
+    private mutating func plainStep() {
+        if passthroughReason == nil {
+            _ = model.qwenMTPHead(
+                hidden: commitHidden(), nextTokens: commitTokens(), cache: headCache)
+            pendingHeadHidden = nil
+            pendingHeadTokens.removeAll()
+        }
+        let out = model.qwenMTPBackbone(y[.newAxis], cache: cache, logitsForLastPositionOnly: true)
+        backbonePasses += 1
+        var logits = out.logits[0..., -1, 0...]
+        logits = processor?.process(logits: logits) ?? logits
+        let token = sampler.sample(logits: logits)
+        processor?.didSample(token: token)
+        y = token
+        yValue = token.item(Int.self)
+        lastHidden = out.hidden[0..., (out.hidden.dim(1) - 1)..., 0...]
+        pendingTokens.append(yValue)
+        quantizeKVCache(&cache)
+        quantizeKVCache(&headCache)
+        eval(cacheArrays(cache) + cacheArrays(headCache) + [y, lastHidden])
+    }
+
+    public mutating func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
-
-        // Drain the pending buffer first
         if pendingIndex < pendingTokens.count {
             let token = pendingTokens[pendingIndex]
             pendingIndex += 1
             tokenCount += 1
             return token
         }
-
-        // Run a new speculation round
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
         speculateRound()
-
-        if pendingTokens.isEmpty {
-            return nil
-        }
-
-        let token = pendingTokens[pendingIndex]
-        pendingIndex += 1
+        guard !pendingTokens.isEmpty else { return nil }
+        let token = pendingTokens[0]
+        pendingIndex = 1
         tokenCount += 1
         return token
     }

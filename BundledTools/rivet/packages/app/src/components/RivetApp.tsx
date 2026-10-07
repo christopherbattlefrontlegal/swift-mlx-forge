@@ -1,4 +1,5 @@
 import { useWindowsHotkeysFix } from '../hooks/useWindowsHotkeysFix';
+import { useForgeNativeCommands } from '../hooks/useForgeNativeCommands';
 import { GraphBuilder } from './GraphBuilder.js';
 import { OverlayTabs } from './OverlayTabs.js';
 import { type FC, useEffect } from 'react';
@@ -58,6 +59,7 @@ export const RivetApp: FC = () => {
   });
 
   useWindowsHotkeysFix();
+  useForgeNativeCommands();
 
   const checkForUpdate = useCheckForUpdate();
 

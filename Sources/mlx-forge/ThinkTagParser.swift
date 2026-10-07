@@ -1,12 +1,17 @@
 // Forge — incremental <think> tag parser for streaming reasoning.
 //
-// Every backend funnels generated text through this parser. It recognizes tags
-// across arbitrary chunk boundaries, preserves ordinary bytes, and records any
-// malformed tag structure so the completed turn can be excluded from replay.
+// Used only by model-local/legacy streams that expose tagged text instead of a
+// structured reasoning channel. It recognizes tags across arbitrary chunk
+// boundaries, preserves ordinary bytes, and records malformed structure.
 
 import Foundation
 
 struct ThinkTagParser: Sendable {
+    enum InitialState: Sendable {
+        case content
+        case reasoning
+    }
+
     private enum State {
         case content
         case reasoning
@@ -24,10 +29,14 @@ struct ThinkTagParser: Sendable {
 
     private(set) var isStructurallyValid = true
 
-    init(openTag: String = "<think>", closeTag: String = "</think>") {
+    init(
+        openTag: String = "<think>", closeTag: String = "</think>",
+        initialState: InitialState = .content
+    ) {
         precondition(!openTag.isEmpty && !closeTag.isEmpty)
         self.openTag = openTag
         self.closeTag = closeTag
+        self.state = initialState == .reasoning ? .reasoning : .content
     }
 
     /// Feed one streaming delta and return only newly classified text.

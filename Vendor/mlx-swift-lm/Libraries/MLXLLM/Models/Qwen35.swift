@@ -145,23 +145,23 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeParameters)
+        // Legacy top-level `rope_scaling`. Checkpoints converted across the
+        // transformers v5 schema change carry both blocks, with the scaling
+        // (for example YaRN) declared only here.
+        let legacyRopeScaling = try container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeScaling)
 
-        if var ropeParameters {
-            if ropeParameters["type"] == nil, let ropeType = ropeParameters["rope_type"] {
-                ropeParameters["type"] = ropeType
-            }
-            self.ropeTheta = ropeParameters["rope_theta"]?.asFloat() ?? 100000.0
-            self.partialRotaryFactor =
-                ropeParameters["partial_rotary_factor"]?.asFloat() ?? 0.25
-            self.ropeScaling = ropeParameters
+        if let ropeParameters {
+            let resolved = resolveRoPEParameters(ropeParameters, legacyScaling: legacyRopeScaling)
+            self.ropeTheta = resolved["rope_theta"]?.asFloat() ?? 100000.0
+            self.partialRotaryFactor = resolved["partial_rotary_factor"]?.asFloat() ?? 0.25
+            self.ropeScaling = resolved
         } else {
             self.ropeTheta =
                 try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 100000.0
             self.partialRotaryFactor =
                 try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 0.25
-            self.ropeScaling =
-                try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
-                ?? defaultRopeParameters
+            self.ropeScaling = legacyRopeScaling ?? defaultRopeParameters
         }
 
         if self.headDim == nil {
@@ -285,17 +285,39 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
 
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
+        if let cache, cache.speculativeWindowArmed {
+            // The MTP iterator armed this cache for a verify window: keep the
+            // state after every position so a rejected tail rolls back by slicing.
+            let trace: MLXArray
+            (out, trace) = gatedDeltaUpdateTracingStates(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+            cache.recordSpeculativeWindow(
+                MambaSpeculativeWindow(
+                    convInput: convInput, stateTrace: trace, stateBefore: state,
+                    convKernelSize: convKernelSize))
+            state = contiguous(trace[0..., S - 1])
+        } else {
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = state
@@ -506,9 +528,11 @@ final class Qwen35DecoderLayer: Module {
     }
 }
 
-/// One native Qwen3.5/Qwen3.6 multi-token-prediction block. Property keys
-/// match the AEON standalone drafter after Forge prefixes them with
-/// `language_model.mtp.0.`.
+/// One native Qwen multi-token-prediction block: fuse the backbone state at t
+/// with the embedding of token t+1, run one full-attention layer, predict t+2
+/// through the shared `lm_head`. Property keys sit under
+/// `language_model.mtp.0.`, whether the head shipped inside the checkpoint
+/// (Qwen3.8, remapped in `sanitize`) or as the AEON sidecar drafter.
 final class Qwen35NativeMTPLayer: Module {
     @ModuleInfo(key: "pre_fc_norm_embedding") var preFCNormEmbedding: RMSNorm
     @ModuleInfo(key: "pre_fc_norm_hidden") var preFCNormHidden: RMSNorm
@@ -581,6 +605,12 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        norm(hiddenStates(inputs, cache: cache))
+    }
+
+    /// Final-layer output before the closing norm. The native MTP head can
+    /// consume this state (ml-explore/mlx-lm#990) or the normed one (vLLM).
+    func hiddenStates(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -591,6 +621,7 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        let pipelineInterval = QwenDecodePipeline.layerInterval
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -598,9 +629,14 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            // Hand the layers built so far to the GPU while the rest of the
+            // graph is still being constructed on the CPU.
+            if pipelineInterval > 0, (i + 1) % pipelineInterval == 0, i + 1 < layers.count {
+                asyncEval(hiddenStates)
+            }
         }
 
-        return norm(hiddenStates)
+        return hiddenStates
     }
 }
 
@@ -650,14 +686,29 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        // MTP tensors are not proof of a raw checkpoint: a converted checkpoint can
+        // keep them, and shifting its already-shifted norms a second time produces
+        // garbage tokens. The conv1d layout is the reliable signal on its own
+        // (upstream ml-explore/mlx-swift-lm #598).
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
         var weights = weights
-        if !QwenNativeMTPConfig.retainWeights {
+        if QwenNativeMTPConfig.retainWeights {
+            // A head packaged inside the checkpoint (Qwen3.8) is keyed
+            // `mtp.<name>`; the module keys its heads as an array,
+            // `mtp.0.<name>`. Sidecar keys already carry the index.
+            for key in Array(weights.keys) {
+                guard let range = key.range(of: ".mtp."), let value = weights[key] else {
+                    continue
+                }
+                if key[range.upperBound...].first?.isNumber == true { continue }
+                weights[key] = nil
+                weights[key.replacingCharacters(in: range, with: ".mtp.0.")] = value
+            }
+        } else {
             weights = weights.filter { !$0.key.contains("mtp.") }
         }
 
@@ -701,35 +752,43 @@ extension Qwen35TextModel: LoRAModel {
 }
 
 extension Qwen35TextModel: QwenNativeMTPModel {
-    public func callQwenMTP(
+    public var qwenMTPHeadCount: Int { nativeMTP.count }
+
+    public func qwenMTPBackbone(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        mtpCaches: [[KVCache]]?
-    ) -> [MLXArray] {
-        guard !nativeMTP.isEmpty else {
-            return [callAsFunction(inputs, cache: cache)]
-        }
-
-        let embedding = model.embedTokens(inputs)
-        let mainHidden = model(inputs, cache: cache)
-        let mainLogits = lmHead.map { $0(mainHidden) }
-            ?? model.embedTokens.asLinear(mainHidden)
-
-        var results = [mainLogits]
-        var hidden = mainHidden
-        for (index, layer) in nativeMTP.enumerated() {
-            let layerCache: KVCache? = mtpCaches.flatMap { caches in
-                caches.indices.contains(index) ? caches[index].first : nil
-            }
-            hidden = layer(hidden: hidden, embedding: embedding, cache: layerCache)
-            results.append(lmHead.map { $0(hidden) }
-                ?? model.embedTokens.asLinear(hidden))
-        }
-        return results
+        logitsForLastPositionOnly: Bool
+    ) -> QwenNativeMTPStep {
+        let preNorm = model.hiddenStates(inputs, cache: cache)
+        let normed = model.norm(preNorm)
+        let projected =
+            logitsForLastPositionOnly ? normed[0..., (normed.dim(1) - 1)..., 0...] : normed
+        return QwenNativeMTPStep(
+            logits: project(projected),
+            hidden: QwenNativeMTPConfig.usePreNormHidden ? preNorm : normed)
     }
 
-    public func makeQwenMTPCaches(parameters: GenerateParameters?) -> [[KVCache]] {
-        nativeMTP.map { _ in [KVCacheSimple()] }
+    public func qwenMTPHead(
+        hidden: MLXArray,
+        nextTokens: MLXArray,
+        cache: [KVCache]?
+    ) -> QwenNativeMTPStep {
+        precondition(!nativeMTP.isEmpty, "Qwen35TextModel has no native MTP head loaded")
+        let embedding = model.embedTokens(nextTokens)
+        let out = nativeMTP[0](hidden: hidden, embedding: embedding, cache: cache?.first)
+        let last = out[0..., (out.dim(1) - 1)..., 0...]
+        return QwenNativeMTPStep(logits: project(last), hidden: out)
+    }
+
+    public func makeQwenMTPCache(parameters: GenerateParameters?) -> [KVCache] {
+        nativeMTP.map { _ in KVCacheSimple() }
+    }
+
+    private func project(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 }
 
@@ -784,15 +843,26 @@ extension Qwen35Model: LoRAModel {
 }
 
 extension Qwen35Model: QwenNativeMTPModel {
-    public func callQwenMTP(
+    public var qwenMTPHeadCount: Int { languageModel.qwenMTPHeadCount }
+
+    public func qwenMTPBackbone(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        mtpCaches: [[KVCache]]?
-    ) -> [MLXArray] {
-        languageModel.callQwenMTP(inputs, cache: cache, mtpCaches: mtpCaches)
+        logitsForLastPositionOnly: Bool
+    ) -> QwenNativeMTPStep {
+        languageModel.qwenMTPBackbone(
+            inputs, cache: cache, logitsForLastPositionOnly: logitsForLastPositionOnly)
     }
 
-    public func makeQwenMTPCaches(parameters: GenerateParameters?) -> [[KVCache]] {
-        languageModel.makeQwenMTPCaches(parameters: parameters)
+    public func qwenMTPHead(
+        hidden: MLXArray,
+        nextTokens: MLXArray,
+        cache: [KVCache]?
+    ) -> QwenNativeMTPStep {
+        languageModel.qwenMTPHead(hidden: hidden, nextTokens: nextTokens, cache: cache)
+    }
+
+    public func makeQwenMTPCache(parameters: GenerateParameters?) -> [KVCache] {
+        languageModel.makeQwenMTPCache(parameters: parameters)
     }
 }

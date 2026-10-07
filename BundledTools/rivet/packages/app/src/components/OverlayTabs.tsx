@@ -220,6 +220,7 @@ export const OverlayTabs: FC = () => {
         <div className={clsx('menu-item canvas-menu', { active: openOverlay === undefined })}>
           <button
             className="dropdown-item"
+            title="Build a flow by connecting blocks"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay(undefined);
@@ -233,6 +234,7 @@ export const OverlayTabs: FC = () => {
         <div className={clsx('menu-item plugins', { active: openOverlay === 'plugins' })}>
           <button
             className="dropdown-item"
+            title="Add-ons that give the canvas new kinds of blocks"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay((s) => (s === 'plugins' ? undefined : 'plugins'));
@@ -261,25 +263,27 @@ export const OverlayTabs: FC = () => {
         <div className={clsx('menu-item prompt-designer-menu', { active: openOverlay === 'promptDesigner' })}>
           <button
             className="dropdown-item"
+            title="Try a prompt against a model and adjust it until the answer is right"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay((s) => (s === 'promptDesigner' ? undefined : 'promptDesigner'));
               }
             }}
           >
-            Prompt Designer
+            Prompt Lab
           </button>
         </div>
         <div className={clsx('menu-item trivet-menu', { active: openOverlay === 'trivet' })}>
           <button
             className="dropdown-item"
+            title="Check that a flow still gives the answers you expect"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay((s) => (s === 'trivet' ? undefined : 'trivet'));
               }
             }}
           >
-            Trivet Tests
+            Forge Tests
             {trivet.runningTests && (
               <div className="spinner">
                 <LoadingSpinner />
@@ -290,25 +294,27 @@ export const OverlayTabs: FC = () => {
         <div className={clsx('menu-item chat-viewer-menu', { active: openOverlay === 'chatViewer' })}>
           <button
             className="dropdown-item"
+            title="Read every AI conversation from the last run"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay((s) => (s === 'chatViewer' ? undefined : 'chatViewer'));
               }
             }}
           >
-            Chat Viewer
+            Conversations
           </button>
         </div>
         <div className={clsx('menu-item data-studio', { active: openOverlay === 'dataStudio' })}>
           <button
             className="dropdown-item"
+            title="Tables of examples your flow can read and write"
             onMouseDown={(e) => {
               if (e.button === 0) {
                 setOpenOverlay((s) => (s === 'dataStudio' ? undefined : 'dataStudio'));
               }
             }}
           >
-            Data Studio
+            Data Sets
           </button>
         </div>
       </div>

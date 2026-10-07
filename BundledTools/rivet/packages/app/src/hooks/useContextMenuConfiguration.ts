@@ -1,4 +1,5 @@
 import { type ComponentType, useMemo } from 'react';
+import { useForgeAiModelMenu } from './useForgeAiModelMenu';
 import { useContextMenuAddNodeConfiguration } from './useContextMenuAddNodeConfiguration.js';
 import DeleteIcon from 'majesticons/line/delete-bin-line.svg?react';
 import SettingsCogIcon from 'majesticons/line/settings-cog-line.svg?react';
@@ -50,6 +51,7 @@ const type = <T>() => undefined! as T;
 
 export function useContextMenuConfiguration() {
   const addMenuConfig = useContextMenuAddNodeConfiguration();
+  const aiModelMenu = useForgeAiModelMenu();
   const commands = useContextMenuCommands();
   const selectedNodeIds = useAtomValue(selectedNodesState);
   const clipboard = useAtomValue(clipboardState);
@@ -120,9 +122,19 @@ export function useContextMenuConfiguration() {
           blankArea: {
             contextType: type<{}>(),
             items: [
+              ...(aiModelMenu
+                ? [
+                    {
+                      id: 'add-ai-model',
+                      label: 'Add AI Model',
+                      items: aiModelMenu,
+                      icon: PlusIcon,
+                    },
+                  ]
+                : []),
               {
                 id: 'add',
-                label: 'Add',
+                label: aiModelMenu ? 'Add Block' : 'Add',
                 items: addMenuConfig,
                 icon: PlusIcon,
               },
@@ -151,7 +163,7 @@ export function useContextMenuConfiguration() {
         },
         commands,
       }) as const satisfies ContextMenuConfig,
-    [addMenuConfig, selectedNodeIds.length, commands, clipboard],
+    [addMenuConfig, aiModelMenu, selectedNodeIds.length, commands, clipboard],
   );
 
   return config;

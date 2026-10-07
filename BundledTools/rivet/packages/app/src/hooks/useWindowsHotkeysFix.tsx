@@ -24,7 +24,8 @@ export const useWindowsHotkeysFix = () => {
       return;
     }
 
-    const onKeyUp = ({ key, ctrlKey, shiftKey }: KeyboardEvent) => {
+    const onKeyUp = (event: KeyboardEvent) => {
+      const { key, ctrlKey, shiftKey } = event;
       const code = `${ctrlKey ? 'CmdOrCtrl+' : ''}${shiftKey ? 'Shift+' : ''}${key.toUpperCase()}`;
       const codeToMenuId: Record<string, MenuIds> = {
         F5: 'remote_debugger',
@@ -38,6 +39,7 @@ export const useWindowsHotkeysFix = () => {
         'CmdOrCtrl+ENTER': 'run',
       };
       if (codeToMenuId[code]) {
+        event.preventDefault();
         console.warn(`Hotkey Fix: ${code} -> ${codeToMenuId[code]}`);
         runMenuCommandImpl(codeToMenuId[code]!);
       }

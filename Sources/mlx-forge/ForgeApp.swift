@@ -40,6 +40,15 @@ struct ForgeApp: App {
                     appState.newConversation()
                 }
                 .keyboardShortcut("n")
+                Divider()
+                Button("Open Graph Project…") {
+                    sendGraphCommand(.openProject)
+                }
+                .keyboardShortcut("o")
+                Button("Import Graph…") {
+                    sendGraphCommand(.importGraph)
+                }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
             }
             CommandMenu("Model") {
                 Button("Browse Models…") {
@@ -52,9 +61,15 @@ struct ForgeApp: App {
                 .keyboardShortcut("h")
                 Divider()
                 Button(appState.showRivet ? "Show Chat" : "Show Forge Graph") {
+                    appState.showMediaStudio = false
                     appState.showRivet.toggle()
                 }
                 .keyboardShortcut("g")
+                Button("Show Media Studio") {
+                    appState.showRivet = false
+                    appState.showMediaStudio = true
+                }
+                .keyboardShortcut("e")
                 Button("Unload All Models") {
                     appState.stopGenerating()
                     appState.engine.unloadAll()
@@ -67,6 +82,18 @@ struct ForgeApp: App {
         Settings {
             ForgeSettingsView()
                 .environment(appState)
+        }
+    }
+
+    private func sendGraphCommand(_ command: ForgeGraphCommand) {
+        appState.showMediaStudio = false
+        if appState.showRivet {
+            NotificationCenter.default.post(name: .forgeGraphCommand, object: command)
+        } else {
+            appState.showRivet = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                NotificationCenter.default.post(name: .forgeGraphCommand, object: command)
+            }
         }
     }
 }
@@ -85,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockFlame.start()
         AppState.shared.beginMCP()
+        AppState.shared.autoRefreshCloudCatalogs()
     }
 
     func applicationShouldHandleReopen(
@@ -115,10 +143,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+enum WorkbenchTab: Hashable {
+    case chat, graph, media
+}
+
+/// macOS 27 introduces a picker style meant for tab-based navigation (it also
+/// reads as "tabs" in VoiceOver); older systems keep the segmented look.
+private struct WorkbenchPickerStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 27, *) {
+            content.pickerStyle(.tabs)
+        } else {
+            content.pickerStyle(.segmented)
+        }
+    }
+}
+
 struct RootView: View {
     @Environment(AppState.self) private var app
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var initializedPanelVisibility = false
+    @State private var speechStudio = SpeechStudio()
+
+    /// Three panes over the two underlying flags; Media wins when both are set.
+    private var workbenchSelection: Binding<WorkbenchTab> {
+        Binding(
+            get: {
+                if app.showMediaStudio { return .media }
+                return app.showRivet ? .graph : .chat
+            },
+            set: { tab in
+                app.showMediaStudio = (tab == .media)
+                app.showRivet = (tab == .graph)
+            })
+    }
 
     var body: some View {
         @Bindable var app = app
@@ -129,8 +187,10 @@ struct RootView: View {
                     ideal: 260,
                     max: 340)
         } detail: {
-            // Chat and Rivet share the detail column and the same Forge model library.
-            if app.showRivet {
+            // Chat, Rivet, and Media share the detail column and the same model library.
+            if app.showMediaStudio {
+                MediaView(speechStudio: speechStudio)
+            } else if app.showRivet {
                 RivetView()
             } else {
                 ChatView()
@@ -164,20 +224,27 @@ struct RootView: View {
             SystemPromptEditor()
                 .environment(app)
         }
+        .sheet(isPresented: $app.showTournament) {
+            TournamentView()
+                .environment(app)
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 UnloadModelsToolbarButton()
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                Picker("Workbench", selection: $app.showRivet) {
-                    Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(false)
+                Picker("Workbench", selection: workbenchSelection) {
+                    Label("Chat", systemImage: "bubble.left.and.bubble.right")
+                        .tag(WorkbenchTab.chat)
                     Label("Graph", systemImage: "point.3.filled.connected.trianglepath.dotted")
-                        .tag(true)
+                        .tag(WorkbenchTab.graph)
+                    Label("Media", systemImage: "photo.on.rectangle.angled")
+                        .tag(WorkbenchTab.media)
                 }
-                .pickerStyle(.segmented)
+                .modifier(WorkbenchPickerStyle())
                 .labelsHidden()
-                .frame(width: 150)
-                .help("Switch between Forge chat and Forge Graph")
+                .frame(width: 225)
+                .help("Switch between Forge chat, Forge Graph, and the Media Studio")
 
                 if case .running = app.server.state {
                     Label("API", systemImage: "network")
@@ -187,11 +254,17 @@ struct RootView: View {
                 }
                 MemoryBadge()
                 Button {
+                    app.showTournament = true
+                } label: {
+                    Label("Tournament", systemImage: "trophy")
+                }
+                .help("Configure and run a model tournament")
+                Button {
                     toggleInspectorPanel()
                 } label: {
                     Label("Tuning", systemImage: "slider.horizontal.3")
                 }
-                .disabled(app.showRivet)
+                .disabled(app.showRivet || app.showMediaStudio)
                 .help("Show or hide the tuning panel")
             }
         }

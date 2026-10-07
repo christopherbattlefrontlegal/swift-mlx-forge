@@ -42,8 +42,13 @@ final class InferenceEngine {
         let chatTemplateHasTemplate: Bool
         /// Sniffed at load: template defines `enable_thinking`.
         let chatTemplateSupportsThinkingToggle: Bool
-        /// Sniffed at load: template defines `reasoning_effort` (Inkling).
+        /// Sniffed at load: template defines `reasoning_effort` (Inkling, Qwen3.8).
         let chatTemplateSupportsReasoningEffort: Bool
+        /// Sniffed at load: levels the template enumerates for `reasoning_effort`
+        /// (Qwen3.8: xhigh, medium, low); empty for Inkling-style templates.
+        let chatTemplateReasoningEffortLevels: [String]
+        /// Sniffed at load: the template's declared default `reasoning_effort`.
+        let chatTemplateReasoningEffortDefault: String?
         /// Sniffed at load: template has no off-branch for `enable_thinking`.
         let chatTemplateThinkingOnly: Bool
         /// Sniffed at load: generation prompt always opens a `` block.
@@ -64,6 +69,8 @@ final class InferenceEngine {
             self.chatTemplateHasTemplate = templateCaps.hasChatTemplate
             self.chatTemplateSupportsThinkingToggle = templateCaps.supportsThinkingToggle
             self.chatTemplateSupportsReasoningEffort = templateCaps.supportsReasoningEffort
+            self.chatTemplateReasoningEffortLevels = templateCaps.reasoningEffortLevels
+            self.chatTemplateReasoningEffortDefault = templateCaps.reasoningEffortDefault
             self.chatTemplateThinkingOnly = templateCaps.thinkingOnly
             self.chatTemplateThinkingBuiltIn = templateCaps.thinkingBuiltIntoTemplate
         }
@@ -195,10 +202,11 @@ final class InferenceEngine {
             throw ForgeError.loadFailed(message)
         }
 
-        // Qwen MTP requires Forge's combined target+sidecar weight loader;
-        // upstream's factory sees only the target repository.
-        let hasQwenMTPSidecar = qwenMTPDrafterDirectory(for: model.directory) != nil
-        let useFactoryLoader = !hasQwenMTPSidecar
+        // Qwen MTP requires Forge's weight loader: it keeps the head packaged
+        // inside a Qwen3.8 checkpoint, or merges a sidecar drafter; upstream's
+        // factory drops both.
+        let hasQwenMTP = qwenNativeMTPAvailable(for: model.directory)
+        let useFactoryLoader = !hasQwenMTP
             && (policy == .eager || model.prefersStandardMLXLoad)
         let task: Task<ModelContainer, Error>
         let generation: UInt64
@@ -287,7 +295,7 @@ final class InferenceEngine {
             let entry = Loaded(
                 model: model, container: container,
                 weightLoadPolicy: recordedPolicy,
-                qwenMTPEnabled: hasQwenMTPSidecar,
+                qwenMTPEnabled: hasQwenMTP,
                 templateCaps: templateCaps)
             loadedModels.append(entry)
             if activeModelID == nil { activeModelID = entry.id }
@@ -583,7 +591,8 @@ final class InferenceEngine {
         settings: GenerationSettings,
         systemInstructions: String = "",
         targetModelID: String? = nil,
-        onChunk: @escaping @MainActor (String) -> Void,
+        mcpTools: [MCPToolBinding]? = nil,
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
     ) {
         let entry: Loaded?
@@ -664,6 +673,7 @@ final class InferenceEngine {
                             systemInstructions: resolvedSystem,
                             images: images,
                             settings: settings,
+                            mcpTools: mcpTools,
                             budgetTarget: budgetTarget,
                             noThinkPrefill: noThinkPrefill,
                             start: start,
@@ -685,7 +695,8 @@ final class InferenceEngine {
             (session, userPrompt) = try preparedSession(
                 for: conversation, entry: entry, settings: settings,
                 prompt: prompt,
-                systemInstructions: resolvedSystem)
+                systemInstructions: resolvedSystem,
+                mcpTools: mcpTools)
         } catch {
             onComplete(nil, error.localizedDescription)
             return
@@ -743,7 +754,7 @@ final class InferenceEngine {
         prompt: String,
         settings: GenerationSettings,
         systemInstructions: String,
-        onChunk: @escaping @MainActor (String) -> Void,
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void,
         onComplete: @escaping @MainActor (GenerateCompletionInfo?, String?) -> Void
     ) {
         let systemPrompt = systemInstructions
@@ -868,8 +879,10 @@ final class InferenceEngine {
     private func preparedSession(
         for conversation: Conversation, entry: Loaded, settings: GenerationSettings,
         prompt: String,
-        systemInstructions: String
+        systemInstructions: String,
+        mcpTools: [MCPToolBinding]? = nil
     ) throws -> (ChatSession, String) {
+        let toolSpecs = Self.toolSpecs(from: mcpTools)
         let systemPrompt = systemInstructions
         let thinkingDirective = Self.thinkingBudgetFrontDirective(
             for: entry, settings: settings)
@@ -884,6 +897,7 @@ final class InferenceEngine {
             box.session.additionalContext = Self.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled,
                 effort: settings.localReasoningEffort)
+            box.session.tools = toolSpecs
             sessions[conversation.id] = box
             let userPrompt = Self.userPrompt(
                 prompt: prompt,
@@ -914,7 +928,8 @@ final class InferenceEngine {
             generateParameters: Self.parameters(from: settings),
             additionalContext: Self.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled,
-                effort: settings.localReasoningEffort))
+                effort: settings.localReasoningEffort),
+            tools: toolSpecs)
         sessions[conversation.id] = SessionBox(
             session: session, modelID: entry.id,
             messageCount: conversation.messages.count, systemPrompt: systemPrompt,
@@ -968,7 +983,10 @@ final class InferenceEngine {
         try await Task.detached(priority: .userInitiated) {
             [directory, loadPolicy, useFactoryLoader, reportProgress] in
             try Task.checkCancellation()
-            let configuration = ModelConfiguration(directory: directory)
+            var configuration = ModelConfiguration(directory: directory)
+            if let format = ChatTemplateSniffer.toolCallFormat(modelDirectory: directory) {
+                configuration.toolCallFormat = format
+            }
             let downloader = ModelStore.makeDownloader()
             let tokenizerLoader = #huggingFaceTokenizerLoader()
             if useFactoryLoader {
@@ -1033,6 +1051,15 @@ final class InferenceEngine {
     nonisolated static let thinkingBudgetForceCloseSuffix =
         "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 
+    nonisolated static func thinkingBudgetForceCloseSuffix(
+        for format: ReasoningTagFormat
+    ) -> String {
+        guard format != .think else { return thinkingBudgetForceCloseSuffix }
+        return
+            "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n"
+            + format.closeTag + "\n\n"
+    }
+
     static func thinkingBudgetGraceTokens(for target: Int) -> Int {
         max(1, Int((Double(target) * thinkingBudgetGraceFraction).rounded()))
     }
@@ -1058,18 +1085,95 @@ final class InferenceEngine {
         """
     }
 
+    // MARK: - Native MCP tool calling (chat template)
+
+    /// OpenAI/Hermes-style tool specs for the chat template, built from Forge's
+    /// MCP catalog. The template renders these in the model's trained format,
+    /// so tool-trained local models call tools natively instead of imitating a
+    /// bespoke text protocol.
+    nonisolated static func toolSpecs(from bindings: [MCPToolBinding]?) -> [ToolSpec]? {
+        guard let bindings, !bindings.isEmpty else { return nil }
+        return bindings.map { binding in
+            [
+                "type": "function",
+                "function": [
+                    "name": binding.nativeToolName,
+                    "description": binding.tool.description,
+                    "parameters": sendableJSON(binding.tool.inputSchemaJSON)
+                        ?? ["type": "object"],
+                ] as [String: any Sendable],
+            ]
+        }
+    }
+
+    nonisolated private static func sendableJSON(_ json: String?) -> [String: any Sendable]? {
+        guard let json,
+            let object = try? JSONSerialization.jsonObject(with: Data(json.utf8))
+        else { return nil }
+        return sendableValue(object) as? [String: any Sendable]
+    }
+
+    /// Rebuilds a JSONSerialization tree with Swift-native Sendable values.
+    nonisolated private static func sendableValue(_ value: Any) -> any Sendable {
+        switch value {
+        case let dictionary as [String: Any]:
+            return dictionary.mapValues { sendableValue($0) }
+        case let array as [Any]:
+            return array.map { sendableValue($0) }
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue }
+            if number.doubleValue == number.doubleValue.rounded(),
+                abs(number.doubleValue) < 1e15
+            {
+                return number.intValue
+            }
+            return number.doubleValue
+        case let string as String:
+            return string
+        case is NSNull:
+            return ""
+        default:
+            return String(describing: value)
+        }
+    }
+
+    /// Re-serializes a native template tool call into the transcript text form
+    /// Forge's agent loop parses: `<tool_call>{"name":...,"arguments":{...}}</tool_call>`.
+    /// Round-trips through ToolCall's Codable encoding (its argument helpers are
+    /// internal to MLXLMCommon).
+    nonisolated private static func toolCallText(_ call: ToolCall) -> String? {
+        guard let encoded = try? JSONEncoder().encode(call),
+            let object = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any],
+            let function = object["function"] as? [String: Any],
+            let name = function["name"] as? String
+        else { return nil }
+        let payload: [String: Any] = [
+            "name": name,
+            "arguments": (function["arguments"] as? [String: Any]) ?? [:],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        return "\n<tool_call>" + String(decoding: data, as: UTF8.self) + "</tool_call>\n"
+    }
+
     private func streamMLXResponse(
         session: ChatSession,
         userPrompt: String,
         entry: Loaded,
         images: [Data],
         start: Date,
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws -> GenerateCompletionInfo? {
         var completionInfo: GenerateCompletionInfo?
-        // Templates that pre-open <think> inside the generation prompt stream reasoning
-        // with no opening tag — surface one so the UI can render a live reasoning block.
-        var emittedSyntheticThinkOpen = false
+        let promptCapture = RenderedPromptCapture()
+        session.onPromptPrepared = { prepared in
+            promptCapture.set(
+                RenderedPromptSnapshot(
+                    tokenIDs: prepared.tokenIDs,
+                    thinkingMarkers: prepared.thinkingMarkers,
+                    promptTailText: prepared.promptTailText))
+        }
+        defer { session.onPromptPrepared = nil }
+        var classifier: ReasoningStreamClassifier?
 
         let mlxImages = try Self.mlxImages(from: images)
         for try await item in session.streamDetails(
@@ -1081,23 +1185,29 @@ final class InferenceEngine {
                 if materializingModelID == entry.id {
                     materializingModelID = nil
                 }
-                if !emittedSyntheticThinkOpen {
-                    emittedSyntheticThinkOpen = true
-                    if entry.chatTemplateThinkingBuiltIn, !text.hasPrefix("<think>") {
-                        onChunk("<think>")
-                    }
-                }
                 liveTokenCount += 1
                 let elapsed = Date().timeIntervalSince(start)
                 if elapsed > 0.2 {
                     liveTokensPerSecond = Double(liveTokenCount) / elapsed
                 }
-                onChunk(text)
+                if classifier == nil {
+                    classifier = ReasoningStreamClassifier(
+                        context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                }
+                for delta in classifier!.ingest(text) { onChunk(delta) }
             case .info(let info):
                 completionInfo = info
-            case .toolCall:
-                break
+            case .toolCall(let call):
+                // Native chat-template tool call (the model's trained format).
+                // Re-serialize it into the transcript text; Forge's agent loop
+                // parses and executes it after the turn completes.
+                if let text = Self.toolCallText(call) {
+                    onChunk(.content(text))
+                }
             }
+        }
+        if var classifier {
+            for delta in classifier.finalize() { onChunk(delta) }
         }
         return completionInfo
     }
@@ -1119,10 +1229,11 @@ final class InferenceEngine {
         systemInstructions: String,
         images: [Data],
         settings: GenerationSettings,
+        mcpTools: [MCPToolBinding]? = nil,
         budgetTarget: Int?,
         noThinkPrefill: Bool,
         start: Date,
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws -> GenerateCompletionInfo? {
         var turns: [BudgetTurn] = []
         let trimmedSystem = systemInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1141,11 +1252,9 @@ final class InferenceEngine {
         })
         turns.append(BudgetTurn(role: "user", content: userPrompt, images: images))
 
-        let thinkingFromStart =
-            !noThinkPrefill
-            && (entry.chatTemplateThinkingOnly || entry.chatTemplateThinkingBuiltIn)
         var completionInfo: GenerateCompletionInfo?
-        var emittedSyntheticThinkOpen = false
+        let promptCapture = RenderedPromptCapture()
+        var classifier: ReasoningStreamClassifier?
 
         let stream = Self.budgetedGenerationStream(
             container: entry.container!,
@@ -1155,8 +1264,9 @@ final class InferenceEngine {
                 effort: settings.localReasoningEffort),
             parameters: Self.parameters(from: settings),
             hardLimit: budgetTarget.map { Self.thinkingBudgetHardLimit(for: $0) },
-            thinkingFromStart: thinkingFromStart,
-            prefillText: noThinkPrefill ? Self.noThinkPrefillText : nil)
+            promptCapture: promptCapture,
+            prefillText: noThinkPrefill ? Self.noThinkPrefillText : nil,
+            tools: Self.toolSpecs(from: mcpTools))
 
         for try await item in stream {
             if Task.isCancelled { break }
@@ -1165,26 +1275,29 @@ final class InferenceEngine {
                 if materializingModelID == entry.id {
                     materializingModelID = nil
                 }
-                if !emittedSyntheticThinkOpen {
-                    emittedSyntheticThinkOpen = true
-                    // thinkingFromStart = the template pre-opened <think>, so the
-                    // raw stream begins mid-reasoning with no opening tag — surface
-                    // one so ThinkTagParser routes the tokens into the reasoning channel.
-                    if thinkingFromStart, !text.hasPrefix("<think>") {
-                        onChunk("<think>")
-                    }
-                }
                 liveTokenCount += 1
                 let elapsed = Date().timeIntervalSince(start)
                 if elapsed > 0.2 {
                     liveTokensPerSecond = Double(liveTokenCount) / elapsed
                 }
-                onChunk(text)
+                if classifier == nil {
+                    classifier = ReasoningStreamClassifier(
+                        context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                }
+                for delta in classifier!.ingest(text) { onChunk(delta) }
             case .info(let info):
                 completionInfo = info
-            case .toolCall:
-                break
+            case .toolCall(let call):
+                // Native chat-template tool call (the model's trained format).
+                // Re-serialize it into the transcript text; Forge's agent loop
+                // parses and executes it after the turn completes.
+                if let text = Self.toolCallText(call) {
+                    onChunk(.content(text))
+                }
             }
+        }
+        if var classifier {
+            for delta in classifier.finalize() { onChunk(delta) }
         }
         return completionInfo
     }
@@ -1200,13 +1313,14 @@ final class InferenceEngine {
         additionalContext: [String: any Sendable]?,
         parameters: GenerateParameters,
         hardLimit: Int?,
-        thinkingFromStart: Bool,
-        prefillText: String? = nil
+        promptCapture: RenderedPromptCapture,
+        prefillText: String? = nil,
+        tools: [ToolSpec]? = nil
     ) -> AsyncThrowingStream<Generation, Error> {
         let (stream, continuation) = AsyncThrowingStream<Generation, Error>.makeStream()
         let task = Task {
             [container, turns, additionalContext, parameters, hardLimit,
-                thinkingFromStart, prefillText, continuation] in
+                promptCapture, prefillText, tools, continuation] in
             do {
                 try await container.perform { context in
                     let messages: [Chat.Message] = try turns.map { turn in
@@ -1220,7 +1334,7 @@ final class InferenceEngine {
                         }
                     }
                     let userInput = UserInput(
-                        chat: messages, additionalContext: additionalContext)
+                        chat: messages, tools: tools, additionalContext: additionalContext)
                     let lmInput = try await context.processor.prepare(input: userInput)
 
                     var promptTokens = lmInput.text.tokens
@@ -1231,6 +1345,15 @@ final class InferenceEngine {
                             promptTokens, MLXArray(prefillIDs.map { Int32($0) }),
                         ])
                     }
+
+                    let promptTokenIDs = promptTokens.asArray(Int.self)
+                    let promptSnapshot = RenderedPromptSnapshot(
+                        tokenIDs: promptTokenIDs,
+                        thinkingMarkers: context.tokenizer.thinkingMarkers,
+                        promptTailText: context.tokenizer.decode(
+                            tokenIds: Array(promptTokenIDs.suffix(64))))
+                    promptCapture.set(promptSnapshot)
+                    let reasoningContext = promptSnapshot.reasoningContext
 
                     // Phase 1 — decode until </think> closes naturally or the cap hits.
                     let phase1: AsyncStream<Generation>
@@ -1245,7 +1368,9 @@ final class InferenceEngine {
                             promptTokenCount: promptTokens.size,
                             modelConfiguration: context.configuration,
                             tokenizer: context.tokenizer,
-                            iterator: iterator)
+                            iterator: iterator,
+                            tools: tools,
+                            toolCallStartsInReasoning: reasoningContext.startsInReasoning)
                     } else {
                         let iterator = try TokenIterator(
                             input: LMInput(text: .init(tokens: promptTokens)),
@@ -1254,7 +1379,9 @@ final class InferenceEngine {
                             promptTokenCount: promptTokens.size,
                             modelConfiguration: context.configuration,
                             tokenizer: context.tokenizer,
-                            iterator: iterator)
+                            iterator: iterator,
+                            tools: tools,
+                            toolCallStartsInReasoning: reasoningContext.startsInReasoning)
                     }
 
                     var generated = ""
@@ -1267,11 +1394,14 @@ final class InferenceEngine {
                         switch item {
                         case .chunk(let text):
                             generated += text
-                            if !thinkingClosed, generated.contains("</think>") {
+                            if !thinkingClosed,
+                                generated.contains(reasoningContext.format.closeTag)
+                            {
                                 thinkingClosed = true
                             }
                             if let hardLimit, !thinkingClosed,
-                                thinkingFromStart || generated.contains("<think>")
+                                reasoningContext.startsInReasoning
+                                    || generated.contains(reasoningContext.format.openTag)
                             {
                                 // Chunks from the naive detokenizer are one token each.
                                 thinkingTokens += 1
@@ -1296,7 +1426,8 @@ final class InferenceEngine {
                     }
 
                     // Phase 2 — canonical early-stop injection, then continue the answer.
-                    let injection = thinkingBudgetForceCloseSuffix
+                    let injection = thinkingBudgetForceCloseSuffix(
+                        for: reasoningContext.format)
                     continuation.yield(.chunk(injection))
                     let continuationIDs = context.tokenizer.encode(
                         text: generated + injection, addSpecialTokens: false)
@@ -1316,21 +1447,27 @@ final class InferenceEngine {
                             model: qwenMTP,
                             parameters: phase2Parameters,
                             numMTPTokens: 3)
+                        // Phase 2 resumes after the injected </think> — the answer
+                        // phase, where real tool calls appear.
                         (phase2, phase2Task) = MLXLMCommon.generateTask(
                             promptTokenCount: phase2Tokens.size,
                             modelConfiguration: context.configuration,
                             tokenizer: context.tokenizer,
-                            iterator: iterator)
+                            iterator: iterator,
+                            tools: tools)
                     } else {
                         let iterator = try TokenIterator(
                             input: LMInput(text: .init(tokens: phase2Tokens)),
                             model: context.model,
                             parameters: phase2Parameters)
+                        // Phase 2 resumes after the injected </think> — the answer
+                        // phase, where real tool calls appear.
                         (phase2, phase2Task) = MLXLMCommon.generateTask(
                             promptTokenCount: phase2Tokens.size,
                             modelConfiguration: context.configuration,
                             tokenizer: context.tokenizer,
-                            iterator: iterator)
+                            iterator: iterator,
+                            tools: tools)
                     }
                     for await item in phase2 {
                         if Task.isCancelled { break }
@@ -1378,8 +1515,23 @@ final class InferenceEngine {
         for entry: Loaded, enabled: Bool, effort: String = "high"
     ) -> [String: any Sendable]? {
         if entry.chatTemplateSupportsReasoningEffort {
-            let normalized = LocalReasoningEffort(rawValue: effort)?.rawValue ?? "high"
-            return ["reasoning_effort": enabled ? normalized : "none"]
+            let levels = entry.chatTemplateReasoningEffortLevels
+            if levels.isEmpty {
+                // Inkling-style: the effort value doubles as the off switch.
+                let normalized = LocalReasoningEffort(rawValue: effort)?.rawValue ?? "high"
+                return ["reasoning_effort": enabled ? normalized : "none"]
+            }
+            // Template-enumerated levels (Qwen3.8: xhigh, medium, low). The template
+            // raises on anything else, so clamp to its own list; thinking off goes
+            // through `enable_thinking`, which the same templates also read.
+            let level =
+                levels.contains(effort)
+                ? effort : (entry.chatTemplateReasoningEffortDefault ?? levels[0])
+            var context: [String: any Sendable] = ["reasoning_effort": level]
+            if entry.chatTemplateSupportsThinkingToggle {
+                context["enable_thinking"] = enabled
+            }
+            return context
         }
         guard entry.chatTemplateSupportsThinkingToggle else { return nil }
         return ["enable_thinking": enabled]
@@ -1401,12 +1553,41 @@ final class InferenceEngine {
             : settings.reasoningEnabled
                 ? max(settings.maxTokens, 16_384)
                 : settings.maxTokens
+        // Penalties. MLX treats nil / 0 as off; each has its own look-back window.
         if settings.repetitionPenalty > 1.0 {
             parameters.repetitionPenalty = Float(settings.repetitionPenalty)
-            parameters.repetitionContextSize = 20
+            parameters.repetitionContextSize = max(1, settings.repetitionContextSize)
+        }
+        if settings.presencePenalty != 0 {
+            parameters.presencePenalty = Float(settings.presencePenalty)
+            parameters.presenceContextSize = max(1, settings.presenceContextSize)
+        }
+        if settings.frequencyPenalty != 0 {
+            parameters.frequencyPenalty = Float(settings.frequencyPenalty)
+            parameters.frequencyContextSize = max(1, settings.frequencyContextSize)
+        }
+        // Seed: 0 keeps MLX's entropy-seeded sampler; anything else is reproducible.
+        if settings.seed != 0 {
+            parameters.seed = UInt64(max(0, settings.seed))
         }
         if settings.maxKVSize > 0 {
             parameters.maxKVSize = settings.maxKVSize
+        }
+        // KV cache quantization. A named scheme overrides kvBits inside MLX
+        // (resolveAffineScheme); "custom" passes kvBits/kvGroupSize through directly.
+        switch settings.kvScheme {
+        case "affine4", "affine8":
+            parameters.kvScheme = settings.kvScheme
+            parameters.quantizedKVStart = max(0, settings.quantizedKVStart)
+        case "custom":
+            parameters.kvBits = settings.kvBits
+            parameters.kvGroupSize = settings.kvGroupSize
+            parameters.quantizedKVStart = max(0, settings.quantizedKVStart)
+        default:
+            break
+        }
+        if settings.prefillStepSize > 0 {
+            parameters.prefillStepSize = settings.prefillStepSize
         }
         return parameters
     }

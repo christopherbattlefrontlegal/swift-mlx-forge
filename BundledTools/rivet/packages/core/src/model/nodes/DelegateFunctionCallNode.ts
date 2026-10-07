@@ -185,8 +185,12 @@ export class DelegateFunctionCallNodeImpl extends NodeImpl<DelegateFunctionCallN
           try {
             const externalContext = omit(context, ['setGlobal']);
             const result = await externalFunction(externalContext, functionCall.arguments ?? {});
-
-            const outputString = typeof result === 'string' ? result : JSON.stringify(result);
+            const unwrappedResult =
+              result && typeof result === 'object' && 'type' in result && 'value' in result
+                ? (result as DataValue).value
+                : result;
+            const outputString =
+              typeof unwrappedResult === 'string' ? unwrappedResult : JSON.stringify(unwrappedResult);
 
             return {
               ['output' as PortId]: {

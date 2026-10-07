@@ -56,15 +56,28 @@ public class ToolCallProcessor {
 
     // MARK: - Initialization
 
+    /// True while the stream is inside a `<think>` reasoning block. Tool-call
+    /// syntax there is the model planning, not a call — reasoning passes
+    /// through untouched and the state machine stays out of it. Streams whose
+    /// prompt already opened a think block (thinking-by-default templates)
+    /// must start with this set.
+    private var insideReasoning: Bool
+
     /// Initialize with a specific tool call format.
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
+    ///   - startsInReasoning: Whether the prompt ends inside an open `<think>`
+    ///     block, so the stream begins as reasoning text.
+    public init(
+        format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil,
+        startsInReasoning: Bool = false
+    ) {
         self.format = format
         self.parser = format.createParser()
         self.tools = tools
         self.supportsBareJSONFallback = format == .json
+        self.insideReasoning = startsInReasoning
     }
 
     // MARK: - Computed Properties
@@ -85,6 +98,17 @@ public class ToolCallProcessor {
     /// - Parameter chunk: The text chunk to process
     /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
     public func processChunk(_ chunk: String) -> String? {
+        // Reasoning guard: never treat text inside <think>...</think> as a
+        // tool call. Chunks are token-sized, so tag containment per chunk is
+        // a reliable transition signal.
+        if insideReasoning {
+            if chunk.contains("</think>") { insideReasoning = false }
+            return chunk
+        }
+        if chunk.contains("<think>"), !chunk.contains("</think>") {
+            insideReasoning = true
+            return chunk
+        }
         if isInlineFormat {
             return processInlineChunk(chunk)
         }

@@ -143,12 +143,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>com.forge.mlx</string>
     <key>CFBundleName</key><string>Forge</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.0.0</string>
+    <key>CFBundleShortVersionString</key><string>2.1.1</string>
     <key>CFBundleVersion</key><string>2</string>
 $ICON_PLIST
     <key>ForgeMCPConfigPath</key><string></string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <key>NSAppleEventsUsageDescription</key><string>Forge controls Apple Music playback (play, pause, volume, EQ) from the Media tab.</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>Forge — native MLX runtime</string>
 </dict>

@@ -50,8 +50,8 @@ export class ChatNodeImpl extends NodeImpl<ChatNode> {
     };
   }
 
-  getEditors(): EditorDefinition<ChatNode>[] {
-    return ChatNodeBase.getEditors();
+  getEditors(): Promise<EditorDefinition<ChatNode>[]> {
+    return ChatNodeBase.getLiveEditors();
   }
 
   getBody() {

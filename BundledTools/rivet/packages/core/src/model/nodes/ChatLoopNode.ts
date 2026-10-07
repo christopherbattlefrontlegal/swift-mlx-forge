@@ -79,9 +79,9 @@ export class ChatLoopNodeImpl extends NodeImpl<ChatLoopNode> {
     };
   }
 
-  getEditors(): EditorDefinition<ChatLoopNode>[] {
+  async getEditors(): Promise<EditorDefinition<ChatLoopNode>[]> {
     return [
-      ...ChatNodeBase.getEditors(),
+      ...(await ChatNodeBase.getLiveEditors()),
       {
         type: 'code',
         label: 'User Prompt',

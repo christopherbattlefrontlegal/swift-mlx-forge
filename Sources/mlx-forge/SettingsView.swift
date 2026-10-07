@@ -1,5 +1,6 @@
-// Forge — app settings window (⌘,): Claude API key (Keychain) + MCP servers.
-// Both lived in the right sidebar before; they're configuration, not tuning.
+// Forge — app settings window (⌘,): Claude API key (Keychain), local FastH3
+// video paths, and MCP servers. They lived in the right sidebar before; they're
+// configuration, not tuning.
 
 import AppKit
 import SwiftUI
@@ -11,6 +12,8 @@ struct ForgeSettingsView: View {
                 .tabItem { Label("Cloud APIs", systemImage: "cloud") }
             PromptLibrarySettings()
                 .tabItem { Label("Prompt Library", systemImage: "book.closed") }
+            LocalVideoSettings()
+                .tabItem { Label("Local Video", systemImage: "video") }
             MCPSettings()
                 .tabItem { Label("MCP Servers (advanced)", systemImage: "server.rack") }
         }
@@ -29,6 +32,82 @@ private struct ClaudeKeySettings: View {
     @State private var openAIDraft = ""
     @State private var customOpenRouterModel = ""
     @State private var braveSearchDraft = ""
+    @State private var xaiDraft = ""
+    @State private var customModelDrafts: [CloudProvider: String] = [:]
+
+    /// OpenRouter-style live catalog controls, shared by every provider card:
+    /// refresh from the provider's /v1/models, show freshness, add custom ids.
+    @ViewBuilder
+    private func catalogControls(for provider: CloudProvider) -> some View {
+        let tick = app.cloudCatalogTick
+        Divider()
+        VStack(alignment: .leading, spacing: Theme.s2) {
+            HStack(spacing: Theme.s2) {
+                Button("Refresh model catalog") {
+                    app.refreshCloudCatalog(provider)
+                }
+                .controlSize(.small)
+                .disabled(app.catalogLoading.contains(provider))
+                if app.catalogLoading.contains(provider) {
+                    ProgressView().controlSize(.small)
+                }
+                Text(catalogSummary(for: provider, tick: tick))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if let error = app.catalogErrors[provider] {
+                Text(error).font(.caption2).foregroundStyle(.red)
+            }
+            HStack(spacing: Theme.s2) {
+                TextField(
+                    "add model id",
+                    text: Binding(
+                        get: { customModelDrafts[provider] ?? "" },
+                        set: { customModelDrafts[provider] = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                Button("Add") {
+                    let draft = (customModelDrafts[provider] ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !draft.isEmpty else { return }
+                    app.addCustomCloudModel(provider, id: draft)
+                    customModelDrafts[provider] = ""
+                }
+                .controlSize(.small)
+                .disabled(
+                    (customModelDrafts[provider] ?? "")
+                        .trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            let customs = CloudModelCatalog.customModels(provider)
+            if !customs.isEmpty {
+                ForEach(customs, id: \.self) { id in
+                    HStack(spacing: Theme.s1) {
+                        Text(id).font(.caption2.monospaced())
+                        Button {
+                            app.removeCustomCloudModel(provider, id: id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func catalogSummary(for provider: CloudProvider, tick: Int) -> String {
+        _ = tick
+        let count = CloudModelCatalog.fetchedCount(provider)
+        guard count > 0 else { return "Using the built-in list. Refresh to fetch live models." }
+        guard let refreshed = CloudModelCatalog.lastRefresh(provider) else {
+            return "\(count) live models"
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        let age = formatter.localizedString(for: refreshed, relativeTo: Date())
+        return "\(count) live models, updated \(age)"
+    }
 
     var body: some View {
         @Bindable var app = app
@@ -36,6 +115,42 @@ private struct ClaudeKeySettings: View {
             VStack(alignment: .leading, spacing: Theme.s4) {
             Label("Cloud API Providers", systemImage: "cloud")
                 .font(.headline)
+
+            providerCard(
+                title: "Z.AI Coding Plan",
+                icon: "bolt.horizontal.circle",
+                description: app.zaiConfiguration.detail
+            ) {
+                HStack(spacing: Theme.s2) {
+                    Label(
+                        app.zaiConfiguration.summary,
+                        systemImage: app.zaiConfiguration.isConfigured
+                            ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(
+                            app.zaiConfiguration.isConfigured ? Theme.okGreen : Theme.emberGlow)
+                    Spacer()
+                    Button("Refresh ZCode Account") {
+                        app.refreshZAIConfiguration()
+                    }
+                    .controlSize(.small)
+                    .disabled(app.isBusy)
+                }
+
+                Toggle(
+                    "Use GLM-5.3 in chat",
+                    isOn: Binding(
+                        get: { app.isZAISelected },
+                        set: { app.setZAISelected($0) }))
+                    .disabled(!app.zaiConfiguration.isConfigured || app.isBusy)
+
+                Text(
+                    "No API key is copied into Forge. Requests reuse the account selected in ZCode, and the credential exists only in the isolated ZCode child process environment."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
 
             providerCard(
                 title: "OpenRouter",
@@ -193,6 +308,42 @@ private struct ClaudeKeySettings: View {
             }
 
             providerCard(
+                title: "xAI (Grok)",
+                icon: "sparkle",
+                description: app.hasXAIKey
+                    ? "xAI key saved. Used for Grok image generation in the Media Studio."
+                    : "Stored in the macOS Keychain. Used for Grok image generation in the Media Studio."
+            ) {
+                HStack(spacing: Theme.s2) {
+                    SecureField(
+                        app.hasXAIKey ? "Replace key" : "XAI_API_KEY",
+                        text: $xaiDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    Button("Save") {
+                        let key = xaiDraft.trimmingCharacters(in: .whitespaces)
+                        guard !key.isEmpty else { return }
+                        app.setXAIKey(key)
+                        xaiDraft = ""
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.ember)
+                    .disabled(xaiDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if app.hasXAIKey {
+                        Button(role: .destructive) {
+                            app.setXAIKey(nil)
+                            xaiDraft = ""
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .help("Remove the stored xAI key")
+                    }
+                }
+
+                catalogControls(for: .xAI)
+            }
+
+            providerCard(
                 title: "OpenAI",
                 icon: "brain.head.profile",
                 description: app.hasOpenAIKey
@@ -231,6 +382,8 @@ private struct ClaudeKeySettings: View {
                         .help("Remove the stored OpenAI key")
                     }
                 }
+
+                catalogControls(for: .openAI)
             }
 
             providerCard(
@@ -249,6 +402,8 @@ private struct ClaudeKeySettings: View {
                     }
                 }
                 .pickerStyle(.menu)
+
+                catalogControls(for: .anthropic)
 
                 HStack(spacing: Theme.s2) {
                     SecureField(
@@ -331,6 +486,176 @@ private struct ClaudeKeySettings: View {
 
 }
 
+// MARK: - Local video (FastH3)
+
+/// Paths for the FastH3 8-Step V2 runtime that the Media Studio's FastH3 Local
+/// provider launches. Blank fields fall back to the built-in defaults.
+private struct LocalVideoSettings: View {
+    @AppStorage(FastH3Paths.fastVideoRootKey) private var fastVideoRoot =
+        FastH3Paths.defaultFastVideoRoot
+    @AppStorage(FastH3Paths.checkpointRootKey) private var checkpointRoot =
+        FastH3Paths.defaultCheckpointRoot
+    @AppStorage(FastH3Paths.mlxCheckpointKey) private var mlxCheckpoint =
+        FastH3Paths.defaultMLXCheckpoint
+
+    private var paths: FastH3Paths {
+        FastH3Paths(
+            fastVideoRoot: fastVideoRoot, checkpointRoot: checkpointRoot,
+            mlxCheckpoint: mlxCheckpoint)
+    }
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: Theme.s4) {
+            Label("Local Video (FastH3 8-Step V2)", systemImage: "video")
+                .font(.headline)
+            Text("FastH3 Local renders text to video with speech on this Mac through a FastVideo clone.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            pathField("FastVideo clone", text: $fastVideoRoot, hint: "Has .venv and the MLX examples")
+            pathField("Checkpoint root", text: $checkpointRoot, hint: "Has fastvideo_inference.json")
+            pathField("MLX INT8 VSA DiT", text: $mlxCheckpoint, hint: "Has mlx_h3_dit.safetensors")
+
+            readiness
+
+            Divider()
+
+            ReferenceVideoSettings()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Theme.s5)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func pathField(_ title: String, text: Binding<String>, hint: String) -> some View {
+        LocalPathField(title: title, text: text, hint: hint)
+    }
+
+    @ViewBuilder
+    private var readiness: some View {
+        let missing = paths.missing()
+        if missing.isEmpty {
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.green)
+        } else {
+            VStack(alignment: .leading, spacing: Theme.s1) {
+                Label("Missing", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
+                ForEach(missing, id: \.self) { path in
+                    Text(path)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+    }
+}
+
+/// A path row: text field, Browse button, and a hint. Browses folders unless
+/// `choosesFiles` is set.
+private struct LocalPathField: View {
+    let title: String
+    let text: Binding<String>
+    let hint: String
+    var choosesFiles = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s1) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+            HStack(spacing: Theme.s2) {
+                TextField(title, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                Button("Browse…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = !choosesFiles
+                    panel.canChooseFiles = choosesFiles
+                    panel.allowsMultipleSelection = false
+                    panel.directoryURL =
+                        choosesFiles
+                        ? URL(fileURLWithPath: text.wrappedValue).deletingLastPathComponent()
+                        : URL(fileURLWithPath: text.wrappedValue, isDirectory: true)
+                    panel.prompt = "Choose"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        text.wrappedValue = url.path
+                    }
+                }
+                .controlSize(.small)
+            }
+            Text(hint)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// mlx-gen paths and readiness for the reference-conditioned local video routes
+/// (Bernini-R reference-to-video, MiniMax-H3 image-to-video with audio).
+private struct ReferenceVideoSettings: View {
+    @AppStorage(MLXGenPaths.executableKey) private var executable =
+        MLXGenPaths.defaultExecutable
+    @AppStorage(MLXGenPaths.hfHomeKey) private var hfHome = MLXGenPaths.defaultHFHome
+
+    private var paths: MLXGenPaths { MLXGenPaths(executable: executable, hfHome: hfHome) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s4) {
+            Label("Reference Video (mlx-gen)", systemImage: "person.crop.rectangle.stack")
+                .font(.headline)
+            Text(
+                "Bernini Reference makes a clip of the people in your reference photos. H3 Image to Video animates a keyframe with synchronized audio. Both run on this Mac through mlx-gen."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            LocalPathField(
+                title: "mlxgen executable", text: $executable,
+                hint: "The mlxgen binary inside its virtualenv (uv pip install mlx-gen)",
+                choosesFiles: true)
+            LocalPathField(
+                title: "Hugging Face home", text: $hfHome,
+                hint: "HF_HOME; model snapshots live in its hub folder")
+
+            ForEach(MLXGenRoute.allCases, id: \.self) { route in
+                readiness(for: route)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func readiness(for route: MLXGenRoute) -> some View {
+        let missing = paths.missing(for: route)
+        VStack(alignment: .leading, spacing: Theme.s1) {
+            if missing.isEmpty {
+                Label("\(route.title): ready", systemImage: "checkmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.green)
+            } else {
+                Label("\(route.title): missing", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
+                ForEach(missing, id: \.self) { item in
+                    Text(item)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - MCP servers
 
 private struct MCPSettings: View {
@@ -345,52 +670,11 @@ private struct MCPSettings: View {
             Label("MCP Servers", systemImage: "server.rack")
                 .font(.headline)
             Text(
-                "Forge includes a small built-in forge-commander fallback for workspace file tools. Full MCP servers, including Desktop Commander and memory graph, are declared in the local mcp.json."
+                "MCP servers, including Desktop Commander and memory graph, are declared in the local mcp.json. Enable a server below and Forge calls its tools directly."
             )
             .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
-
-            VStack(alignment: .leading, spacing: Theme.s2) {
-                HStack {
-                    Label("Built-in Forge Commander", systemImage: "desktopcomputer")
-                        .font(.caption.weight(.semibold))
-                    Spacer()
-                    Text("\(app.commanderDirectories.count + 1) root\(app.commanderDirectories.isEmpty ? "" : "s")")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                Text("Available out of the box as MCP server \"forge-commander\". It can list, read, write, inspect, and search files under Forge's app-support folder and any workspace folders you grant here.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                VStack(alignment: .leading, spacing: Theme.s1) {
-                    commanderRootRow(ForgePaths.appSupport, removable: false)
-                    ForEach(app.commanderDirectories, id: \.self) { dir in
-                        commanderRootRow(dir, removable: true)
-                    }
-                }
-
-                Button {
-                    let panel = NSOpenPanel()
-                    panel.canChooseDirectories = true
-                    panel.canChooseFiles = false
-                    panel.allowsMultipleSelection = false
-                    panel.prompt = "Add Workspace"
-                    panel.message = "Select a folder that Forge's built-in forge-commander tools may access."
-                    if panel.runModal() == .OK, let url = panel.url {
-                        app.addCommanderDirectory(url)
-                    }
-                } label: {
-                    Label("Add Workspace Folder", systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.ember)
-            }
-            .padding(Theme.s2)
-            .background(.white.opacity(0.04))
-            .clipShape(.rect(cornerRadius: Theme.radiusSmall))
 
             VStack(alignment: .leading, spacing: Theme.s2) {
                 Text("Add HTTP/SSE Server")
@@ -447,7 +731,7 @@ private struct MCPSettings: View {
                 }
             }
 
-            Text("stdio command servers run in the local developer build. Mac App Store sandbox builds must use built-in tools or HTTP/SSE bridges.")
+            Text("stdio command servers run in the local developer build. Mac App Store sandbox builds must use HTTP/SSE bridges.")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
@@ -477,32 +761,6 @@ private struct MCPSettings: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-    private func commanderRootRow(_ url: URL, removable: Bool) -> some View {
-        HStack(spacing: Theme.s2) {
-            Image(systemName: removable ? "folder" : "app.badge")
-                .foregroundStyle(.secondary)
-            Text(url.path)
-                .font(.caption2.monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            Spacer()
-            Button("Reveal") {
-                NSWorkspace.shared.activateFileViewerSelecting([url])
-            }
-            .buttonStyle(.borderless)
-            if removable {
-                Button(role: .destructive) {
-                    app.removeCommanderDirectory(url)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove workspace folder")
-            }
-        }
-    }
 }
 
 private struct MCPServerRow: View {
@@ -523,13 +781,11 @@ private struct MCPServerRow: View {
             }
             Spacer()
             statusText
-            if !entry.isBuiltIn {
-                Button(role: .destructive, action: remove) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove from Forge MCP config")
+            Button(role: .destructive, action: remove) {
+                Image(systemName: "trash")
             }
+            .buttonStyle(.borderless)
+            .help("Remove from Forge MCP config")
         }
         .padding(Theme.s2)
         .frame(maxWidth: .infinity, alignment: .leading)

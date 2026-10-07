@@ -80,10 +80,11 @@ final class ChatHistorySanitizationTests: XCTestCase {
         let turns = history.modelReplayTurns
         XCTAssertEqual(
             turns.map(\.role),
-            [.user, .assistant])
+            [.user, .assistant, .user])
         XCTAssertEqual(turns, [
             ModelReplayTurn(role: .user, content: "How many moons?"),
             ModelReplayTurn(role: .assistant, content: "Answer one"),
+            ModelReplayTurn(role: .user, content: "MCP result: done"),
         ])
         XCTAssertTrue(
             turns.allSatisfy { !$0.content.contains("<think") && !$0.content.contains("</think>") })

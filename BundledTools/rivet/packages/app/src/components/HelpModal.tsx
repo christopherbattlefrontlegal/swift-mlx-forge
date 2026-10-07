@@ -2,7 +2,6 @@ import { type FC } from 'react';
 import { helpModalOpenState } from '../state/ui';
 import Modal, { ModalTransition, ModalHeader, ModalTitle, ModalBody, ModalFooter } from '@atlaskit/modal-dialog';
 import Button from '@atlaskit/button';
-import DiscordIcon from '../assets/vendor_logos/discord-mark-white.svg?react';
 import GithubIcon from '../assets/vendor_logos/github-mark-white.svg?react';
 import TwitterIcon from '../assets/vendor_logos/twitter-logo.svg?react';
 import YoutubeIcon from '../assets/vendor_logos/youtube-icon.png';
@@ -43,15 +42,6 @@ export const HelpModal: FC = () => {
             <div css={styles}>
               <p>Need help with Forge graphs? These upstream resources document the graph engine:</p>
 
-              <h2>
-                <a href="https://discord.gg/qT8B2gv9Mg" target="_blank" rel="noreferrer">
-                  <DiscordIcon /> Upstream Community Discord
-                </a>
-              </h2>
-              <p>
-                Join the upstream community to get help, share your creations, discuss prompt
-                engineering, and more!
-              </p>
               <h2>
                 <a href="https://rivet.ironcladapp.com/docs" target="_blank" rel="noreferrer">
                   <QuestionIcon /> Upstream Graph Documentation

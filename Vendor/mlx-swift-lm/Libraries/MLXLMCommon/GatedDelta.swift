@@ -18,8 +18,32 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, traceStates: Bool = false) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    // Tracing variant: `state_out` is [B, T, Hv, Dv, Dk], the state after every
+    // position, so a speculative tail can be rolled back by slicing.
+    let stateOutInit =
+        traceStates
+        ? "auto o_state = state_out + ((size_t)b_idx * T * Hv + hv_idx) * (size_t)Dv * Dk + dv_idx * Dk;"
+        : "auto o_state = state_out + (n * Dv + dv_idx) * Dk;"
+    let traceWrite =
+        traceStates
+        ? """
+                  for (int i = 0; i < n_per_t; ++i) {
+                    o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+                  }
+                  o_state += (size_t)Hv * Dv * Dk;
+        """
+        : ""
+    let finalWrite =
+        traceStates
+        ? ""
+        : """
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  o_state[s_idx] = static_cast<StT>(state[i]);
+                }
+        """
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -43,9 +67,9 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             auto g_ = g + b_idx * T * Hv;
             auto beta_ = beta + b_idx * T * Hv;
 
-            // state_in, state_out: [B, Hv, Dv, Dk]
+            // state_in: [B, Hv, Dv, Dk]; state_out: same, or the per-position trace
             auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+            \(stateOutInit)
 
             float state[n_per_t];
             for (int i = 0; i < n_per_t; ++i) {
@@ -85,11 +109,9 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               y += Hv * Dv;
               g_ += Hv;
               beta_ += Hv;
+        \(traceWrite)
             }
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<StT>(state[i]);
-            }
+        \(finalWrite)
         """
 
     var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -97,7 +119,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (traceStates ? "_trace" : "")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
@@ -112,10 +134,14 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelTrace: MLXFast.MLXFastKernel?
+    let kernelMaskedTrace: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelTrace = makeGatedDeltaKernel(hasMask: false, traceStates: true)
+        kernelMaskedTrace = makeGatedDeltaKernel(hasMask: true, traceStates: true)
     }
 }
 
@@ -128,7 +154,8 @@ func gatedDeltaKernel(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    traceStates: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = k.dim(0)
     let T = k.dim(1)
@@ -141,11 +168,12 @@ func gatedDeltaKernel(
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    let manager = GatedDeltaKernelManager.shared
     if let mask {
-        selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
+        selectedKernel = traceStates ? manager.kernelMaskedTrace : manager.kernelMasked
         inputs.append(mask)
     } else {
-        selectedKernel = GatedDeltaKernelManager.shared.kernel
+        selectedKernel = traceStates ? manager.kernelTrace : manager.kernel
     }
 
     guard let kernel = selectedKernel else {
@@ -164,7 +192,7 @@ func gatedDeltaKernel(
         ],
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
-        outputShapes: [[B, T, Hv, Dv], state.shape],
+        outputShapes: [[B, T, Hv, Dv], traceStates ? [B, T, Hv, Dv, Dk] : state.shape],
         outputDTypes: [inputType, stateType]
     )
 
@@ -222,7 +250,8 @@ func gatedDeltaOps(
     g: MLXArray,
     beta: MLXArray,
     state: MLXArray? = nil,
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    traceStates: Bool = false
 ) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let T = q.dim(1)
@@ -244,6 +273,7 @@ func gatedDeltaOps(
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
+    var states = [MLXArray]()
 
     for t in 0 ..< T {
         let qT = q[0..., t]
@@ -264,10 +294,11 @@ func gatedDeltaOps(
         )
         ys.append(y)
         state = newState
+        if traceStates { states.append(newState) }
     }
 
     let y = MLX.stacked(ys, axis: 1)
-    return (y, state)
+    return (y, traceStates ? MLX.stacked(states, axis: 1) : state)
 }
 
 // MARK: - Public API
@@ -303,4 +334,40 @@ public func gatedDeltaUpdate(
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+/// Same recurrence as ``gatedDeltaUpdate`` but returns the state after every
+/// position, `[B, T, Hv, Dv, Dk]`, instead of only the final one. Used by
+/// speculative decoding so a rejected tail rolls back by slicing.
+public func gatedDeltaUpdateTracingStates(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let beta = sigmoid(b).asType(.float32)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+
+    let B = q.dim(0)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let Dk = q.dim(3)
+
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+
+    if GatedDeltaKernelManager.shared.kernelTrace != nil {
+        return gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask, traceStates: true)
+    }
+
+    return gatedDeltaOps(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask, traceStates: true)
 }

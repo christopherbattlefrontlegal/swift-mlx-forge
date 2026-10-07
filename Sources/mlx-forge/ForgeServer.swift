@@ -16,6 +16,7 @@ import Foundation
 import MLXLMCommon
 import Network
 import Observation
+import SystemConfiguration
 
 /// `@unchecked Sendable` box for handing a non-Sendable value (ChatSession,
 /// [Chat.Message]) into the server's off-main generation task. Safe because
@@ -41,6 +42,7 @@ final class ForgeServer {
 
     weak var engine: InferenceEngine?
     weak var store: ModelStore?
+    weak var mcp: MCPManager?
     /// Compiled Rivet browser app served from `/rivet/` on this same listener.
     /// Same-origin hosting lets Rivet use the API without weakening CORS.
     var rivetRoot: URL?
@@ -51,6 +53,9 @@ final class ForgeServer {
 
     private var listener: NWListener?
     private var startGeneration = 0
+    /// In-flight request tasks. stop() cancels them so a long generation can't
+    /// keep the GPU gate (and app shutdown) hostage after the listener closes.
+    private var requestTasks: [UUID: Task<Void, Never>] = [:]
     /// The port we are actually bound to. Drives `localIdentity()` so Host/Origin
     /// enforcement is keyed off the real socket, not the observable `state` (which
     /// can briefly lag a stale listener's lifecycle events).
@@ -144,6 +149,8 @@ final class ForgeServer {
         listener?.cancel()
         listener = nil
         boundPort = nil
+        requestTasks.values.forEach { $0.cancel() }
+        requestTasks.removeAll()
         state = .stopped
     }
 
@@ -151,7 +158,8 @@ final class ForgeServer {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
-        Task { [weak self] in
+        let requestID = UUID()
+        requestTasks[requestID] = Task { [weak self] in
             do {
                 let request = try await HTTPRequest.read(from: connection)
                 await self?.route(request, on: connection)
@@ -161,6 +169,7 @@ final class ForgeServer {
                     message: "Bad request.", allowOrigin: nil)
             }
             connection.cancel()
+            self?.requestTasks.removeValue(forKey: requestID)
         }
     }
 
@@ -249,6 +258,10 @@ final class ForgeServer {
             await handleHealth(on: connection, allowOrigin: allowOrigin)
         case ("GET", "/v1/models"):
             await handleModels(on: connection, allowOrigin: allowOrigin)
+        case ("POST", "/v1/forge/mcp/tools"):
+            await handleMCPTools(on: connection, allowOrigin: allowOrigin)
+        case ("POST", "/v1/forge/mcp/call"):
+            await handleMCPCall(request, on: connection, allowOrigin: allowOrigin)
         case ("POST", "/v1/chat/completions"):
             await handleChat(request, on: connection, allowOrigin: allowOrigin)
         default:
@@ -345,7 +358,7 @@ final class ForgeServer {
 
     private func handleModels(on connection: NWConnection, allowOrigin: String?) async {
         let loadedNames = Set(engine?.loadedModels.map(\.model.name) ?? [])
-        let models = (store?.localModels ?? []).map { model -> [String: Any] in
+        var models = (store?.localModels ?? []).map { model -> [String: Any] in
             [
                 "id": model.name,
                 "object": "model",
@@ -353,14 +366,162 @@ final class ForgeServer {
                 "loaded": loadedNames.contains(model.name),
             ]
         }
+        // Cloud models the user has a key for, under provider-prefixed ids that
+        // /v1/chat/completions forwards (see `cloudRoute`). Lists come from the
+        // live provider catalogs, so graph clients never carry a stale model list.
+        for provider in CloudProvider.allCases where provider.apiKey != nil {
+            for model in CloudModelCatalog.chatModels(provider) {
+                models.append([
+                    "id": "\(Self.gatewayPrefix(provider))/\(model.id)", "object": "model",
+                    "owned_by": provider.label, "name": model.label,
+                ])
+            }
+        }
+        if SecretsStore.hasOpenRouterKey {
+            for id in UserDefaults.standard.stringArray(forKey: "openrouter.models") ?? [] {
+                models.append([
+                    "id": "openrouter/\(id)", "object": "model",
+                    "owned_by": "OpenRouter", "name": OpenRouterClient.label(for: id),
+                ])
+            }
+        }
         await HTTPResponse.sendJSON(
             on: connection, object: ["object": "list", "data": models], allowOrigin: allowOrigin)
+    }
+
+    // MARK: - Cloud gateway
+
+    private struct CloudGateway {
+        let provider: String
+        let url: String
+        let key: String?
+        let model: String
+    }
+
+    nonisolated private static func gatewayPrefix(_ provider: CloudProvider) -> String {
+        switch provider {
+        case .openAI: return "openai"
+        case .anthropic: return "anthropic"
+        case .xAI: return "xai"
+        }
+    }
+
+    /// Maps a provider-prefixed model id to that provider's OpenAI-compatible
+    /// chat endpoint. Nil for anything that is not a cloud id.
+    nonisolated private static func cloudGateway(for model: String) -> CloudGateway? {
+        var parts = model.split(separator: "/", maxSplits: 1).map(String.init)
+        if parts.count == 1 {
+            // Graphs saved before the gateway carry bare provider ids ("gpt-5").
+            let bare = model.lowercased()
+            if bare.hasPrefix("gpt-") || bare.hasPrefix("chatgpt-")
+                || bare.range(of: #"^o\d"#, options: .regularExpression) != nil
+            {
+                parts = ["openai", model]
+            } else if bare.hasPrefix("claude-") {
+                parts = ["anthropic", model]
+            } else if bare.hasPrefix("grok-") {
+                parts = ["xai", model]
+            }
+        }
+        guard parts.count == 2, !parts[1].isEmpty else { return nil }
+        switch parts[0] {
+        case "openai":
+            return CloudGateway(
+                provider: "OpenAI", url: "https://api.openai.com/v1/chat/completions",
+                key: SecretsStore.openAIAPIKey, model: parts[1])
+        case "anthropic":
+            return CloudGateway(
+                provider: "Anthropic", url: "https://api.anthropic.com/v1/chat/completions",
+                key: SecretsStore.anthropicAPIKey, model: parts[1])
+        case "xai":
+            return CloudGateway(
+                provider: "xAI", url: "https://api.x.ai/v1/chat/completions",
+                key: SecretsStore.xaiAPIKey, model: parts[1])
+        case "openrouter":
+            return CloudGateway(
+                provider: "OpenRouter", url: "https://openrouter.ai/api/v1/chat/completions",
+                key: SecretsStore.openRouterAPIKey, model: parts[1])
+        default:
+            return nil
+        }
+    }
+
+    /// Forwards the request body unchanged (apart from the bare model id) and
+    /// relays the provider's response, so the key never leaves Forge.
+    private func handleCloudChat(
+        _ request: HTTPRequest, gateway: CloudGateway, stream: Bool,
+        on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard let key = gateway.key else {
+            await HTTPResponse.sendError(
+                on: connection, status: "401 Unauthorized",
+                message: "No \(gateway.provider) API key set. Add one in Forge Settings.",
+                allowOrigin: allowOrigin)
+            return
+        }
+        guard var body = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
+        else {
+            await HTTPResponse.sendError(
+                on: connection, status: "400 Bad Request",
+                message: "Invalid request body.", allowOrigin: allowOrigin)
+            return
+        }
+        body["model"] = gateway.model
+        var upstream = URLRequest(url: URL(string: gateway.url)!)
+        upstream.httpMethod = "POST"
+        upstream.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        upstream.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        upstream.timeoutInterval = 600
+        upstream.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        var headSent = false
+        do {
+            guard stream else {
+                let (data, response) = try await URLSession.shared.data(for: upstream)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 502
+                await HTTPResponse.send(
+                    on: connection, status: Self.statusLine(code),
+                    contentType: "application/json", body: data, allowOrigin: allowOrigin)
+                return
+            }
+            let (bytes, response) = try await URLSession.shared.bytes(for: upstream)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 502
+            guard code < 300 else {
+                var data = Data()
+                for try await byte in bytes { data.append(byte) }
+                await HTTPResponse.send(
+                    on: connection, status: Self.statusLine(code),
+                    contentType: "application/json", body: data, allowOrigin: allowOrigin)
+                return
+            }
+            await HTTPResponse.sendHead(
+                on: connection, status: "200 OK", contentType: "text/event-stream",
+                allowOrigin: allowOrigin)
+            headSent = true
+            // `lines` drops the blank separators SSE needs; restore one after
+            // every field line that ends an event.
+            for try await line in bytes.lines {
+                let terminator = line.hasPrefix("event:") ? "\n" : "\n\n"
+                guard await HTTPResponse.sendRaw(on: connection, line + terminator) else { break }
+            }
+        } catch {
+            // Mid-stream failures just end the stream; a second head would corrupt it.
+            guard !headSent else { return }
+            await HTTPResponse.sendError(
+                on: connection, status: "502 Bad Gateway",
+                message: "\(gateway.provider) request failed: \(error.localizedDescription)",
+                allowOrigin: allowOrigin)
+        }
+    }
+
+    nonisolated private static func statusLine(_ code: Int) -> String {
+        "\(code) \(HTTPURLResponse.localizedString(forStatusCode: code).capitalized)"
     }
 
     private func handleChat(
         _ request: HTTPRequest, on connection: NWConnection, allowOrigin: String?
     ) async {
-        let chat: ChatCompletionRequest
+        var chat: ChatCompletionRequest
         do {
             chat = try JSONDecoder().decode(ChatCompletionRequest.self, from: request.body)
         } catch {
@@ -368,6 +529,28 @@ final class ForgeServer {
                 on: connection, status: "400 Bad Request",
                 message: "Invalid request body.", allowOrigin: allowOrigin)
             return
+        }
+
+        if store?.localModels.contains(where: { $0.name == chat.model }) != true,
+            let gateway = Self.cloudGateway(for: chat.model)
+        {
+            await handleCloudChat(
+                request, gateway: gateway, stream: chat.stream ?? false,
+                on: connection, allowOrigin: allowOrigin)
+            return
+        }
+
+        if chat.model == "forge/local" {
+            guard let localName = engine?.activeModel?.model.name
+                ?? engine?.loadedModels.first?.model.name
+            else {
+                await HTTPResponse.sendError(
+                    on: connection, status: "409 Conflict",
+                    message: "Load a local model before using Graph Architect.",
+                    allowOrigin: allowOrigin)
+                return
+            }
+            chat.model = localName
         }
 
         // Resolve (auto-loading if installed but cold). On failure, return a generic
@@ -387,6 +570,20 @@ final class ForgeServer {
         var parameters = InferenceEngine.parameters(from: defaultSettings())
         if let temperature = chat.temperature { parameters.temperature = Float(temperature) }
         if let topP = chat.top_p { parameters.topP = Float(topP) }
+        // Extended sampling fields (OpenAI names where they exist, llama.cpp/vLLM names
+        // for the rest). Each overrides the Forge default only when present.
+        if let topK = chat.top_k { parameters.topK = max(0, topK) }
+        if let minP = chat.min_p { parameters.minP = Float(minP) }
+        if let seed = chat.seed { parameters.seed = UInt64(max(0, seed)) }
+        if let presence = chat.presence_penalty {
+            parameters.presencePenalty = presence == 0 ? nil : Float(presence)
+        }
+        if let frequency = chat.frequency_penalty {
+            parameters.frequencyPenalty = frequency == 0 ? nil : Float(frequency)
+        }
+        if let repetition = chat.repetition_penalty {
+            parameters.repetitionPenalty = repetition <= 1.0 ? nil : Float(repetition)
+        }
         if let maxTokens = chat.max_tokens ?? chat.max_completion_tokens {
             parameters.maxTokens = maxTokens > 0 ? min(maxTokens, 32_768) : nil
         }
@@ -397,8 +594,9 @@ final class ForgeServer {
         let messages: [Chat.Message] = chat.messages.map { message in
             switch message.role {
             case "system", "developer": return .system(message.text)
-            case "assistant": return .assistant(message.text)
-            case "tool": return .tool(message.text)
+            case "assistant":
+                return .assistant(message.text, toolCalls: message.decodedToolCalls)
+            case "tool": return .tool(message.text, id: message.toolCallID)
             default: return .user(message.text)
             }
         }
@@ -412,7 +610,6 @@ final class ForgeServer {
             .map(\.content)
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
-        let history = Array(messages.filter { $0.role != .system }.dropLast())
         let settings = defaultSettings()
 
         let responseIDForEntry = "chatcmpl-\(UUID().uuidString.prefix(12))"
@@ -440,11 +637,11 @@ final class ForgeServer {
         let session = ChatSession(
             container,
             instructions: systemText.isEmpty ? nil : systemText,
-            history: history,
             generateParameters: parameters,
             additionalContext: InferenceEngine.thinkingAdditionalContext(
                 for: entry, enabled: settings.localThinkingEnabled,
-                effort: settings.localReasoningEffort))
+                effort: settings.localReasoningEffort),
+            tools: chat.toolSpecs)
         let responseID = "chatcmpl-\(UUID().uuidString.prefix(12))"
         let created = Int(Date().timeIntervalSince1970)
 
@@ -458,6 +655,73 @@ final class ForgeServer {
                 responseID: responseID, created: created, on: connection, allowOrigin: allowOrigin)
         }
         engine?.refreshMemory()
+    }
+
+    private func handleMCPTools(on connection: NWConnection, allowOrigin: String?) async {
+        guard allowOrigin != nil else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The MCP bridge is available only to the embedded graph workbench.",
+                allowOrigin: nil)
+            return
+        }
+        guard let mcp else {
+            await HTTPResponse.sendError(
+                on: connection, status: "503 Service Unavailable",
+                message: "MCP manager unavailable.", allowOrigin: allowOrigin)
+            return
+        }
+        let tools = await mcp.prepareToolCatalogForPrompt().map { binding -> [String: Any] in
+            [
+                "server": binding.serverID,
+                "name": binding.tool.name,
+                "description": binding.tool.description,
+                "inputSchema": binding.inputSchemaObject,
+            ]
+        }
+        await HTTPResponse.sendJSON(
+            on: connection, object: ["tools": tools], allowOrigin: allowOrigin)
+    }
+
+    private func handleMCPCall(
+        _ request: HTTPRequest, on connection: NWConnection, allowOrigin: String?
+    ) async {
+        guard allowOrigin != nil else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The MCP bridge is available only to the embedded graph workbench.",
+                allowOrigin: nil)
+            return
+        }
+        guard let mcp,
+            let object = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+            let rawServer = object["server"] as? String,
+            let tool = object["tool"] as? String,
+            let arguments = object["arguments"] as? [String: Any]
+        else {
+            await HTTPResponse.sendError(
+                on: connection, status: "400 Bad Request",
+                message: "Expected server, tool, and arguments.", allowOrigin: allowOrigin)
+            return
+        }
+        let server = mcp.resolveEntryID(rawServer)
+        guard mcp.effectiveSelectedTools(for: server).contains(tool) else {
+            await HTTPResponse.sendError(
+                on: connection, status: "403 Forbidden",
+                message: "The requested MCP tool is not enabled.", allowOrigin: allowOrigin)
+            return
+        }
+        do {
+            let result = try await mcp.callTool(
+                entryID: server, name: tool, arguments: arguments)
+            await HTTPResponse.send(
+                on: connection, status: "200 OK", contentType: "application/json",
+                body: result, allowOrigin: allowOrigin)
+        } catch {
+            await HTTPResponse.sendError(
+                on: connection, status: "502 Bad Gateway",
+                message: error.localizedDescription, allowOrigin: allowOrigin)
+        }
     }
 
     private func resolveModel(named name: String) async throws -> InferenceEngine.Loaded {
@@ -498,33 +762,69 @@ final class ForgeServer {
         _ = try? await gate.withTurnDetached { [sessionBox, messagesBox] in
             let session = sessionBox.value
             let messages = messagesBox.value
+            let promptCapture = RenderedPromptCapture()
+            session.onPromptPrepared = { prepared in
+                promptCapture.set(
+                    RenderedPromptSnapshot(
+                        tokenIDs: prepared.tokenIDs,
+                        thinkingMarkers: prepared.thinkingMarkers,
+                        promptTailText: prepared.promptTailText))
+            }
+            defer { session.onPromptPrepared = nil }
             do {
-                // The session already carries the prior turns as history; the final user
-                // message is the turn we are replying to.
-                let replyTarget = messages.last(where: { $0.role != .system })
-                let prompt = replyTarget?.content ?? ""
-                let role = replyTarget?.role ?? .user
-                let images = replyTarget?.images ?? []
-                let videos = replyTarget?.videos ?? []
                 var finishReason = "stop"
+                var toolIndex = 0
+                var classifier: ReasoningStreamClassifier?
                 for try await item in session.streamDetails(
-                    to: prompt, role: role, images: images, videos: videos)
+                    to: messages.filter { $0.role != .system })
                 {
                     if Task.isCancelled { break }
                     switch item {
                     case .chunk(let chunk):
-                        let delivered = await HTTPResponse.sendRaw(
-                            on: connection,
-                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: ["content": chunk], finish: nil))\n\n")
-                        // Client hung up — stop generating instead of burning GPU to
-                        // completion into a dead socket (ending iteration cancels the
-                        // underlying generation).
-                        guard delivered else { return }
+                        if classifier == nil {
+                            classifier = ReasoningStreamClassifier(
+                                context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                        }
+                        for delta in classifier!.ingest(chunk) {
+                            guard let payload = Self.apiPayload(for: delta) else { continue }
+                            let delivered = await HTTPResponse.sendRaw(
+                                on: connection,
+                                "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: payload, finish: nil))\n\n")
+                            // Client hung up — stop generating instead of burning GPU to
+                            // completion into a dead socket (ending iteration cancels the
+                            // underlying generation).
+                            guard delivered else { return }
+                        }
                     case .info(let info):
                         // Report length-truncation honestly so clients can retry/extend.
                         if info.stopReason == .length { finishReason = "length" }
-                    case .toolCall:
-                        break
+                    case .toolCall(let call):
+                        finishReason = "tool_calls"
+                        let delta: [String: Any] = [
+                            "tool_calls": [[
+                                "index": toolIndex,
+                                "id": call.id ?? "call-\(UUID().uuidString)",
+                                "type": "function",
+                                "function": [
+                                    "name": call.function.name,
+                                    "arguments": Self.toolArgumentsJSON(call),
+                                ],
+                            ]]
+                        ]
+                        toolIndex += 1
+                        let delivered = await HTTPResponse.sendRaw(
+                            on: connection,
+                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: delta, finish: nil))\n\n")
+                        guard delivered else { return }
+                    }
+                }
+                if var classifier {
+                    for delta in classifier.finalize() {
+                        guard let payload = Self.apiPayload(for: delta) else { continue }
+                        let delivered = await HTTPResponse.sendRaw(
+                            on: connection,
+                            "data: \(Self.chunkJSON(responseID: responseID, created: created, model: model, delta: payload, finish: nil))\n\n")
+                        guard delivered else { return }
                     }
                 }
                 await HTTPResponse.sendRaw(
@@ -561,6 +861,22 @@ final class ForgeServer {
         return String(decoding: data, as: UTF8.self)
     }
 
+    nonisolated private static func apiPayload(
+        for delta: InferenceStreamDelta
+    ) -> [String: Any]? {
+        switch delta {
+        case .reasoning(let text): return ["reasoning": text]
+        case .content(let text): return ["content": text]
+        case .invalidReasoningStructure: return nil
+        }
+    }
+
+    nonisolated private static func toolArgumentsJSON(_ call: ToolCall) -> String {
+        let object = call.function.arguments.mapValues(\.anyValue)
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func completeChat(
         session: ChatSession, messages: [Chat.Message], model: String,
         responseID: String, created: Int, on connection: NWConnection, allowOrigin: String?
@@ -576,35 +892,79 @@ final class ForgeServer {
             // turn serving an API request doesn't freeze the app UI.
             let sessionBox = SendableBox(value: session)
             let messagesBox = SendableBox(value: messages)
-            let (output, info) = try await gate.withTurnDetached { [sessionBox, messagesBox] in
+            let (output, reasoning, info, toolCalls) = try await gate.withTurnDetached {
+                [sessionBox, messagesBox] in
                 let session = sessionBox.value
                 let messages = messagesBox.value
-                let replyTarget = messages.last(where: { $0.role != .system })
-                let prompt = replyTarget?.content ?? ""
-                let role = replyTarget?.role ?? .user
-                let images = replyTarget?.images ?? []
-                let videos = replyTarget?.videos ?? []
+                let promptCapture = RenderedPromptCapture()
+                session.onPromptPrepared = { prepared in
+                    promptCapture.set(
+                        RenderedPromptSnapshot(
+                            tokenIDs: prepared.tokenIDs,
+                            thinkingMarkers: prepared.thinkingMarkers,
+                            promptTailText: prepared.promptTailText))
+                }
+                defer { session.onPromptPrepared = nil }
                 var output = ""
+                var reasoning = ""
                 var info: GenerateCompletionInfo?
+                var toolCalls: [ToolCall] = []
+                var classifier: ReasoningStreamClassifier?
                 for try await item in session.streamDetails(
-                    to: prompt, role: role, images: images, videos: videos
+                    to: messages.filter { $0.role != .system }
                 ) {
                     switch item {
-                    case .chunk(let text): output += text
+                    case .chunk(let text):
+                        if classifier == nil {
+                            classifier = ReasoningStreamClassifier(
+                                context: promptCapture.get()?.reasoningContext ?? .taggedThink)
+                        }
+                        for delta in classifier!.ingest(text) {
+                            switch delta {
+                            case .reasoning(let text): reasoning += text
+                            case .content(let text): output += text
+                            case .invalidReasoningStructure: break
+                            }
+                        }
                     case .info(let i): info = i
-                    case .toolCall: break
+                    case .toolCall(let call): toolCalls.append(call)
                     }
                 }
-                return (output, info)
+                if var classifier {
+                    for delta in classifier.finalize() {
+                        switch delta {
+                        case .reasoning(let text): reasoning += text
+                        case .content(let text): output += text
+                        case .invalidReasoningStructure: break
+                        }
+                    }
+                }
+                return (output, reasoning, info, toolCalls)
             }
-            let finishReason = info?.stopReason == .length ? "length" : "stop"
+            let finishReason = !toolCalls.isEmpty
+                ? "tool_calls" : (info?.stopReason == .length ? "length" : "stop")
+            var responseMessage: [String: Any] = ["role": "assistant", "content": output]
+            if !reasoning.isEmpty { responseMessage["reasoning"] = reasoning }
+            if !toolCalls.isEmpty {
+                responseMessage["tool_calls"] = toolCalls.enumerated().map { index, call in
+                    [
+                        "index": index,
+                        "id": call.id ?? "call-\(UUID().uuidString)",
+                        "type": "function",
+                        "function": [
+                            "name": call.function.name,
+                            "arguments": Self.toolArgumentsJSON(call),
+                        ],
+                    ] as [String: Any]
+                }
+            }
             let body: [String: Any] = [
                 "id": responseID, "object": "chat.completion",
                 "created": created, "model": model,
                 "choices": [
                     [
                         "index": 0,
-                        "message": ["role": "assistant", "content": output],
+                        "message": responseMessage,
                         "finish_reason": finishReason,
                     ]
                 ],
@@ -682,9 +1042,10 @@ final class ForgeServer {
                     system: systemText.isEmpty ? nil : systemText,
                     history: history)
                 _ = await gguf.respond(to: prompt, maxOutputTokens: maxOutputTokens) { delta in
+                    guard let payload = Self.apiPayload(for: delta) else { return }
                     let delivered = await HTTPResponse.sendRaw(
                         on: connection,
-                        "data: \(chunkJSON(delta: ["content": delta], finish: nil))\n\n")
+                        "data: \(chunkJSON(delta: payload, finish: nil))\n\n")
                     // Client hung up — stop llama.cpp instead of generating into a dead socket.
                     if !delivered { gguf.stop() }
                 }
@@ -750,11 +1111,24 @@ enum LocalNetwork {
             }
             freeifaddrs(addresses)
         }
-        let localHostName = Host.current().names.first { $0.hasSuffix(".local") }
-        if let localHostName, !hosts.contains(localHostName) {
+        // `Host.current().names` performs synchronous reverse-DNS/mDNS resolution.
+        // This function is read from SwiftUI's body on the main actor, so a slow
+        // resolver freezes the whole app (and endpoint requests can hit the same
+        // path through `localIdentity()`). The SystemConfiguration value is the
+        // machine's configured Bonjour name and does not perform network lookup.
+        if let localHostName = configuredBonjourHostName(), !hosts.contains(localHostName) {
             hosts.append(localHostName)
         }
         return hosts
+    }
+
+    private static func configuredBonjourHostName() -> String? {
+        guard let configured = SCDynamicStoreCopyLocalHostName(nil) as String? else {
+            return nil
+        }
+        let name = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return name.hasSuffix(".local") ? name : "\(name).local"
     }
 }
 
@@ -766,20 +1140,71 @@ private struct ChatCompletionRequest: Decodable {
     var stream: Bool?
     var temperature: Double?
     var top_p: Double?
+    var top_k: Int?
+    var min_p: Double?
+    var seed: Int?
+    var presence_penalty: Double?
+    var frequency_penalty: Double?
+    var repetition_penalty: Double?
     var max_tokens: Int?
     var max_completion_tokens: Int?
+    var tools: [JSONValue]?
+
+    var toolSpecs: [ToolSpec]? {
+        let converted = tools?.compactMap { value -> ToolSpec? in
+            guard case .object(let object) = value else { return nil }
+            return object.mapValues(Self.sendableValue)
+        } ?? []
+        return converted.isEmpty ? nil : converted
+    }
+
+    private static func sendableValue(_ value: JSONValue) -> any Sendable {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .double(let value): return value
+        case .string(let value): return value
+        case .array(let values): return values.map(sendableValue)
+        case .object(let values): return values.mapValues(sendableValue)
+        }
+    }
 
     struct Message: Decodable {
         var role: String
         var text: String
+        var toolCalls: [ToolCallPayload]?
+        var toolCallID: String?
+
+        var decodedToolCalls: [ToolCall]? {
+            let calls = toolCalls?.compactMap { payload -> ToolCall? in
+                guard payload.type == nil || payload.type == "function" else { return nil }
+                let arguments: [String: JSONValue]
+                if let data = payload.function.arguments.data(using: .utf8),
+                    let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+                {
+                    arguments = decoded
+                } else {
+                    arguments = [:]
+                }
+                return ToolCall(
+                    function: .init(name: payload.function.name, arguments: arguments),
+                    id: payload.id)
+            } ?? []
+            return calls.isEmpty ? nil : calls
+        }
 
         enum CodingKeys: String, CodingKey {
             case role, content
+            case toolCalls = "tool_calls"
+            case toolCallID = "tool_call_id"
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             role = try container.decode(String.self, forKey: .role)
+            toolCalls = try container.decodeIfPresent([ToolCallPayload].self, forKey: .toolCalls)
+            toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID)
             // content can be a string or an array of typed parts.
             if let string = try? container.decode(String.self, forKey: .content) {
                 text = string
@@ -793,6 +1218,17 @@ private struct ChatCompletionRequest: Decodable {
         struct Part: Decodable {
             var type: String?
             var text: String?
+        }
+
+        struct ToolCallPayload: Decodable {
+            var id: String?
+            var type: String?
+            var function: Function
+
+            struct Function: Decodable {
+                var name: String
+                var arguments: String
+            }
         }
     }
 }

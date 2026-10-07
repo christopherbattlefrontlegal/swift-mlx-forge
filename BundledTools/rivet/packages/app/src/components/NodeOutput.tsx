@@ -509,7 +509,7 @@ const NodeOutputSingleProcess: FC<{
         </Tooltip>
 
         {node.type === 'chat' && (
-          <Tooltip content="Open chat in Prompt Designer">
+          <Tooltip content="Open chat in Prompt Lab">
             <div className="prompt-designer-button" onClick={handleOpenPromptDesigner}>
               <FlaskIcon />
             </div>

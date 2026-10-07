@@ -15,7 +15,12 @@ import { MCPError, MCPErrorType, type MCP } from '../../integrations/mcp/MCPProv
 import { dedent, getInputOrData } from '../../utils/index.js';
 import { nodeDefinition } from '../NodeDefinition.js';
 import type { RivetUIContext } from '../RivetUIContext.js';
-import { getServerHelperMessage, getServerOptions, loadMCPConfiguration } from '../../integrations/mcp/MCPUtils.js';
+import {
+  getServerHelperMessage,
+  getServerOptions,
+  isForgeMCPBridgeAvailable,
+  loadMCPConfiguration,
+} from '../../integrations/mcp/MCPUtils.js';
 import { getMCPBaseInputs, type MCPBaseNodeData } from '../../integrations/mcp/MCPBase.js';
 
 type MCPDiscoveryNode = ChartNode<'mcpDiscovery', MCPDiscoveryNodeData>;
@@ -151,7 +156,7 @@ class MCPDiscoveryNodeImpl extends NodeImpl<MCPDiscoveryNode> {
     const versionPart = `Version: ${this.data.version}`;
     const parts = [namePart, versionPart, base];
 
-    if (context.executor !== 'nodejs') {
+    if (context.executor !== 'nodejs' && !isForgeMCPBridgeAvailable()) {
       parts.push('(Requires Node Executor)');
     }
 
@@ -243,7 +248,7 @@ class MCPDiscoveryNodeImpl extends NodeImpl<MCPDiscoveryNode> {
 
       return output;
     } catch (err) {
-      if (context.executor === 'browser') {
+      if (context.executor === 'browser' && !context.mcpProvider) {
         throw new Error('Failed to create Client without Node Executor');
       }
 

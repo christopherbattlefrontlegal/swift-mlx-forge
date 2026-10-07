@@ -71,7 +71,8 @@ struct OpenAIClient {
         return ["role": turn.role, "content": parts]
     }
 
-    static let models: [(id: String, label: String)] = [
+    /// Curated fallback shown before the first live catalog fetch.
+    static let defaultModels: [(id: String, label: String)] = [
         ("gpt-5.5", "GPT-5.5"),
         ("gpt-5.5-pro", "GPT-5.5 Pro"),
         ("gpt-5.4", "GPT-5.4"),
@@ -80,19 +81,24 @@ struct OpenAIClient {
         ("o3", "o3"),
     ]
 
+    /// Live catalog when fetched, plus user-added ids (see CloudModelCatalog).
+    static var models: [(id: String, label: String)] {
+        CloudModelCatalog.chatModels(.openAI)
+    }
+
     static func label(for id: String) -> String {
         models.first { $0.id == id }?.label ?? id
     }
 
     var apiKey: String
 
-    /// Streams a Responses API turn. Reasoning summary deltas are wrapped in ``.
+    /// Streams a Responses API turn with its native reasoning/content distinction.
     func stream(
         model: String,
         system: String?,
         turns: [Turn],
         config: OpenAIStreamConfig = OpenAIStreamConfig(),
-        onChunk: @escaping @MainActor (String) -> Void
+        onChunk: @escaping @MainActor (InferenceStreamDelta) -> Void
     ) async throws {
         guard !apiKey.isEmpty else { throw OpenAIError.noKey }
 
@@ -164,14 +170,8 @@ struct OpenAIClient {
                 throw OpenAIError.stream(Self.responseIncompleteMessage(obj))
             }
             if type == "response.completed" {
-                if let tail = assembler.finish() {
-                    await onChunk(tail)
-                }
                 return
             }
-        }
-        if let tail = assembler.finish() {
-            await onChunk(tail)
         }
         throw OpenAIError.stream("response stream ended before completion")
     }
@@ -201,60 +201,37 @@ struct OpenAIClient {
     }
 }
 
-/// Maps OpenAI Responses SSE events into `` + answer text for the chat UI.
+/// Maps OpenAI Responses SSE events into the typed Forge stream contract.
 private struct OpenAIReasoningStreamAssembler {
-    private var thinkingOpen = false
-    private var thinkingClosed = false
-
-    mutating func ingest(eventType: String, payload: [String: Any]) -> String? {
+    mutating func ingest(
+        eventType: String, payload: [String: Any]
+    ) -> InferenceStreamDelta? {
         switch eventType {
         case "response.reasoning_summary_part.added",
             "response.reasoning_summary_text.delta",
             "response.reasoning.delta":
             if let delta = payload["delta"] as? String, !delta.isEmpty {
-                return appendThinking(delta)
+                return .reasoning(delta)
             }
             if let summary = payload["summary"] as? String, !summary.isEmpty {
-                return appendThinking(summary)
+                return .reasoning(summary)
             }
             if let part = payload["part"] as? [String: Any],
                 let text = part["text"] as? String, !text.isEmpty {
-                return appendThinking(text)
+                return .reasoning(text)
             }
         case "response.output_text.delta", "response.content_part.delta":
             if let delta = payload["delta"] as? String, !delta.isEmpty {
-                var out = closeThinkingIfNeeded() ?? ""
-                out += delta
-                return out.isEmpty ? nil : out
+                return .content(delta)
             }
             if let part = payload["part"] as? [String: Any],
                 part["type"] as? String == "output_text",
                 let text = part["text"] as? String, !text.isEmpty {
-                var out = closeThinkingIfNeeded() ?? ""
-                out += text
-                return out.isEmpty ? nil : out
+                return .content(text)
             }
         default:
             break
         }
         return nil
-    }
-
-    private mutating func appendThinking(_ text: String) -> String {
-        if !thinkingOpen {
-            thinkingOpen = true
-            return "<think>\n" + text
-        }
-        return text
-    }
-
-    private mutating func closeThinkingIfNeeded() -> String? {
-        guard thinkingOpen, !thinkingClosed else { return nil }
-        thinkingClosed = true
-        return "\n</think>\n\n"
-    }
-
-    mutating func finish() -> String? {
-        closeThinkingIfNeeded()
     }
 }

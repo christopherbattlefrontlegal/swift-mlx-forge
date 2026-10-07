@@ -1396,30 +1396,76 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
+/// One multi-token window through a Gated DeltaNet layer: the conv input and
+/// the recurrent state after every position, kept so a rejected speculative
+/// tail rolls back by slicing. Only recorded when the MTP iterator arms the
+/// cache before a verify pass, so ordinary prefill windows never retain it.
+public struct MambaSpeculativeWindow {
+    public let convInput: MLXArray
+    /// `[B, T, Hv, Dv, Dk]`, the SSM state after each of the T positions.
+    public let stateTrace: MLXArray
+    public let stateBefore: MLXArray?
+    public let convKernelSize: Int
+
+    public init(
+        convInput: MLXArray, stateTrace: MLXArray, stateBefore: MLXArray?, convKernelSize: Int
+    ) {
+        self.convInput = convInput
+        self.stateTrace = stateTrace
+        self.stateBefore = stateBefore
+        self.convKernelSize = convKernelSize
+    }
+
+    /// Positions in the window.
+    public var length: Int { stateTrace.dim(1) }
+}
+
 public class MambaCache: ArraysCache {
-    private var mtpCheckpoint: [MLXArray]?
+    /// Armed by the MTP iterator before a verify pass; the layer records the
+    /// window on its next call and disarms it.
+    public var speculativeWindowArmed = false
+    private var speculativeWindow: MambaSpeculativeWindow?
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
 
-    /// Qwen's recurrent Gated-DeltaNet state cannot be shortened like an
-    /// attention KV cache. Snapshot it immediately before target verification.
-    public func checkpointForMTP() {
-        let current = state
-        mtpCheckpoint = current.isEmpty ? nil : current.map { $0[.ellipsis] }
+    public func recordSpeculativeWindow(_ window: MambaSpeculativeWindow) {
+        speculativeWindow = window
+        speculativeWindowArmed = false
+    }
+
+    public func clearSpeculativeWindow() {
+        speculativeWindow = nil
+        speculativeWindowArmed = false
     }
 
     /// MTP callers use `trim` uniformly across attention and recurrent caches.
-    /// Restore the snapshot when any speculative tail was rejected.
     public override var isTrimmable: Bool { true }
 
+    /// Roll the recurrent state back by `n` positions. The conv and SSM states
+    /// cannot be shortened like an attention cache, so the state after the last
+    /// surviving position is taken from the recorded trace. Without a recorded
+    /// window nothing is trimmed.
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        defer { mtpCheckpoint = nil }
-        guard n > 0, let mtpCheckpoint else { return 0 }
-        state = mtpCheckpoint
-        return n
+        defer {
+            speculativeWindow = nil
+            speculativeWindowArmed = false
+        }
+        guard n > 0, let window = speculativeWindow else { return 0 }
+        let trimmed = min(n, window.length)
+        let keep = window.length - trimmed
+        let convTail = window.convKernelSize - 1
+        if keep == 0 {
+            self[0] = contiguous(window.convInput[0..., ..<convTail, 0...])
+            self[1] = window.stateBefore
+        } else {
+            self[0] = contiguous(window.convInput[0..., keep ..< (keep + convTail), 0...])
+            self[1] = contiguous(window.stateTrace[0..., keep - 1])
+        }
+        offset -= trimmed
+        return trimmed
     }
 
     public override func copy() -> any KVCache {

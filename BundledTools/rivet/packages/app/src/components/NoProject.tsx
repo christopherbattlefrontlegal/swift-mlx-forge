@@ -2,7 +2,6 @@ import Button from '@atlaskit/button';
 import { css } from '@emotion/react';
 import { type FC } from 'react';
 import { useOpenUrl } from '../hooks/useOpenUrl';
-import DiscordIcon from '../assets/vendor_logos/discord-mark-white.svg?react';
 import GearIcon from 'majesticons/line/settings-cog-line.svg?react';
 import ForgeIcon from '../forge-logo.png';
 import { useSetAtom } from 'jotai';
@@ -82,7 +81,6 @@ const styles = css`
 
 export const NoProject: FC = () => {
   const openDocumentation = useOpenUrl('https://rivet.ironcladapp.com/docs');
-  const joinDiscord = useOpenUrl('https://discord.gg/qT8B2gv9Mg');
   const setNewProjectModalOpen = useSetAtom(newProjectModalOpenState);
   const setSettingsModalOpen = useSetAtom(settingsModalOpenState);
   const openProject = useLoadProjectWithFileBrowser();
@@ -109,10 +107,6 @@ export const NoProject: FC = () => {
 
         <div className="help-links">
           <a href="#" onClick={syncWrapper(openDocumentation)}>Graph documentation</a>
-          <span>·</span>
-          <a href="#" onClick={syncWrapper(joinDiscord)}>
-            <DiscordIcon /> Rivet community
-          </a>
         </div>
       </div>
     </div>

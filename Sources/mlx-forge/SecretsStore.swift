@@ -23,6 +23,7 @@ enum SecretsStore {
         var openRouter: String?
         var braveSearch: String?
         var openAI: String?
+        var xAI: String? = nil
         var localServerAPIKey: String? = nil
     }
 
@@ -64,11 +65,17 @@ enum SecretsStore {
         set { mutate { $0.braveSearch = normalized(newValue) } }
     }
 
+    static var xaiAPIKey: String? {
+        get { read { normalized($0.xAI) } }
+        set { mutate { $0.xAI = normalized(newValue) } }
+    }
+
     static var hasHuggingFaceToken: Bool { read { normalized($0.huggingFace) != nil } }
     static var hasAnthropicKey: Bool { read { normalized($0.anthropic) != nil } }
     static var hasOpenRouterKey: Bool { read { normalized($0.openRouter) != nil } }
     static var hasOpenAIKey: Bool { read { normalized($0.openAI) != nil } }
     static var hasBraveSearchKey: Bool { read { normalized($0.braveSearch) != nil } }
+    static var hasXAIKey: Bool { read { normalized($0.xAI) != nil } }
 
     /// Lazily creates a 256-bit bearer token for authenticating LAN API
     /// requests. A token is returned only after it has been verified in the

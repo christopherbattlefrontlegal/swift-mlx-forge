@@ -908,6 +908,35 @@ data:
           outgoingConnections:
             - function->"Array" sAnxJ1k5aqXR_fckQIop5/input10
           visualData: -339.78929182391/1041.1558756004192/280/54//
+        '[forgeMCPCallTool]:gptFunction "GPT Function"':
+          data:
+            description: Calls an enabled MCP tool, including Desktop Commander, to inspect
+              source code or external context. Use the exact server and tool names
+              provided in the enabled MCP catalog.
+            name: callMCPTool
+            schema: |-
+              {
+                "type": "object",
+                "properties": {
+                  "server": {
+                    "type": "string",
+                    "description": "The exact MCP server identifier."
+                  },
+                  "tool": {
+                    "type": "string",
+                    "description": "The exact enabled MCP tool name."
+                  },
+                  "arguments": {
+                    "type": "object",
+                    "description": "Arguments matching the selected tool's input schema."
+                  }
+                },
+                "required": ["server", "tool", "arguments"],
+                "additionalProperties": false
+              }
+          outgoingConnections:
+            - function->"Array" sAnxJ1k5aqXR_fckQIop5/input17
+          visualData: -696.5934698174597/1107.6406169278446/280/67//
         '[sAnxJ1k5aqXR_fckQIop5]:array "Array"':
           data:
             flatten: true
@@ -1579,7 +1608,7 @@ data:
         '[yTUWxJP4rllqx5XkOnp0D]:loopUntil "Loop Until"':
           data:
             conditionType: allOutputsSet
-            maxIterations: 50
+            maxIterations: 160
             targetGraph: lK3NTnVYWoxGt6cnEO9gp
           visualData: 5505.414440365536/2236.357543199284/230/26//
     cnwBxMpFgu4UsiPNtrWT-:
@@ -1990,6 +2019,8 @@ data:
       nodes:
         '[0cqheENSin-CqueDgmCU4]:delegateFunctionCall "Delegate Function Call"':
           data:
+            autoDelegate: true
+            fallBackToExternalCall: true
             handlers:
               - key: readNodeDocumentation
                 value: GclkPKrrBXX88jIhSRlgX
@@ -2025,6 +2056,7 @@ data:
                 value: aZaxcfuQyhMBZYvuE187H
               - key: help
                 value: gdy3Un3l2XDlYW_kGamAl
+            passthroughErrors: true
           isSplitRun: true
           outgoingConnections:
             - message->"Assemble Prompt" ow1008xcfQ03MBc-kJyQD/message2

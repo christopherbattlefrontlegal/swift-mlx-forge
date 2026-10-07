@@ -12,7 +12,10 @@ import {
 export function useAddNodeCommand() {
   const setNodes = useSetAtom(nodesState);
 
-  return useCommand<{ nodeType: string; position: { x: number; y: number } }, { id: NodeId }>({
+  return useCommand<
+    { nodeType: string; position: { x: number; y: number }; data?: Record<string, unknown>; title?: string },
+    { id: NodeId }
+  >({
     type: 'addNode',
     apply(params, appliedData, currentState) {
       let nodeType = params.nodeType as string | undefined;
@@ -34,6 +37,13 @@ export function useAddNodeCommand() {
 
       if (appliedData) {
         newNode.id = appliedData.id;
+      }
+
+      if (params.data) {
+        Object.assign(newNode.data as object, params.data);
+      }
+      if (params.title) {
+        newNode.title = params.title;
       }
 
       // We've added more buttons at the top so just... increase the width of every node a little bit :/

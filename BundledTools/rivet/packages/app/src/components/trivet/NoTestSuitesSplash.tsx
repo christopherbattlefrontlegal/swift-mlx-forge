@@ -41,7 +41,7 @@ const styles = css`
 const content = `
 # No Test Suites Yet!
 
-Trivet is the integrated graph test runner in Forge - create tests here, define their inputs and expected outputs,
+Forge Tests is the built-in test runner for your flows - create tests here, define their inputs and expected outputs,
 and run validation graphs to verify your graphs.
 
 Tests are organized into suites - designed so that you can have a suite for each graph you are testing.
@@ -68,7 +68,7 @@ export const NoTestSuitesSplash: FC<{
             Create Test Suite
           </Button>
           <Button appearance="default" onClick={syncWrapper(viewDocumentation)}>
-            View Trivet Documentation
+            View Test Documentation
           </Button>
         </div>
       </div>

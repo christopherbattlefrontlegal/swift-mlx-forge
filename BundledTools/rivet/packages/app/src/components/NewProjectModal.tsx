@@ -8,10 +8,7 @@ import { Field } from '@atlaskit/form';
 import TextField from '@atlaskit/textfield';
 import { match } from 'ts-pattern';
 import Button from '@atlaskit/button';
-import Textarea from '@atlaskit/textarea';
 import { useNewProject } from '../hooks/useNewProject';
-import Select, { type OptionType, type GroupType } from '@atlaskit/select';
-import documentationTutorialProject from '../assets/tutorials/documentation-tutorial.rivet-project?raw';
 import aiAgentTemplateProject from '../assets/templates/ai_agent_template.rivet-project?raw';
 import mcpAiAgentTemplateProject from '../assets/templates/mcp_ai_agent_template.rivet-project?raw';
 import { useNewProjectFromTemplate } from '../hooks/useNewProjectFromTemplate';
@@ -79,12 +76,6 @@ export const NewProjectModal: FC = () => {
               </Section>
               <Section title="Templates">
                 <ButtonItem
-                  isSelected={selectedTemplate === 'tutorial'}
-                  onClick={() => setSelectedTemplate('tutorial')}
-                >
-                  From Tutorial
-                </ButtonItem>
-                <ButtonItem
                   isSelected={selectedTemplate === 'ai_agent'}
                   onClick={() => setSelectedTemplate('ai_agent')}
                 >
@@ -102,7 +93,6 @@ export const NewProjectModal: FC = () => {
           <main>
             {match(selectedTemplate)
               .with('blank_project', () => <BlankProjectTemplate onCreated={onProjectCreated} />)
-              .with('tutorial', () => <FromTutorialTemplate onCreated={onProjectCreated} />)
               .with('ai_agent', () => <AiAgentTemplate onCreated={onProjectCreated}/>)
               .with('mcp_ai_agent', () => <MCPAiAgentTemplate onCreated={onProjectCreated}/>)
               .with('community_templates', () => <div>Coming soon!</div>)
@@ -123,14 +113,12 @@ export const NewProjectModal: FC = () => {
 const BlankProjectTemplate: FC<{
   onCreated: () => void;
 }> = ({ onCreated }) => {
-  const [projectName, setProjectName] = useState<string>('');
-  const [projectDescription, setProjectDescription] = useState<string>('');
-
+  const [projectName, setProjectName] = useState('');
   const newProject = useNewProject();
 
   const createProject = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    newProject({ title: projectName, description: projectDescription });
+    newProject({ title: projectName });
     onCreated();
   };
 
@@ -138,29 +126,17 @@ const BlankProjectTemplate: FC<{
     <div className="template blank-project">
       <h1>Blank Project</h1>
       <p>
-        Creates a new blank Forge project. The project will have no graphs and no nodes. Great when you have an idea and
-        want to start from scratch.
+        Name it now if you want, or leave the name empty and Forge will assign Untitled automatically.
       </p>
       <form onSubmit={createProject}>
-        <Field name="projectName" label="Project Name">
+        <Field name="projectName" label="Name (optional)">
           {() => (
             <TextField
               name="projectName"
               value={projectName}
-              onChange={(e) => setProjectName((e.target as HTMLInputElement).value)}
-              placeholder="Project Name"
+              onChange={(event) => setProjectName((event.target as HTMLInputElement).value)}
+              placeholder="Untitled"
               autoComplete="off"
-            />
-          )}
-        </Field>
-        <Field name="projectDescription" label="Project Description (optional)">
-          {() => (
-            <Textarea
-              name="projectDescription"
-              placeholder="Project Description"
-              autoComplete="off"
-              value={projectDescription}
-              onChange={(e) => setProjectDescription((e.target as HTMLTextAreaElement).value)}
             />
           )}
         </Field>
@@ -224,71 +200,6 @@ const MCPAiAgentTemplate: FC<{
         <Button appearance="primary" type="submit">
           Create Project
         </Button>
-      </form>
-    </div>
-  );
-};
-
-const tutorials = [
-  {
-    label: 'Documentation Tutorials',
-    options: [
-      {
-        label: 'Documentation Tutorial Project',
-        value: 'documentation_tutorial_project',
-      },
-    ],
-  },
-] satisfies GroupType<OptionType>[];
-
-const FromTutorialTemplate: FC<{
-  onCreated: () => void;
-}> = ({ onCreated }) => {
-  const [selectedTutorial, setSelectedTutorial] = useState<string | undefined>();
-
-  const selectedTutorialData = tutorials.flatMap((t) => t.options).find((t) => t.value === selectedTutorial);
-
-  const newProjectFromTemplate = useNewProjectFromTemplate();
-
-  const createProject = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-
-    if (!selectedTutorial) {
-      return;
-    }
-
-    match(selectedTutorial)
-      .with('documentation_tutorial_project', () => {
-        newProjectFromTemplate(documentationTutorialProject);
-      })
-      .otherwise((tutorial) => {});
-
-    onCreated();
-  };
-
-  return (
-    <div className="template from-tutorial">
-      <h1>From Tutorial</h1>
-      <p>
-        Creates a new project from a Forge tutorial. Select your tutorial using the dropdown below and a new project
-        will be created, containing the contents of the tutorial project.
-      </p>
-      <form onSubmit={createProject}>
-        <Field name="tutorial" label="Tutorial">
-          {() => (
-            <Select
-              options={tutorials as any}
-              value={selectedTutorialData}
-              onChange={(option) => setSelectedTutorial(option?.value)}
-              placeholder="Select a tutorial"
-            />
-          )}
-        </Field>
-        <div className="actions">
-          <Button appearance="primary" type="submit">
-            Create Project
-          </Button>
-        </div>
       </form>
     </div>
   );

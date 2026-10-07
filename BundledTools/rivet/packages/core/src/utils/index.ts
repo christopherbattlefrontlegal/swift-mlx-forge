@@ -12,3 +12,4 @@ export * from './serialization/serializationUtils.js';
 export * from './handleEscapeCharacters.js';
 export * from './compatibility.js';
 export * from './defaults.js';
+export * from './forgeModels.js';

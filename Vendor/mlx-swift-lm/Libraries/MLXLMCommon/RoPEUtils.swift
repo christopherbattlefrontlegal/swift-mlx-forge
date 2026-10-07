@@ -289,6 +289,94 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     }
 }
 
+/// YaRN scaling parameters as declared in `rope_scaling` / `rope_parameters`.
+///
+/// `init?(scalingConfig:)` returns nil for configurations that do not declare a
+/// YaRN type, so callers fall back to plain RoPE without re-parsing the dictionary.
+public struct YarnRoPEParameters: Sendable, Equatable {
+    public var scalingFactor: Float
+    public var originalMaxPositionEmbeddings: Int
+    public var betaFast: Float
+    public var betaSlow: Float
+    public var mscale: Float
+    public var mscaleAllDim: Float
+    /// Explicit `attention_factor`. When present it replaces the mscale-derived
+    /// value, matching the reference implementation.
+    public var attentionFactor: Float?
+
+    public init(
+        scalingFactor: Float,
+        originalMaxPositionEmbeddings: Int,
+        betaFast: Float = 32,
+        betaSlow: Float = 1,
+        mscale: Float = 1,
+        mscaleAllDim: Float = 0,
+        attentionFactor: Float? = nil
+    ) {
+        self.scalingFactor = scalingFactor
+        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
+        self.betaFast = betaFast
+        self.betaSlow = betaSlow
+        self.mscale = mscale
+        self.mscaleAllDim = mscaleAllDim
+        self.attentionFactor = attentionFactor
+    }
+
+    public init?(scalingConfig: [String: StringOrNumber]?) {
+        guard let scalingConfig, let type = ropeType(in: scalingConfig), yarnTypes.contains(type)
+        else { return nil }
+        self.scalingFactor = scalingConfig["factor"]?.asFloat() ?? 32.0
+        self.originalMaxPositionEmbeddings =
+            scalingConfig["original_max_position_embeddings"]?.asInt() ?? 4096
+        self.betaFast = scalingConfig["beta_fast"]?.asFloat() ?? 32.0
+        self.betaSlow = scalingConfig["beta_slow"]?.asFloat() ?? 1.0
+        self.mscale = scalingConfig["mscale"]?.asFloat() ?? 1.0
+        self.mscaleAllDim = scalingConfig["mscale_all_dim"]?.asFloat() ?? 0.0
+        self.attentionFactor = scalingConfig["attention_factor"]?.asFloat()
+    }
+
+    /// Scale applied to the rotated query and key dimensions.
+    public var attentionScale: Float {
+        if let attentionFactor {
+            return attentionFactor
+        }
+        func mscaleValue(_ mscale: Float) -> Float {
+            if scalingFactor <= 1 {
+                return 1.0
+            }
+            return 0.1 * mscale * log(scalingFactor) + 1.0
+        }
+        return mscaleValue(mscale) / mscaleValue(mscaleAllDim)
+    }
+
+    /// Per-dimension rotary frequencies after NTK-by-parts interpolation. These
+    /// are the `freqs` that `MLXFast.RoPE` consumes: angle = position / freq.
+    public func frequencies(dimensions: Int, base: Float) -> MLXArray {
+        func correctionDim(numRotations: Float) -> Float {
+            return Float(dimensions)
+                * log(Float(originalMaxPositionEmbeddings) / (numRotations * 2 * Float.pi))
+                / (2 * log(base))
+        }
+        let low = max(Int(floor(correctionDim(numRotations: betaFast))), 0)
+        let high = min(Int(ceil(correctionDim(numRotations: betaSlow))), dimensions - 1)
+
+        var rampMax = Float(high)
+        if Float(low) == rampMax {
+            rampMax += 0.001
+        }
+        let linearFunc =
+            (MLXArray(0 ..< (dimensions / 2)).asType(.float32) - Float(low)) / (rampMax - Float(low))
+        let freqMask = 1.0 - clip(linearFunc, min: 0, max: 1)
+
+        let freqExtra = pow(
+            base,
+            MLXArray(stride(from: 0, to: dimensions, by: 2)).asType(.float32)
+                / dimensions)
+        let freqInter = scalingFactor * freqExtra
+        return (freqInter * freqExtra) / (freqInter * freqMask + freqExtra * (1 - freqMask))
+    }
+}
+
 public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dimensions: Int
     let traditional: Bool
@@ -296,7 +384,7 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     private let _mscale: Float
     private let _freqs: MLXArray
 
-    public init(
+    public convenience init(
         dimensions: Int,
         traditional: Bool = false,
         maxPositionEmbeddings: Int = 2048,
@@ -306,62 +394,35 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         betaFast: Float = 32,
         betaSlow: Float = 1,
         mscale: Float = 1,
-        mscaleAllDim: Float = 0
+        mscaleAllDim: Float = 0,
+        attentionFactor: Float? = nil
+    ) {
+        self.init(
+            dimensions: dimensions,
+            traditional: traditional,
+            base: base,
+            parameters: YarnRoPEParameters(
+                scalingFactor: scalingFactor,
+                originalMaxPositionEmbeddings: originalMaxPositionEmbeddings,
+                betaFast: betaFast,
+                betaSlow: betaSlow,
+                mscale: mscale,
+                mscaleAllDim: mscaleAllDim,
+                attentionFactor: attentionFactor))
+    }
+
+    public init(
+        dimensions: Int,
+        traditional: Bool = false,
+        base: Float = 10000,
+        parameters: YarnRoPEParameters
     ) {
         precondition(dimensions % 2 == 0, "Dimensions must be even")
 
         self.dimensions = dimensions
         self.traditional = traditional
-
-        func yarnFindCorrectionDim(numRotations: Float) -> Float {
-            return Float(dimensions)
-                * log(Float(originalMaxPositionEmbeddings) / (numRotations * 2 * Float.pi))
-                / (2 * log(base))
-        }
-
-        func yarnFindCorrectionRange() -> (low: Int, high: Int) {
-            let low = Int(floor(yarnFindCorrectionDim(numRotations: betaFast)))
-            let high = Int(ceil(yarnFindCorrectionDim(numRotations: betaSlow)))
-            return (max(low, 0), min(high, dimensions - 1))
-        }
-
-        func yarnGetMscale(scale: Float, mscale: Float) -> Float {
-            if scale <= 1 {
-                return 1.0
-            }
-            return 0.1 * mscale * log(scale) + 1.0
-        }
-
-        func yarnLinearRampMask(minVal: Float, maxVal: Float, dim: Int) -> MLXArray {
-            var maxVal = maxVal
-            if minVal == maxVal {
-                maxVal += 0.001
-            }
-
-            let linearFunc = (MLXArray(0 ..< dim).asType(.float32) - minVal) / (maxVal - minVal)
-            return clip(linearFunc, min: 0, max: 1)
-        }
-
-        self._mscale =
-            yarnGetMscale(scale: scalingFactor, mscale: mscale)
-            / yarnGetMscale(scale: scalingFactor, mscale: mscaleAllDim)
-
-        let freqExtra = pow(
-            base,
-            MLXArray(stride(from: 0, to: dimensions, by: 2)).asType(.float32)
-                / dimensions)
-        let freqInter =
-            scalingFactor
-            * pow(
-                base,
-                MLXArray(stride(from: 0, to: dimensions, by: 2)).asType(.float32)
-                    / dimensions)
-
-        let (low, high) = yarnFindCorrectionRange()
-        let freqMask =
-            1.0 - yarnLinearRampMask(minVal: Float(low), maxVal: Float(high), dim: dimensions / 2)
-
-        self._freqs = (freqInter * freqExtra) / (freqInter * freqMask + freqExtra * (1 - freqMask))
+        self._mscale = parameters.attentionScale
+        self._freqs = parameters.frequencies(dimensions: dimensions, base: base)
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
@@ -403,6 +464,44 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         )
     }
 
+}
+
+/// Keys that describe position scaling, as opposed to the base rotary geometry
+/// (`rope_theta`, `partial_rotary_factor`, `mrope_section`, `mrope_interleaved`).
+private let ropeScalingKeys: Set<String> = [
+    "type", "rope_type", "factor", "original_max_position_embeddings", "attention_factor",
+    "beta_fast", "beta_slow", "mscale", "mscale_all_dim", "truncate",
+    "low_freq_factor", "high_freq_factor", "short_factor", "long_factor",
+]
+
+/// Folds a legacy `rope_scaling` block into transformers-v5 style `rope_parameters`.
+///
+/// Checkpoints converted across the v5 schema change can carry both: `rope_parameters`
+/// describing the base geometry with `type: default`, and `rope_scaling` declaring the
+/// scaling (for example YaRN) that the converter never folded in. The legacy block is
+/// applied only when `rope_parameters` declares no non-default type of its own; an
+/// explicit type in `rope_parameters` is authoritative. `rope_type` is normalised to
+/// `type` in the result.
+public func resolveRoPEParameters(
+    _ ropeParameters: [String: StringOrNumber],
+    legacyScaling: [String: StringOrNumber]?
+) -> [String: StringOrNumber] {
+    var resolved = ropeParameters
+    if resolved["type"] == nil, let ropeType = resolved["rope_type"] {
+        resolved["type"] = ropeType
+    }
+    guard let legacyScaling,
+        (ropeType(in: resolved) ?? "default") == "default",
+        let legacyType = ropeType(in: legacyScaling),
+        legacyType != "default"
+    else {
+        return resolved
+    }
+    for (key, value) in legacyScaling where ropeScalingKeys.contains(key) {
+        resolved[key] = value
+    }
+    resolved["type"] = .string(legacyType)
+    return resolved
 }
 
 public typealias RoPELayer = OffsetLayer & ArrayOffsetLayer
@@ -447,25 +546,12 @@ public func initializeRope(
             base: base,
             scalingConfig: scalingConfig
         )
-    } else if yarnTypes.contains(ropeType) {
-        let factor = scalingConfig?["factor"]?.asFloat() ?? 32.0
-        let origMax = scalingConfig?["original_max_position_embeddings"]?.asInt() ?? 4096
-        let betaFast = scalingConfig?["beta_fast"]?.asFloat() ?? 32.0
-        let betaSlow = scalingConfig?["beta_slow"]?.asFloat() ?? 1.0
-        let mscale = scalingConfig?["mscale"]?.asFloat() ?? 1.0
-        let mscaleAllDim = scalingConfig?["mscale_all_dim"]?.asFloat() ?? 0.0
-
+    } else if let parameters = YarnRoPEParameters(scalingConfig: scalingConfig) {
         return YarnRoPE(
             dimensions: dims,
             traditional: traditional,
-            maxPositionEmbeddings: maxPositionEmbeddings ?? 2048,
             base: base,
-            scalingFactor: factor,
-            originalMaxPositionEmbeddings: origMax,
-            betaFast: betaFast,
-            betaSlow: betaSlow,
-            mscale: mscale,
-            mscaleAllDim: mscaleAllDim
+            parameters: parameters
         )
     } else if ropeType == "longrope" {
         guard let config = scalingConfig else {
