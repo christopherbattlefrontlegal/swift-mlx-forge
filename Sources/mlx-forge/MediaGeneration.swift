@@ -3,7 +3,8 @@
 // One home for every generation API the Media Studio speaks: OpenAI images
 // (gpt-image-1), xAI Grok images, OpenAI Sora video jobs, and xAI Grok
 // text-to-speech. Video is an async job API; the client polls until the render
-// completes and returns the MP4 bytes. Generated assets land in Application Support/Forge/Media.
+// completes and returns the MP4 bytes. Local FastH3 video runs on this Mac through
+// FastH3Runtime. Generated assets land in Application Support/Forge/Media.
 
 import Foundation
 import Observation
@@ -35,6 +36,7 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
     case openAIImage
     case grokImage
     case openAIVideo
+    case fastH3Video
 
     var id: String { rawValue }
 
@@ -43,22 +45,27 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         case .openAIImage: return "GPT Image"
         case .grokImage: return "Grok Image"
         case .openAIVideo: return "Sora Video"
+        case .fastH3Video: return "FastH3 Local"
         }
     }
 
     var systemImage: String {
         switch self {
         case .openAIImage, .grokImage: return "photo"
-        case .openAIVideo: return "video"
+        case .openAIVideo, .fastH3Video: return "video"
         }
     }
 
-    var isVideo: Bool { self == .openAIVideo }
+    var isVideo: Bool { self == .openAIVideo || self == .fastH3Video }
+
+    /// Runs on this Mac; no cloud key is involved.
+    var isLocal: Bool { self == .fastH3Video }
 
     var hasKey: Bool {
         switch self {
         case .openAIImage, .openAIVideo: return SecretsStore.hasOpenAIKey
         case .grokImage: return SecretsStore.hasXAIKey
+        case .fastH3Video: return true
         }
     }
 
@@ -66,6 +73,17 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .openAIImage, .openAIVideo: return "OpenAI"
         case .grokImage: return "xAI"
+        case .fastH3Video: return "FastH3"
+        }
+    }
+
+    /// Why Generate is unavailable, or nil when this provider can run now.
+    var unavailableReason: String? {
+        switch self {
+        case .fastH3Video:
+            return FastH3Runtime.unavailableReason()
+        case .openAIImage, .grokImage, .openAIVideo:
+            return hasKey ? nil : "Add an \(keyHint) API key in Settings to use \(label)."
         }
     }
 
@@ -74,6 +92,7 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         case .openAIImage: return ["1024x1024", "1536x1024", "1024x1536"]
         case .grokImage: return ["default"]
         case .openAIVideo: return ["1280x720", "720x1280"]
+        case .fastH3Video: return FastH3Runtime.sizes
         }
     }
 }
@@ -108,6 +127,8 @@ enum MediaGenClient {
             return try await imageData(fromGenerationResponse: json)
         case .openAIVideo:
             throw MediaGenError.badResponse("Video uses generateVideo().")
+        case .fastH3Video:
+            throw MediaGenError.badResponse("FastH3 video uses FastH3Runtime.generate().")
         }
     }
 

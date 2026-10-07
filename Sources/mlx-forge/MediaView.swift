@@ -1,5 +1,5 @@
-// Forge — Media Studio pane: cloud image/video generation, the generated-asset
-// gallery, and an Apple Music transport.
+// Forge — Media Studio pane: cloud image/video generation, local FastH3 video,
+// the generated-asset gallery, and an Apple Music transport.
 //
 // The Music section drives Music.app through its public scripting surface
 // (play/pause, track info, volume, and the player's own EQ presets). It pipes
@@ -77,8 +77,6 @@ struct MediaView: View {
                     Label(p.label, systemImage: p.systemImage).tag(p)
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
 
             modelPicker
 
@@ -93,11 +91,20 @@ struct MediaView: View {
                 .background(Theme.composerBackground)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall))
 
+            if provider == .fastH3Video {
+                Text("(S1) A presenter says <d>[English] Hello.</d>")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if provider.isVideo {
-                Picker("Length", selection: $videoSeconds) {
-                    Text("4 seconds").tag(4)
-                    Text("8 seconds").tag(8)
-                    Text("12 seconds").tag(12)
+                if provider == .openAIVideo {
+                    Picker("Length", selection: $videoSeconds) {
+                        Text("4 seconds").tag(4)
+                        Text("8 seconds").tag(8)
+                        Text("12 seconds").tag(12)
+                    }
                 }
                 Picker("Size", selection: $imageSize) {
                     ForEach(provider.imageSizes, id: \.self) { Text($0).tag($0) }
@@ -108,13 +115,11 @@ struct MediaView: View {
                 }
             }
 
-            if !provider.hasKey {
-                Label(
-                    "Add an \(provider.keyHint) API key in Settings to use \(provider.label).",
-                    systemImage: "key.slash")
-                .font(.caption)
-                .foregroundStyle(Theme.emberGlow)
-                .fixedSize(horizontal: false, vertical: true)
+            if let reason = provider.unavailableReason {
+                Label(reason, systemImage: provider.isLocal ? "folder.badge.questionmark" : "key.slash")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack(spacing: Theme.s2) {
@@ -128,7 +133,7 @@ struct MediaView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.ember)
                 .disabled(
-                    isGenerating || !provider.hasKey
+                    isGenerating || provider.unavailableReason != nil
                         || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if isGenerating {
                     Button("Cancel") {
@@ -171,6 +176,7 @@ struct MediaView: View {
         case .openAIImage: return CloudModelCatalog.imageModels(.openAI)
         case .grokImage: return CloudModelCatalog.imageModels(.xAI)
         case .openAIVideo: return CloudModelCatalog.videoModels()
+        case .fastH3Video: return [FastH3Runtime.modelName]
         }
     }
 
@@ -179,6 +185,7 @@ struct MediaView: View {
         case .openAIImage: return $openAIImageModel
         case .grokImage: return $grokImageModel
         case .openAIVideo: return $videoModel
+        case .fastH3Video: return .constant(FastH3Runtime.modelName)
         }
     }
 
@@ -201,6 +208,7 @@ struct MediaView: View {
         case .openAIImage: return openAIImageModel
         case .grokImage: return grokImageModel
         case .openAIVideo: return videoModel
+        case .fastH3Video: return FastH3Runtime.modelName
         }
     }
 
@@ -209,11 +217,13 @@ struct MediaView: View {
         guard !requestPrompt.isEmpty, !isGenerating else { return }
         isGenerating = true
         errorText = ""
-        status = provider.isVideo ? "submitting render job" : "generating"
+        status = provider.isLocal
+            ? "starting FastVideo" : (provider.isVideo ? "submitting render job" : "generating")
         let requestProvider = provider
         let requestModel = selectedModel
         let requestSize = imageSize
         let requestSeconds = videoSeconds
+        let requestSeed = Int.random(in: 0...Int(Int32.max))
         generationTask = Task { @MainActor in
             defer {
                 isGenerating = false
@@ -222,7 +232,14 @@ struct MediaView: View {
             do {
                 let data: Data
                 let fileExtension: String
-                if requestProvider.isVideo {
+                if requestProvider == .fastH3Video {
+                    data = try await FastH3Runtime.generate(
+                        prompt: requestPrompt, size: requestSize, seed: requestSeed
+                    ) { progress in
+                        Task { @MainActor in self.status = progress }
+                    }
+                    fileExtension = "mp4"
+                } else if requestProvider.isVideo {
                     data = try await MediaGenClient.generateVideo(
                         model: requestModel, prompt: requestPrompt,
                         seconds: requestSeconds, size: requestSize

@@ -1,5 +1,6 @@
-// Forge — app settings window (⌘,): Claude API key (Keychain) + MCP servers.
-// Both lived in the right sidebar before; they're configuration, not tuning.
+// Forge — app settings window (⌘,): Claude API key (Keychain), local FastH3
+// video paths, and MCP servers. They lived in the right sidebar before; they're
+// configuration, not tuning.
 
 import AppKit
 import SwiftUI
@@ -11,6 +12,8 @@ struct ForgeSettingsView: View {
                 .tabItem { Label("Cloud APIs", systemImage: "cloud") }
             PromptLibrarySettings()
                 .tabItem { Label("Prompt Library", systemImage: "book.closed") }
+            LocalVideoSettings()
+                .tabItem { Label("Local Video", systemImage: "video") }
             MCPSettings()
                 .tabItem { Label("MCP Servers (advanced)", systemImage: "server.rack") }
         }
@@ -481,6 +484,97 @@ private struct ClaudeKeySettings: View {
         openAIDraft = ""
     }
 
+}
+
+// MARK: - Local video (FastH3)
+
+/// Paths for the FastH3 8-Step V2 runtime that the Media Studio's FastH3 Local
+/// provider launches. Blank fields fall back to the built-in defaults.
+private struct LocalVideoSettings: View {
+    @AppStorage(FastH3Paths.fastVideoRootKey) private var fastVideoRoot =
+        FastH3Paths.defaultFastVideoRoot
+    @AppStorage(FastH3Paths.checkpointRootKey) private var checkpointRoot =
+        FastH3Paths.defaultCheckpointRoot
+    @AppStorage(FastH3Paths.mlxCheckpointKey) private var mlxCheckpoint =
+        FastH3Paths.defaultMLXCheckpoint
+
+    private var paths: FastH3Paths {
+        FastH3Paths(
+            fastVideoRoot: fastVideoRoot, checkpointRoot: checkpointRoot,
+            mlxCheckpoint: mlxCheckpoint)
+    }
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: Theme.s4) {
+            Label("Local Video (FastH3 8-Step V2)", systemImage: "video")
+                .font(.headline)
+            Text("FastH3 Local renders text to video with speech on this Mac through a FastVideo clone.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            pathField("FastVideo clone", text: $fastVideoRoot, hint: "Has .venv and the MLX examples")
+            pathField("Checkpoint root", text: $checkpointRoot, hint: "Has fastvideo_inference.json")
+            pathField("MLX INT8 VSA DiT", text: $mlxCheckpoint, hint: "Has mlx_h3_dit.safetensors")
+
+            readiness
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(Theme.s5)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func pathField(_ title: String, text: Binding<String>, hint: String) -> some View {
+        VStack(alignment: .leading, spacing: Theme.s1) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+            HStack(spacing: Theme.s2) {
+                TextField(title, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                Button("Browse…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.allowsMultipleSelection = false
+                    panel.directoryURL = URL(fileURLWithPath: text.wrappedValue, isDirectory: true)
+                    panel.prompt = "Choose"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        text.wrappedValue = url.path
+                    }
+                }
+                .controlSize(.small)
+            }
+            Text(hint)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var readiness: some View {
+        let missing = paths.missing()
+        if missing.isEmpty {
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.green)
+        } else {
+            VStack(alignment: .leading, spacing: Theme.s1) {
+                Label("Missing", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
+                ForEach(missing, id: \.self) { path in
+                    Text(path)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+    }
 }
 
 // MARK: - MCP servers
