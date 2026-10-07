@@ -603,6 +603,8 @@ private struct ReferenceVideoSettings: View {
     @AppStorage(MLXGenPaths.executableKey) private var executable =
         MLXGenPaths.defaultExecutable
     @AppStorage(MLXGenPaths.hfHomeKey) private var hfHome = MLXGenPaths.defaultHFHome
+    @AppStorage(StudioLauncher.launcherKey) private var studioLauncher =
+        StudioLauncher.defaultLauncher
 
     private var paths: MLXGenPaths { MLXGenPaths(executable: executable, hfHome: hfHome) }
 
@@ -627,6 +629,30 @@ private struct ReferenceVideoSettings: View {
 
             ForEach(MLXGenRoute.allCases, id: \.self) { route in
                 readiness(for: route)
+            }
+
+            Divider()
+
+            Label("Music Video Studio", systemImage: "music.mic")
+                .font(.headline)
+            Text(
+                "The Media tab's Music Video Studio button opens Claude Code in a workspace whose CLAUDE.md briefs it on the band, the song, and every local video tool here."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            LocalPathField(
+                title: "Studio launcher", text: $studioLauncher,
+                hint: "An executable .command script; opens in iTerm2 when installed, else Terminal",
+                choosesFiles: true)
+            if FileManager.default.isExecutableFile(atPath: studioLauncher) {
+                Label("Launcher found", systemImage: "checkmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.green)
+            } else {
+                Label("Launcher missing or not executable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
             }
         }
     }
