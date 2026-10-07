@@ -66,7 +66,15 @@ let package = Package(
                 .product(name: "LLM", package: "LLM.swift"),
                 .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Sources/mlx-forge"
+            path: "Sources/mlx-forge",
+            linkerSettings: [
+                // VideoPlayer lives in the _AVKit_SwiftUI overlay, which does not link
+                // AVKit itself. Swift auto-links AVKit only when app code references an
+                // AVKit symbol directly; nothing here does, so the linker dropped it and
+                // the player view aborted at runtime ("failed to demangle superclass of
+                // VideoPlayerView from mangled name 'So12AVPlayerViewC'"). Link it explicitly.
+                .linkedFramework("AVKit")
+            ]
         ),
         .testTarget(
             name: "mlx-forgeTests",
