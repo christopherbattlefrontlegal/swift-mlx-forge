@@ -129,7 +129,9 @@ final class MLXGenRuntimeTests: XCTestCase {
         try "#!/bin/sh\n".write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
 
-        var paths = MLXGenPaths(executable: executable.path, hfHome: root.path)
+        var paths = MLXGenPaths(
+            executable: executable.path, hfHome: root.path,
+            loraCache: root.appendingPathComponent("loras").path)
 
         // An empty snapshot folder is not a download.
         XCTAssertEqual(paths.missing(for: .berniniReference).count, 1)
@@ -143,8 +145,20 @@ final class MLXGenRuntimeTests: XCTestCase {
         XCTAssertEqual(paths.missing(for: .berniniReference).count, 1)
         try FileManager.default.removeItem(at: incomplete)
 
-        // H3 needs two repos; neither is present here.
+        // H3 needs its snapshot plus the Turbo adapter in mlx-gen's LoRA cache.
         XCTAssertEqual(paths.missing(for: .h3FirstFrame).count, 2)
+        let h3 = root.appendingPathComponent("hub/" + MLXGenPaths.cacheFolder(for: "MiniMaxAI/MiniMax-H3"))
+        try FileManager.default.createDirectory(
+            at: h3.appendingPathComponent("snapshots/rev1"), withIntermediateDirectories: true)
+        try "{}".write(
+            to: h3.appendingPathComponent("snapshots/rev1/model_index.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(paths.missing(for: .h3FirstFrame).count, 1)
+        XCTAssertTrue(paths.missing(for: .h3FirstFrame)[0].contains("minimax_h3_fl2v_turbo"))
+        let lora = root.appendingPathComponent("loras/minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors")
+        try FileManager.default.createDirectory(
+            at: lora.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: lora)
+        XCTAssertTrue(paths.missing(for: .h3FirstFrame).isEmpty)
 
         // A missing executable is listed first, with the install hint.
         paths.executable = root.appendingPathComponent("nope").path
