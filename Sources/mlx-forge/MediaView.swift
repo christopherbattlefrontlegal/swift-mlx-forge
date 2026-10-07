@@ -7,7 +7,9 @@
 
 import AVKit
 import AppKit
+import ImageIO
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct MediaView: View {
     @Environment(AppState.self) private var app
@@ -21,6 +23,8 @@ struct MediaView: View {
     @State private var isGenerating = false
     @State private var selected: MediaAsset?
     @State private var generationTask: Task<Void, Never>?
+    @State private var referenceImages: [URL] = []
+    @State private var referenceThumbnails: [URL: NSImage] = [:]
     @AppStorage("media.model.openAIImage") private var openAIImageModel = "gpt-image-1"
     @AppStorage("media.model.grokImage") private var grokImageModel = "grok-2-image"
     @AppStorage("media.model.video") private var videoModel = "sora-2"
@@ -91,12 +95,14 @@ struct MediaView: View {
                 .background(Theme.composerBackground)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall))
 
-            if provider == .fastH3Video {
-                Text("(S1) A presenter says <d>[English] Hello.</d>")
+            if let hint = provider.promptHint {
+                Text(hint)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            referencePicker
 
             if provider.isVideo {
                 if provider == .openAIVideo {
@@ -133,7 +139,7 @@ struct MediaView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.ember)
                 .disabled(
-                    isGenerating || provider.unavailableReason != nil
+                    isGenerating || provider.unavailableReason != nil || needsReferenceImages
                         || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if isGenerating {
                     Button("Cancel") {
@@ -168,6 +174,11 @@ struct MediaView: View {
             if !newValue.imageSizes.contains(imageSize) {
                 imageSize = newValue.imageSizes.first ?? "1024x1024"
             }
+            if let limit = newValue.referenceImageRange?.upperBound,
+                referenceImages.count > limit
+            {
+                referenceImages = Array(referenceImages.prefix(limit))
+            }
         }
     }
 
@@ -177,6 +188,8 @@ struct MediaView: View {
         case .grokImage: return CloudModelCatalog.imageModels(.xAI)
         case .openAIVideo: return CloudModelCatalog.videoModels()
         case .fastH3Video: return [FastH3Runtime.modelName]
+        case .berniniReference: return [MLXGenRoute.berniniReference.displayModel]
+        case .h3ImageVideo: return [MLXGenRoute.h3FirstFrame.displayModel]
         }
     }
 
@@ -186,6 +199,8 @@ struct MediaView: View {
         case .grokImage: return $grokImageModel
         case .openAIVideo: return $videoModel
         case .fastH3Video: return .constant(FastH3Runtime.modelName)
+        case .berniniReference: return .constant(MLXGenRoute.berniniReference.displayModel)
+        case .h3ImageVideo: return .constant(MLXGenRoute.h3FirstFrame.displayModel)
         }
     }
 
@@ -209,6 +224,8 @@ struct MediaView: View {
         case .grokImage: return grokImageModel
         case .openAIVideo: return videoModel
         case .fastH3Video: return FastH3Runtime.modelName
+        case .berniniReference: return MLXGenRoute.berniniReference.displayModel
+        case .h3ImageVideo: return MLXGenRoute.h3FirstFrame.displayModel
         }
     }
 
@@ -218,8 +235,9 @@ struct MediaView: View {
         isGenerating = true
         errorText = ""
         status = provider.isLocal
-            ? "starting FastVideo" : (provider.isVideo ? "submitting render job" : "generating")
+            ? "starting local renderer" : (provider.isVideo ? "submitting render job" : "generating")
         let requestProvider = provider
+        let requestImages = referenceImages
         let requestModel = selectedModel
         let requestSize = imageSize
         let requestSeconds = videoSeconds
@@ -232,7 +250,15 @@ struct MediaView: View {
             do {
                 let data: Data
                 let fileExtension: String
-                if requestProvider == .fastH3Video {
+                if let route = requestProvider.mlxGenRoute {
+                    data = try await MLXGenRuntime.generate(
+                        route: route, prompt: requestPrompt, size: requestSize,
+                        seed: requestSeed, images: requestImages
+                    ) { progress in
+                        Task { @MainActor in self.status = progress }
+                    }
+                    fileExtension = "mp4"
+                } else if requestProvider == .fastH3Video {
                     data = try await FastH3Runtime.generate(
                         prompt: requestPrompt, size: requestSize, seed: requestSeed
                     ) { progress in
@@ -266,6 +292,125 @@ struct MediaView: View {
                 errorText = error.localizedDescription
             }
         }
+    }
+
+    // MARK: - Reference photos
+
+    private var needsReferenceImages: Bool {
+        guard let range = provider.referenceImageRange else { return false }
+        return !range.contains(referenceImages.count)
+    }
+
+    @ViewBuilder
+    private var referencePicker: some View {
+        if let range = provider.referenceImageRange {
+            VStack(alignment: .leading, spacing: Theme.s2) {
+                HStack {
+                    Text(
+                        range.upperBound == 1
+                            ? "Keyframe"
+                            : "Reference photos (\(range.lowerBound) to \(range.upperBound), in order)"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button(range.upperBound == 1 ? "Choose…" : "Add…") {
+                        addReferenceImages(limit: range.upperBound)
+                    }
+                    .controlSize(.small)
+                    .disabled(isGenerating)
+                }
+                if referenceImages.isEmpty {
+                    Text(
+                        range.upperBound == 1
+                            ? "Choose the photo the clip starts from."
+                            : "Add photos of the people and things that should appear."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: Theme.s2) {
+                            ForEach(Array(referenceImages.enumerated()), id: \.element) { index, url in
+                                referenceThumb(url, index: index)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func referenceThumb(_ url: URL, index: Int) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if let image = referenceThumbnails[url] {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Image(systemName: "photo")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 72, height: 72)
+            .background(Theme.assistantBubble)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall))
+            Button {
+                referenceImages.removeAll { $0 == url }
+                referenceThumbnails[url] = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.white)
+                    .shadow(radius: 2)
+            }
+            .buttonStyle(.plain)
+            .padding(2)
+            .disabled(isGenerating)
+        }
+        .overlay(alignment: .bottomLeading) {
+            Text("\(index + 1)")
+                .font(.caption2.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(.black.opacity(0.6))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(3)
+        }
+        .help(url.lastPathComponent)
+    }
+
+    private func addReferenceImages(limit: Int) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = limit > 1
+        panel.allowedContentTypes = [.png, .jpeg, .tiff, .webP]
+        panel.prompt = limit == 1 ? "Choose" : "Add"
+        guard panel.runModal() == .OK else { return }
+        var chosen = limit == 1 ? [] : referenceImages
+        for url in panel.urls where !chosen.contains(url) && chosen.count < limit {
+            chosen.append(url)
+        }
+        referenceImages = chosen
+        for url in chosen where referenceThumbnails[url] == nil {
+            referenceThumbnails[url] = Self.thumbnail(for: url)
+        }
+    }
+
+    /// A small decoded preview, so the panel never re-decodes full-size photos.
+    private static func thumbnail(for url: URL, maxPixel: Int = 160) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     // MARK: - Viewer

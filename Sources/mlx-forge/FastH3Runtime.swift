@@ -151,21 +151,22 @@ enum FastH3Runtime {
         let outputURL = outputDir.appendingPathComponent(UUID().uuidString + ".mp4")
         defer { try? FileManager.default.removeItem(at: outputURL) }
 
-        var environment = ProcessInfo.processInfo.environment
-        // A Finder-launched app has a minimal PATH; the mux step needs Homebrew's ffmpeg.
-        environment["PATH"] =
-            "/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
-        environment["PYTHONUNBUFFERED"] = "1"
-
         onStatus("starting FastVideo (seed \(seed))")
-        let result = try await run(
-            executable: paths.python,
-            arguments: arguments(
-                paths: paths, prompt: prompt, width: dims.width, height: dims.height,
-                seed: seed, outputPath: outputURL.path),
-            currentDirectory: paths.fastVideoRoot,
-            environment: environment,
-            onStatus: onStatus)
+        let result: LocalProcessRunner.Result
+        do {
+            result = try await LocalProcessRunner.run(
+                executable: paths.python,
+                arguments: arguments(
+                    paths: paths, prompt: prompt, width: dims.width, height: dims.height,
+                    seed: seed, outputPath: outputURL.path),
+                currentDirectory: paths.fastVideoRoot,
+                environment: LocalProcessRunner.environment()
+            ) { line in
+                if let status = status(fromLogLine: line) { onStatus(status) }
+            }
+        } catch LocalProcessError.launchFailed(let reason) {
+            throw FastH3Error.launchFailed(reason)
+        }
         try Task.checkCancellation()
         guard result.status == 0 else {
             throw FastH3Error.failed(status: result.status, log: result.logTail)
@@ -174,97 +175,5 @@ enum FastH3Runtime {
             throw FastH3Error.noOutput(outputURL.path)
         }
         return data
-    }
-
-    // MARK: - Subprocess
-
-    private struct RunResult: Sendable {
-        let status: Int32
-        let logTail: String
-    }
-
-    /// Splits the merged stdout/stderr stream into lines and keeps the tail for errors.
-    private final class ProcessLog: @unchecked Sendable {
-        private let lock = NSLock()
-        private var partial = ""
-        private var lines: [String] = []
-        private let limit = 60
-
-        func ingest(_ data: Data) -> [String] {
-            lock.lock()
-            defer { lock.unlock() }
-            partial += String(decoding: data, as: UTF8.self)
-            var completed: [String] = []
-            while let newline = partial.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-                let line = String(partial[..<newline])
-                partial = String(partial[partial.index(after: newline)...])
-                if !line.isEmpty { completed.append(line) }
-            }
-            lines.append(contentsOf: completed)
-            if lines.count > limit { lines.removeFirst(lines.count - limit) }
-            return completed
-        }
-
-        var tail: String {
-            lock.lock()
-            defer { lock.unlock() }
-            let all = partial.isEmpty ? lines : lines + [partial]
-            return all.joined(separator: "\n")
-        }
-    }
-
-    private final class ProcessBox: @unchecked Sendable {
-        let process = Process()
-    }
-
-    private static func run(
-        executable: String, arguments: [String], currentDirectory: String,
-        environment: [String: String],
-        onStatus: @escaping @Sendable (String) -> Void
-    ) async throws -> RunResult {
-        let box = ProcessBox()
-        let process = box.process
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory, isDirectory: true)
-        process.environment = environment
-        process.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        let log = ProcessLog()
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
-            }
-            for line in log.ingest(data) {
-                if let status = FastH3Runtime.status(fromLogLine: line) { onStatus(status) }
-            }
-        }
-
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<RunResult, Error>) in
-                process.terminationHandler = { finished in
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    _ = log.ingest(pipe.fileHandleForReading.readDataToEndOfFile())
-                    continuation.resume(
-                        returning: RunResult(
-                            status: finished.terminationStatus, logTail: log.tail))
-                }
-                do {
-                    try process.run()
-                } catch {
-                    process.terminationHandler = nil
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(throwing: FastH3Error.launchFailed(error.localizedDescription))
-                }
-            }
-        } onCancel: {
-            if box.process.isRunning { box.process.terminate() }
-        }
     }
 }

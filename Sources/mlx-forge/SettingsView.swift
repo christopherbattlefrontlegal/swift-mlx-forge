@@ -519,6 +519,10 @@ private struct LocalVideoSettings: View {
             pathField("MLX INT8 VSA DiT", text: $mlxCheckpoint, hint: "Has mlx_h3_dit.safetensors")
 
             readiness
+
+            Divider()
+
+            ReferenceVideoSettings()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(Theme.s5)
@@ -527,30 +531,7 @@ private struct LocalVideoSettings: View {
     }
 
     private func pathField(_ title: String, text: Binding<String>, hint: String) -> some View {
-        VStack(alignment: .leading, spacing: Theme.s1) {
-            Text(title)
-                .font(.callout.weight(.semibold))
-            HStack(spacing: Theme.s2) {
-                TextField(title, text: text)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.callout.monospaced())
-                Button("Browse…") {
-                    let panel = NSOpenPanel()
-                    panel.canChooseDirectories = true
-                    panel.canChooseFiles = false
-                    panel.allowsMultipleSelection = false
-                    panel.directoryURL = URL(fileURLWithPath: text.wrappedValue, isDirectory: true)
-                    panel.prompt = "Choose"
-                    if panel.runModal() == .OK, let url = panel.url {
-                        text.wrappedValue = url.path
-                    }
-                }
-                .controlSize(.small)
-            }
-            Text(hint)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
+        LocalPathField(title: title, text: text, hint: hint)
     }
 
     @ViewBuilder
@@ -571,6 +552,104 @@ private struct LocalVideoSettings: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                }
+            }
+        }
+    }
+}
+
+/// A path row: text field, Browse button, and a hint. Browses folders unless
+/// `choosesFiles` is set.
+private struct LocalPathField: View {
+    let title: String
+    let text: Binding<String>
+    let hint: String
+    var choosesFiles = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s1) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+            HStack(spacing: Theme.s2) {
+                TextField(title, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                Button("Browse…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = !choosesFiles
+                    panel.canChooseFiles = choosesFiles
+                    panel.allowsMultipleSelection = false
+                    panel.directoryURL =
+                        choosesFiles
+                        ? URL(fileURLWithPath: text.wrappedValue).deletingLastPathComponent()
+                        : URL(fileURLWithPath: text.wrappedValue, isDirectory: true)
+                    panel.prompt = "Choose"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        text.wrappedValue = url.path
+                    }
+                }
+                .controlSize(.small)
+            }
+            Text(hint)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// mlx-gen paths and readiness for the reference-conditioned local video routes
+/// (Bernini-R reference-to-video, MiniMax-H3 image-to-video with audio).
+private struct ReferenceVideoSettings: View {
+    @AppStorage(MLXGenPaths.executableKey) private var executable =
+        MLXGenPaths.defaultExecutable
+    @AppStorage(MLXGenPaths.hfHomeKey) private var hfHome = MLXGenPaths.defaultHFHome
+
+    private var paths: MLXGenPaths { MLXGenPaths(executable: executable, hfHome: hfHome) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s4) {
+            Label("Reference Video (mlx-gen)", systemImage: "person.crop.rectangle.stack")
+                .font(.headline)
+            Text(
+                "Bernini Reference makes a clip of the people in your reference photos. H3 Image to Video animates a keyframe with synchronized audio. Both run on this Mac through mlx-gen."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            LocalPathField(
+                title: "mlxgen executable", text: $executable,
+                hint: "The mlxgen binary inside its virtualenv (uv pip install mlx-gen)",
+                choosesFiles: true)
+            LocalPathField(
+                title: "Hugging Face home", text: $hfHome,
+                hint: "HF_HOME; model snapshots live in its hub folder")
+
+            ForEach(MLXGenRoute.allCases, id: \.self) { route in
+                readiness(for: route)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func readiness(for route: MLXGenRoute) -> some View {
+        let missing = paths.missing(for: route)
+        VStack(alignment: .leading, spacing: Theme.s1) {
+            if missing.isEmpty {
+                Label("\(route.title): ready", systemImage: "checkmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.green)
+            } else {
+                Label("\(route.title): missing", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.emberGlow)
+                ForEach(missing, id: \.self) { item in
+                    Text(item)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
                 }
             }
         }

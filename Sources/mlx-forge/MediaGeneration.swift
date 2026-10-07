@@ -4,7 +4,8 @@
 // (gpt-image-1), xAI Grok images, OpenAI Sora video jobs, and xAI Grok
 // text-to-speech. Video is an async job API; the client polls until the render
 // completes and returns the MP4 bytes. Local FastH3 video runs on this Mac through
-// FastH3Runtime. Generated assets land in Application Support/Forge/Media.
+// FastH3Runtime; reference-conditioned local video (Bernini-R, MiniMax-H3) runs
+// through MLXGenRuntime. Generated assets land in Application Support/Forge/Media.
 
 import Foundation
 import Observation
@@ -37,6 +38,8 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
     case grokImage
     case openAIVideo
     case fastH3Video
+    case berniniReference
+    case h3ImageVideo
 
     var id: String { rawValue }
 
@@ -46,6 +49,8 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         case .grokImage: return "Grok Image"
         case .openAIVideo: return "Sora Video"
         case .fastH3Video: return "FastH3 Local"
+        case .berniniReference: return "Bernini Reference"
+        case .h3ImageVideo: return "H3 Image to Video"
         }
     }
 
@@ -53,19 +58,47 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .openAIImage, .grokImage: return "photo"
         case .openAIVideo, .fastH3Video: return "video"
+        case .berniniReference: return "person.crop.rectangle.stack"
+        case .h3ImageVideo: return "photo.on.rectangle.angled"
         }
     }
 
-    var isVideo: Bool { self == .openAIVideo || self == .fastH3Video }
+    var isVideo: Bool { self == .openAIVideo || isLocal }
 
     /// Runs on this Mac; no cloud key is involved.
-    var isLocal: Bool { self == .fastH3Video }
+    var isLocal: Bool { self == .fastH3Video || mlxGenRoute != nil }
+
+    /// The mlx-gen route behind this provider, for the reference-conditioned ones.
+    var mlxGenRoute: MLXGenRoute? {
+        switch self {
+        case .berniniReference: return .berniniReference
+        case .h3ImageVideo: return .h3FirstFrame
+        case .openAIImage, .grokImage, .openAIVideo, .fastH3Video: return nil
+        }
+    }
+
+    /// How many input photos the provider needs, or nil for prompt-only providers.
+    var referenceImageRange: ClosedRange<Int>? { mlxGenRoute?.referenceImageRange }
+
+    /// A one-line prompting hint shown under the prompt editor.
+    var promptHint: String? {
+        switch self {
+        case .fastH3Video:
+            return "(S1) A presenter says <d>[English] Hello.</d>"
+        case .berniniReference:
+            return "Describe the scene and the action. The people and objects come from the reference photos, in order."
+        case .h3ImageVideo:
+            return "The clip starts from the keyframe. Describe what happens next; use (S1) and <d>[English] words</d> for dialogue."
+        case .openAIImage, .grokImage, .openAIVideo:
+            return nil
+        }
+    }
 
     var hasKey: Bool {
         switch self {
         case .openAIImage, .openAIVideo: return SecretsStore.hasOpenAIKey
         case .grokImage: return SecretsStore.hasXAIKey
-        case .fastH3Video: return true
+        case .fastH3Video, .berniniReference, .h3ImageVideo: return true
         }
     }
 
@@ -74,6 +107,7 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         case .openAIImage, .openAIVideo: return "OpenAI"
         case .grokImage: return "xAI"
         case .fastH3Video: return "FastH3"
+        case .berniniReference, .h3ImageVideo: return "mlx-gen"
         }
     }
 
@@ -82,6 +116,8 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .fastH3Video:
             return FastH3Runtime.unavailableReason()
+        case .berniniReference, .h3ImageVideo:
+            return mlxGenRoute.flatMap { MLXGenRuntime.unavailableReason(for: $0) }
         case .openAIImage, .grokImage, .openAIVideo:
             return hasKey ? nil : "Add an \(keyHint) API key in Settings to use \(label)."
         }
@@ -93,6 +129,8 @@ enum MediaProvider: String, CaseIterable, Identifiable, Codable {
         case .grokImage: return ["default"]
         case .openAIVideo: return ["1280x720", "720x1280"]
         case .fastH3Video: return FastH3Runtime.sizes
+        case .berniniReference: return MLXGenRoute.berniniReference.sizes
+        case .h3ImageVideo: return MLXGenRoute.h3FirstFrame.sizes
         }
     }
 }
@@ -129,6 +167,8 @@ enum MediaGenClient {
             throw MediaGenError.badResponse("Video uses generateVideo().")
         case .fastH3Video:
             throw MediaGenError.badResponse("FastH3 video uses FastH3Runtime.generate().")
+        case .berniniReference, .h3ImageVideo:
+            throw MediaGenError.badResponse("Local reference video uses MLXGenRuntime.generate().")
         }
     }
 
