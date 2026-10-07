@@ -91,6 +91,16 @@ final class MLXGenRuntimeTests: XCTestCase {
         XCTAssertNil(MLXGenRuntime.failureMessage(fromLogTail: "plain text only"))
     }
 
+    func testBerniniProfileFollowsTheCanvas() {
+        let route = MLXGenRoute.berniniReference
+        XCTAssertEqual(route.sizes.first, "480x272")
+        XCTAssertTrue(route.profile(width: 480, height: 272) == (49, 20))
+        XCTAssertTrue(route.profile(width: 272, height: 480) == (49, 20))
+        XCTAssertTrue(route.profile(width: 848, height: 480) == (81, 40))
+        XCTAssertTrue(route.profile(width: 480, height: 848) == (81, 40))
+        XCTAssertTrue(MLXGenRoute.h3FirstFrame.profile(width: 960, height: 544) == (124, 8))
+    }
+
     func testCacheFolderNameMatchesHuggingFaceLayout() {
         XCTAssertEqual(MLXGenPaths.cacheFolder(for: "MiniMaxAI/MiniMax-H3"), "models--MiniMaxAI--MiniMax-H3")
     }

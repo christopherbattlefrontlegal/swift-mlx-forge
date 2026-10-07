@@ -38,26 +38,26 @@ enum MLXGenRoute: String, CaseIterable, Sendable {
         }
     }
 
-    /// WIDTHxHEIGHT choices. Bernini's official canvas is 848x480; H3 needs
-    /// multiples of 32 and validates at 960x544.
+    /// WIDTHxHEIGHT choices, fastest first. Bernini's official canvas is
+    /// 848x480 at 81 frames and 40 steps; measured on an M3 Ultra that ran past
+    /// 30 minutes, while 480x272 at 49 frames and 20 steps took three minutes
+    /// with the reference likeness intact. H3 needs multiples of 32 and
+    /// validates at 960x544.
     var sizes: [String] {
         switch self {
-        case .berniniReference: return ["848x480", "480x848"]
+        case .berniniReference: return ["480x272", "272x480", "848x480", "480x848"]
         case .h3FirstFrame: return ["960x544", "544x960"]
         }
     }
 
-    var frames: Int {
+    /// Clip length and denoise steps for a canvas: Bernini's official profile
+    /// on its official canvas, the three-minute profile on the smaller ones.
+    func profile(width: Int, height: Int) -> (frames: Int, steps: Int) {
         switch self {
-        case .berniniReference: return 81
-        case .h3FirstFrame: return 124
-        }
-    }
-
-    var steps: Int {
-        switch self {
-        case .berniniReference: return 40
-        case .h3FirstFrame: return 8
+        case .berniniReference:
+            return max(width, height) >= 848 ? (81, 40) : (49, 20)
+        case .h3FirstFrame:
+            return (124, 8)
         }
     }
 
@@ -273,6 +273,7 @@ enum MLXGenRuntime {
             throw MLXGenError.badReferences(expected: route.referenceImageRange, got: images.count)
         }
         guard let dims = FastH3Runtime.dimensions(from: size) else { throw MLXGenError.badSize(size) }
+        let profile = route.profile(width: dims.width, height: dims.height)
 
         let outputDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("Forge-MLXGen", isDirectory: true)
@@ -292,7 +293,7 @@ enum MLXGenRuntime {
                 executable: paths.executable,
                 arguments: arguments(
                     route: route, prompt: prompt, width: dims.width, height: dims.height,
-                    frames: frames ?? route.frames, steps: steps ?? route.steps, seed: seed,
+                    frames: frames ?? profile.frames, steps: steps ?? profile.steps, seed: seed,
                     images: images.map(\.path), outputPath: outputURL.path),
                 currentDirectory: outputDir.path,
                 environment: environment
