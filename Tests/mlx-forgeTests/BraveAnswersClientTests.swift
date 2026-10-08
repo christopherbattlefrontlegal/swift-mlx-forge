@@ -3,6 +3,18 @@ import XCTest
 @testable import mlx_forge
 
 final class BraveAnswersClientTests: XCTestCase {
+    func testParserInitializationStartsWithAnUnfinishedEmptyStream() throws {
+        for research in [false, true] {
+            var parser = BraveAnswerStreamParser(research: research)
+            XCTAssertEqual(parser.research, research)
+            XCTAssertFalse(parser.isDone)
+            XCTAssertThrowsError(try parser.finish())
+            _ = try parser.ingest(line: "data: [DONE]")
+            XCTAssertTrue(parser.isDone)
+            XCTAssertThrowsError(try parser.finish())
+        }
+    }
+
     private func event(_ content: String) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: [
             "choices": [["delta": ["content": content]]],

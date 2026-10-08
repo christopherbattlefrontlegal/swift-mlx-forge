@@ -24,6 +24,10 @@ struct BraveAnswerStreamParser {
     ]
     private static let tags = researchTags + ["citation", "usage", "enum_item"]
 
+    init(research: Bool) {
+        self.research = research
+    }
+
     mutating func ingest(line: String) throws -> [BraveAnswerEvent] {
         guard !isDone, line.hasPrefix("data:") else { return [] }
         let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
